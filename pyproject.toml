@@ -37,6 +37,8 @@ repository = "https://github.com/fox-it/dissect.archive"
 
 [project.optional-dependencies]
 full = [
+    "pycryptodome",
+    "backports.zstd; python_version < '3.14'",
     "rich",
 ]
 dev = [
@@ -48,6 +50,7 @@ dev = [
 [dependency-groups]
 test = [
     "pytest",
+    "lz4",
 ]
 lint = [
     "ruff==0.13.1",
