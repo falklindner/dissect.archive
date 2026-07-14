@@ -29,6 +29,24 @@ enum PageType : uint8 {
     DATA    = 0xFF      /* data segment (SG header or continuation) */
 };
 
+enum EncrAlg : uint8 {
+    NONE            = 0,    // none
+    AES_128_CBC     = 1,    // aes-128-cbc
+    AES_192_CBC     = 2,    // aes-192-cbc
+    AES_256_CBC     = 3,    // aes-256-cbc
+    GOST2015        = 4,    // gost2015
+    AES_128_GCM     = 5,    // aes-128-gcm
+    AES_192_GCM     = 6,    // aes-192-gcm
+    AES_256_GCM     = 7     // aes-256-gcm
+};
+
+enum ComprLvl : uint8 {
+  NONE   = 0,  // "none"
+  LOW    = 1,  // "low"
+  NORMAL = 2,  // "normal"
+  HIGH   = 3   // "high"
+};
+
 struct page_header {
     uint8       marker;                 /* always 0x41 'A' */
     PageType    type;
@@ -41,7 +59,12 @@ struct arch_superblock {
     char        magic[4];               /* "ARCH" */
     uint32      header_size;            /* total header body size, may span pages */
     uint16      header_version;         /* 8 in current archives */
-    char        _unknown1[6];
+    ComprLvl    compr_lvl;
+    EncrAlg     encr_alg;
+    uint8_t     dedup;                  /* 0 = "off", 1 = "on" */
+    uint8_t     hash_alg;
+    uint8_t     chunking_alg;
+    uint8_t     hash_window_width;
     uint64      created_ms;             /* creation time, ms since Unix epoch */
     uint64      modified_ms;            /* commit time, ms since Unix epoch */
     char        archive_uuid[16];

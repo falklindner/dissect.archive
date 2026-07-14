@@ -42,6 +42,10 @@ class SuperBlock:
         self.archive_uuid: bytes = bytes(self.sb.archive_uuid)
         self.created_ms: int = self.sb.created_ms
         self.modified_ms: int = self.sb.modified_ms
+        self.compr_lvl: c_tibx.ComprLvl = self.sb.compr_lvl
+        self.encr_alg: c_tibx.EncrAlg = self.sb.encr_alg
+        self.hash_alg: int = self.sb.hash_alg
+        self.dedup: bool = bool(self.sb.dedup)
 
     def __repr__(self) -> str:
         return f"<SuperBlock offset={self.offset:#x} modified_ms={self.modified_ms}>"
