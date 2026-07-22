@@ -49,8 +49,11 @@ if TYPE_CHECKING:
     from dissect.archive.tibx.maps import Extent
     from dissect.archive.tibx.page import SuperBlock
 
-# Decompressed segments kept per archive (~32 x a few hundred KiB)
-SEGMENT_CACHE_SIZE = 32
+# Decompressed segments are cached per archive under a memory budget rather than a fixed
+# count: random-access workloads (MFT, registry hives) touch thousands of distinct
+# segments, and a count of ~32 thrashed to a near-100% miss rate. A byte budget keeps many
+# more small segments resident while still bounding memory for large ones.
+SEGMENT_CACHE_BUDGET = 256 * 1024 * 1024
 
 SPLIT_PART_RE = re.compile(r"^(?P<stem>.+?)-(?P<num>\d{4})\.tibx$", re.IGNORECASE)
 
@@ -109,6 +112,7 @@ class TIBX:
         self._extents: list[Extent] | None = None
         self._segment_index = None
         self._segment_cache: OrderedDict[int, bytes] = OrderedDict()
+        self._segment_cache_bytes = 0
         self._segment_layout: dict[tuple[int, int], int] | None = None
         self._volumes: list[TibxVolume] | None = None
 
@@ -291,8 +295,12 @@ class TIBX:
 
         plain = read_plaintext(self.store, locator.page_offset, self._data_key)
         self._segment_cache[segment_id] = plain
-        if len(self._segment_cache) > SEGMENT_CACHE_SIZE:
-            self._segment_cache.popitem(last=False)
+        self._segment_cache_bytes += len(plain)
+        # Evict oldest until under budget, but always keep the just-added entry so a single
+        # segment larger than the budget is still returned (and simply evicted next insert).
+        while self._segment_cache_bytes > SEGMENT_CACHE_BUDGET and len(self._segment_cache) > 1:
+            _, evicted = self._segment_cache.popitem(last=False)
+            self._segment_cache_bytes -= len(evicted)
         return plain
 
 

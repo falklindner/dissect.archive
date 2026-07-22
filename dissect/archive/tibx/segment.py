@@ -16,6 +16,7 @@ from dissect.archive.tibx.c_tibx import (
     COMP_STORED_VARIANTS,
     COMP_ZSTD,
     ENVELOPE_SIZE,
+    PAGE_BODY_SIZE,
     SEGMENT_FIRST_PAGE_PAYLOAD,
     SEGMENT_HEADER_OFFSET,
     SEGMENT_MAGIC,
@@ -45,6 +46,7 @@ class Segment:
         if magic not in (SEGMENT_MAGIC, SEGMENT_MAGIC_ENCRYPTED):
             raise CorruptArchiveError(f"page {page_index} carries no segment header")
         self.page_index = page_index
+        self.page = page  # retained so read_compressed need not re-read the header page
         self.header = c_tibx.segment_header(page[SEGMENT_HEADER_OFFSET:])
         self.encrypted = magic == SEGMENT_MAGIC_ENCRYPTED
         self.length = self.header.length
@@ -72,33 +74,32 @@ def read_compressed(store: PageStore, segment: Segment) -> bytes:
     """Read exactly ``segment.zlength`` still-compressed bytes.
 
     Walks the segment's page plus as many continuation DATA pages as needed, stripping
-    each page's 8-byte envelope.
+    each page's 8-byte envelope. The physically-contiguous continuation pages are read in
+    a single batched I/O (one ``read`` instead of one per page), which matters most over a
+    network share.
     """
-    parts = []
     remaining = segment.zlength
+    first_take = min(SEGMENT_FIRST_PAGE_PAYLOAD, remaining)
+    parts = [segment.page[SEGMENT_PAYLOAD_OFFSET : SEGMENT_PAYLOAD_OFFSET + first_take]]
+    remaining -= first_take
 
-    first_page = store.page(segment.page_index)
-    take = min(SEGMENT_FIRST_PAGE_PAYLOAD, remaining)
-    parts.append(first_page[SEGMENT_PAYLOAD_OFFSET : SEGMENT_PAYLOAD_OFFSET + take])
-    remaining -= take
-
-    next_index = segment.page_index + 1
-    while remaining > 0:
-        if next_index >= store.page_count:
+    if remaining > 0:
+        cont_count = (remaining + PAGE_BODY_SIZE - 1) // PAGE_BODY_SIZE
+        start = segment.page_index + 1
+        if start + cont_count > store.page_count:
             raise CorruptArchiveError(f"segment at page {segment.page_index} runs off the end of the archive")
-        page = store.page(next_index)
-        if page[1] != c_tibx.PageType.DATA:
-            raise CorruptArchiveError(
-                f"unexpected non-data page {next_index} inside segment at page {segment.page_index}"
-            )
-        # The segment's byte length is authoritative for where it ends; we deliberately do
-        # not treat an SG/SE magic on a continuation page as a new segment, because
-        # compressed and encrypted payload bytes can coincidentally match that magic.
-        body = page[ENVELOPE_SIZE:]
-        take = min(len(body), remaining)
-        parts.append(body[:take])
-        remaining -= take
-        next_index += 1
+        for offset, page in enumerate(store.read_run(start, cont_count)):
+            if page[1] != c_tibx.PageType.DATA:
+                raise CorruptArchiveError(
+                    f"unexpected non-data page {start + offset} inside segment at page {segment.page_index}"
+                )
+            # The segment's byte length is authoritative for where it ends; we deliberately
+            # do not treat an SG/SE magic on a continuation page as a new segment, because
+            # compressed and encrypted payload bytes can coincidentally match that magic.
+            body = page[ENVELOPE_SIZE:]
+            take = min(len(body), remaining)
+            parts.append(body[:take])
+            remaining -= take
 
     return b"".join(parts)
 

@@ -39,6 +39,7 @@ repository = "https://github.com/fox-it/dissect.archive"
 full = [
     "pycryptodome",
     "backports.zstd; python_version < '3.14'",
+    "lz4",
     "rich",
 ]
 dev = [

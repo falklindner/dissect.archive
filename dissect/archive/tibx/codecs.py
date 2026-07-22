@@ -28,6 +28,23 @@ from dissect.archive.tibx.exceptions import CorruptArchiveError
 # Generous ceiling for a single decompressed unit; real segments are a few MiB
 MAX_DECOMPRESSED = 2 << 30
 
+# Optional C-accelerated LZ4 block decoder. The pure-Python decoder below is always the
+# fallback (``lz4`` is not a hard dependency), so nothing breaks without it; when present
+# it is orders of magnitude faster and, per a capability probe, produces byte-identical
+# output including the growing-dictionary (``LZ4_decompress_safe_continue``) semantics the
+# linked-LZ4 chains rely on.
+try:
+    import lz4.block as _lz4_block
+
+    _probe = _lz4_block.compress(b"tibx-lz4-capability-probe", store_size=False)
+    if (
+        _lz4_block.decompress(_probe, uncompressed_size=25) != b"tibx-lz4-capability-probe"
+        or _lz4_block.decompress(_probe, uncompressed_size=25, dict=b"") != b"tibx-lz4-capability-probe"
+    ):
+        _lz4_block = None
+except Exception:
+    _lz4_block = None
+
 
 def decompress_zstd(data: bytes, max_output: int) -> bytes:
     """Decompress one zstd frame, ignoring trailing padding, bounded by ``max_output``."""
@@ -47,7 +64,17 @@ def lz4_block_decompress(src: bytes, uncompressed_size: int, dictionary: bytes =
     Adapted from ``dissect.util.compression.lz4_python.decompress``, extended with a
     ``dictionary`` seed: output starts as the dictionary so matches may reach back into
     it; the seed is stripped from the returned data.
+
+    Uses the C ``lz4`` library when available (byte-identical, far faster), falling back
+    to the pure-Python decoder otherwise.
     """
+    if _lz4_block is not None and uncompressed_size > 0:
+        try:
+            return _lz4_block.decompress(src, uncompressed_size=uncompressed_size, dict=dictionary)
+        except Exception as e:
+            # Malformed on-disk block on untrusted input -- normalise to our error type
+            raise CorruptArchiveError(f"LZ4: {e}")
+
     reader = io.BytesIO(src)
     dst = bytearray(dictionary)
     base = len(dictionary)

@@ -8,6 +8,7 @@ root; a torn final commit (power loss) is skipped in favor of the newest complet
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import TYPE_CHECKING, BinaryIO
 
 from dissect.util import ts
@@ -21,6 +22,12 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 ARCH_MAGIC = b"ARCH"
+
+# Pages recently returned by ``page()`` are kept in a small LRU so repeated single-page
+# reads -- LSM directory pages revisited during tree walks, a segment header page read to
+# parse the ``Segment`` then again to read its payload -- do not each re-hit the backing
+# file (which may be a network share). 512 pages == 2 MiB.
+PAGE_CACHE_SIZE = 512
 
 
 def _type_name(value: int) -> str:
@@ -76,23 +83,53 @@ class PageStore:
         fh.seek(0, 2)
         self.size = fh.tell()
         self.page_count = self.size // PAGE_SIZE
+        self._page_cache: OrderedDict[int, bytes] = OrderedDict()
 
         if self.size < PAGE_SIZE or self.page(0)[8:12] != ARCH_MAGIC:
             raise InvalidArchiveError("Missing ARCH magic at page 0")
 
     def page(self, index: int) -> bytes:
-        """Read the page at ``index``.
+        """Read the page at ``index`` (LRU-cached).
 
         Raises:
             CorruptArchiveError: If the page does not exist or is truncated.
         """
+        cached = self._page_cache.get(index)
+        if cached is not None:
+            self._page_cache.move_to_end(index)
+            return cached
         if not 0 <= index < self.page_count:
             raise CorruptArchiveError(f"page {index} is out of bounds (archive has {self.page_count} pages)")
         self.fh.seek(index * PAGE_SIZE)
         page = self.fh.read(PAGE_SIZE)
         if len(page) != PAGE_SIZE:
             raise CorruptArchiveError(f"short read on page {index}")
+        self._page_cache[index] = page
+        if len(self._page_cache) > PAGE_CACHE_SIZE:
+            self._page_cache.popitem(last=False)
         return page
+
+    def read_run(self, start: int, count: int) -> list[bytes]:
+        """Read ``count`` consecutive pages beginning at ``start`` in a single I/O.
+
+        Collapses what would otherwise be ``count`` separate ``seek``+``read`` calls into
+        one -- the pages of a multi-page segment are physically contiguous, so this is the
+        batch read path for :func:`segment.read_compressed`. Unlike :meth:`page` it does not
+        populate the LRU (segment payload pages are read once), but it does honour pages
+        already resident there.
+
+        Raises:
+            CorruptArchiveError: If the run extends past the end of the archive or is truncated.
+        """
+        if count <= 0:
+            return []
+        if start < 0 or start + count > self.page_count:
+            raise CorruptArchiveError(f"page run {start}..{start + count} is out of bounds ({self.page_count} pages)")
+        self.fh.seek(start * PAGE_SIZE)
+        blob = self.fh.read(count * PAGE_SIZE)
+        if len(blob) != count * PAGE_SIZE:
+            raise CorruptArchiveError(f"short read on page run {start}..{start + count}")
+        return [blob[i * PAGE_SIZE : (i + 1) * PAGE_SIZE] for i in range(count)]
 
     def page_type(self, index: int) -> int:
         """Return the type byte of the page at ``index``."""
