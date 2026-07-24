@@ -154,9 +154,19 @@ class TIBX:
 
     @property
     def encrypted(self) -> bool:
-        """Whether the archive's data segments are encrypted (a keymap tree is present)."""
+        """Whether reading this archive's data segments needs a password.
+
+        A keymap tree with records is the cheap precondition; it is then confirmed by
+        structurally locating the password-wrapped data key, so a keymap that carries no
+        such key does not prompt for a password that could never work.
+        """
         keymap = self.header.tree(TLV_KEYMAP)
-        return keymap is not None and keymap.has_records
+        if keymap is None or not keymap.has_records:
+            return False
+
+        from dissect.archive.tibx.crypto import has_password_wrapped_key
+
+        return has_password_wrapped_key(self.header)
 
     def unlock(self, password: str | bytes) -> None:
         """Derive the data key from ``password`` to read encrypted segments.
