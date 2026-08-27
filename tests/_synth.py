@@ -6,10 +6,10 @@ scratch — up to and including complete archives with a TLV directory, data_map
 segment_map LSM superblocks (mem-tree or on-disk LEAF/LDIR ctrees) and SG data
 segments.
 
-The fixtures are derived from those of ``acronis-tibx``, a private research project by mniedermaier that is no longer
-publicly available, and extended here with the LSM layer. They are
-cross-checked against archives produced by Acronis Cyber Protect / True Image 2026 -- a
-synthetic page store is only useful for as long as a real parser would accept it.
+The fixtures are derived from those of the MIT-licensed ``acronis-tibx`` (see
+``THIRD_PARTY_NOTICES.md``) and extended here with the LSM layer. They are cross-checked
+against archives produced by Acronis Cyber Protect / True Image 2026 -- a synthetic page
+store is only useful for as long as a real parser would accept it.
 """
 
 from __future__ import annotations

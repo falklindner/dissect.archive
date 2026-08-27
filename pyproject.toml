@@ -8,7 +8,7 @@ description = "A Dissect module implementing parsers for various archive and bac
 readme = "README.md"
 requires-python = ">=3.10"
 license = "AGPL-3.0-or-later"
-license-files = ["LICENSE", "COPYRIGHT"]
+license-files = ["LICENSE", "COPYRIGHT", "THIRD_PARTY_NOTICES.md"]
 authors = [
   {name = "Dissect Team", email = "dissect@fox-it.com"}
 ]

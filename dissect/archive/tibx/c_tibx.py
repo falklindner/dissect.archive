@@ -10,10 +10,9 @@ cstruct instance. The few little-endian fields (the LSM cell-group header, the L
 sequence id and the segment_map ``page_count``) are decoded manually at their use sites.
 
 The format is not documented by Acronis. These definitions encode the format findings of
-``acronis-tibx``, a private research project by mniedermaier that is no longer
-publicly available, and were confirmed against archives
-written by Acronis Cyber Protect / True Image 2026; fields still marked ``_reserved`` or
-``_pad`` are ones whose meaning is not yet established.
+the MIT-licensed ``acronis-tibx`` (see ``THIRD_PARTY_NOTICES.md``) and were confirmed
+against archives written by Acronis Cyber Protect / True Image 2026; fields still marked
+``_reserved`` or ``_pad`` are ones whose meaning is not yet established.
 """
 
 from __future__ import annotations

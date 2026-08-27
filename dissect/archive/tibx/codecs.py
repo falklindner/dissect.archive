@@ -10,6 +10,9 @@
 adapted from ``dissect.util.compression.lz4_python`` with a dictionary seed added.
 A ``.tibx`` is untrusted input: every decode is bounded by the caller-supplied output
 size so malformed on-disk sizes can't drive unbounded allocations.
+
+The linked-LZ4 chain framing is ported from the MIT-licensed ``acronis-tibx``. See
+``THIRD_PARTY_NOTICES.md``.
 """
 
 from __future__ import annotations

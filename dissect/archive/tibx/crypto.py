@@ -14,6 +14,9 @@ against real Acronis Cyber Protect / True Image 2026 output.
 
 Each ``SE`` segment payload is ``IV||16 || AES-256-CBC ciphertext``; the plaintext is a
 zstd frame (or stored bytes when the segment's compression is NONE).
+
+Ported from the MIT-licensed ``acronis-tib-reader`` and ``acronis-tibx``. See
+``THIRD_PARTY_NOTICES.md``.
 """
 
 from __future__ import annotations

@@ -4,6 +4,9 @@ A segment is a 0x2C-byte header (``SG`` plaintext / ``SE`` encrypted, at page of
 +0x08) followed by the compressed payload. Payloads larger than the segment's first
 page (4052 bytes) spill onto continuation DATA pages, each contributing its 4088-byte
 body.
+
+Ported from the MIT-licensed ``acronis-tib-reader``, with the ``comp=0x0001`` variant
+from ``acronis-tibx``. See ``THIRD_PARTY_NOTICES.md``.
 """
 
 from __future__ import annotations

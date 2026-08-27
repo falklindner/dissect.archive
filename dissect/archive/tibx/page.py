@@ -4,6 +4,9 @@ A ``.tibx`` is append-only transactional: every commit appends a new ARCH superb
 carrying its own copy-on-write LSM trees, so each ARCH page is a complete point-in-time
 snapshot (a recovery point). The highest-offset ARCH page whose CRC validates is the live
 root; a torn final commit (power loss) is skipped in favor of the newest complete root.
+
+Ported from the page store of the MIT-licensed ``acronis-tibx``. See
+``THIRD_PARTY_NOTICES.md``.
 """
 
 from __future__ import annotations
