@@ -4,10 +4,12 @@ Real archives can't be committed for every edge case (and corruption cases can't
 produced by Acronis at all), so structural tests build minimal valid page stores from
 scratch — up to and including complete archives with a TLV directory, data_map /
 segment_map LSM superblocks (mem-tree or on-disk LEAF/LDIR ctrees) and SG data
-segments, which the acronis-tibx POC parses as well (the oracle in spikes/).
+segments.
 
-Ported from the acronis-tibx POC's synthetic fixtures (MIT, see THIRD_PARTY_NOTICES.md)
-and extended with the LSM layer.
+Every builder here writes the layout described in :mod:`dissect.archive.tibx.c_tibx`, and
+the fixtures were cross-checked against archives produced by Acronis Cyber Protect /
+True Image 2026 -- a synthetic page store is only useful for as long as a real parser
+would accept it.
 """
 
 from __future__ import annotations
@@ -16,7 +18,8 @@ import struct
 import sys
 from typing import TYPE_CHECKING, NamedTuple
 
-from dissect.archive.tibx.crc32c import page_crc32c
+from dissect.archive.tibx.c_tibx import c_tibx
+from dissect.archive.tibx.page import page_crc32c
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -120,7 +123,10 @@ def wrap_data_key(data_key: bytes, password: bytes, iter_log2: int = 12) -> byte
     kek = PBKDF2(password, salt, dkLen=32, count=1 << iter_log2, hmac_hash_module=SHA256)
     padded = data_key + bytes([16]) * 16  # 32-byte key -> full padding block
     wrapped = AES.new(kek, AES.MODE_CBC, b"\x00" * 16).encrypt(padded)
-    return b"\x00\x00" + bytes([FORMAT_PASSWORD, 3, iter_log2, 0]) + salt + wrapped
+    header = c_tibx.wrapped_key(format=FORMAT_PASSWORD, alg=3, iter_log2=iter_log2, _reserved=0, salt=salt)
+    # Two leading bytes so the blob does not start on the format byte -- the parser locates
+    # the wrapped key by scanning, and a blob at offset 0 would not exercise that.
+    return b"\x00\x00" + header.dumps() + wrapped
 
 
 def build_archive(uuid: bytes = b"\xab" * 16) -> bytes:

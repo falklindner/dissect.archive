@@ -33,6 +33,7 @@ from dissect.archive.tibx.exceptions import (
     CorruptArchiveError,
     Error,
     InvalidArchiveError,
+    UnsupportedFormatError,
 )
 from dissect.archive.tibx.lsm import read_archive_header
 from dissect.archive.tibx.maps import load_extents, load_segment_index
@@ -154,7 +155,21 @@ class TIBX:
 
     @property
     def encrypted(self) -> bool:
-        """Whether reading this archive's data segments needs a password.
+        """Whether this archive's data segments are encrypted.
+
+        The superblock's ``encr_alg`` is the archive-level signal and costs nothing, but it
+        has only been verified for ``header_version`` 8, so a keymap carrying a wrapped data
+        key is accepted as evidence too. Use :attr:`password_protected` to find out whether a
+        *password* can open it -- an archive wrapped to a certificate is encrypted all the
+        same, and no password will help.
+        """
+        if self.root.encr_alg != c_tibx.EncrAlg.NONE:
+            return True
+        return self.password_protected or self._certificate_protected
+
+    @property
+    def password_protected(self) -> bool:
+        """Whether a password can unlock this archive.
 
         A keymap tree with records is the cheap precondition; it is then confirmed by
         structurally locating the password-wrapped data key, so a keymap that carries no
@@ -168,13 +183,32 @@ class TIBX:
 
         return has_password_wrapped_key(self.header)
 
+    @property
+    def _certificate_protected(self) -> bool:
+        """Whether the keymap wraps the data key to a certificate rather than a password."""
+        keymap = self.header.tree(TLV_KEYMAP)
+        if keymap is None or not keymap.has_records:
+            return False
+
+        from dissect.archive.tibx.crypto import has_certificate_wrapped_key
+
+        return has_certificate_wrapped_key(self.header)
+
     def unlock(self, password: str | bytes) -> None:
         """Derive the data key from ``password`` to read encrypted segments.
 
         Raises:
             InvalidPasswordError: If the password is wrong.
+            UnsupportedFormatError: If the archive is encrypted but wrapped to a
+                certificate, which no password can open.
         """
         from dissect.archive.tibx.crypto import unwrap_data_key
+
+        if not self.password_protected and self._certificate_protected:
+            raise UnsupportedFormatError(
+                "archive is encrypted, but not password-protected: its data key is wrapped "
+                "to a certificate, which this parser cannot use"
+            )
 
         self._data_key = unwrap_data_key(self.header, password)
         self._segment_cache.clear()

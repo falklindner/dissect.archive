@@ -141,6 +141,17 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
+    class wrapped_key(__cs__.Structure):
+        format: _c_tibx.uint8
+        alg: _c_tibx.uint8
+        iter_log2: _c_tibx.uint8
+        _reserved: _c_tibx.uint8
+        salt: __cs__.CharArray
+        @overload
+        def __init__(self, format: _c_tibx.uint8 | None = ..., alg: _c_tibx.uint8 | None = ..., iter_log2: _c_tibx.uint8 | None = ..., _reserved: _c_tibx.uint8 | None = ..., salt: __cs__.CharArray | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
     class file_table_entry(__cs__.Structure):
         index: _c_tibx.uint32
         byte_offset: _c_tibx.uint64

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from dissect.archive.tibx.c_tibx import c_tibx
 from dissect.archive.tibx.crypto import (
     DataKey,
     decrypt_segment,
@@ -154,3 +155,51 @@ def test_encrypted_archive_end_to_end(compression: int) -> None:
 
     tibx.unlock(PASSWORD)
     assert volume.read(0, len(content)) == content
+
+
+def _with_encr_alg(archive: bytes, alg: int) -> bytes:
+    """``archive`` with ``arch_superblock.encr_alg`` on page 0 set to ``alg``."""
+    from tests._synth import PAGE, finalize
+
+    page = bytearray(archive[:PAGE])
+    page[0x13] = alg
+    return finalize(page) + archive[PAGE:]
+
+
+def test_encr_alg_alone_marks_archive_encrypted() -> None:
+    # The superblock is the archive-level signal and costs nothing to read: an archive
+    # whose keymap we cannot make sense of is still encrypted if encr_alg says so.
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)])
+    assert not TIBX(io.BytesIO(archive)).encrypted
+
+    encrypted = _with_encr_alg(archive, c_tibx.EncrAlg.AES_256_CBC)
+    assert TIBX(io.BytesIO(encrypted)).encrypted
+    # ... but nothing about it suggests a password would help
+    assert not TIBX(io.BytesIO(encrypted)).password_protected
+
+
+def test_encr_alg_agrees_with_keymap_detection() -> None:
+    # Both signals point the same way on a normal password-protected archive.
+    archive = _with_encr_alg(
+        build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD),
+        c_tibx.EncrAlg.AES_256_CBC,
+    )
+    tibx = TIBX(io.BytesIO(archive))
+    assert tibx.encrypted
+    assert tibx.password_protected
+    tibx.unlock(PASSWORD)
+
+
+def test_certificate_wrapped_archive_rejects_password() -> None:
+    # Wrapped to a certificate, not a password: prompting for one can never work, so say
+    # so instead of failing with a generic "wrong password".
+    base = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD)
+    blob = bytearray(_header(base).tree(7).memtree_payload)
+    blob[blob.index(bytes([0x01, 0x03]))] = 0x02  # FORMAT_PASSWORD -> FORMAT_PUBKEY
+    archive = _with_encr_alg(_rebuild_with_keymap(base, bytes(blob)), c_tibx.EncrAlg.AES_256_CBC)
+
+    tibx = TIBX(io.BytesIO(archive))
+    assert tibx.encrypted
+    assert not tibx.password_protected
+    with pytest.raises(UnsupportedFormatError, match="not password-protected"):
+        tibx.unlock(PASSWORD)

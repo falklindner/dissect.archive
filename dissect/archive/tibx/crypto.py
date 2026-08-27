@@ -2,9 +2,8 @@
 
 The LSM index is always plaintext; only data segments are encrypted (page tag ``SE``).
 The data key is wrapped with a password-derived key-encryption key (KEK) and stored in
-the keymap tree (TLV[7]) superblock mem-tree. A wrapped-key blob is:
-
-    [format=0x01][alg][iter_log2][reserved][salt||16][wrapped key, PKCS#7-padded||16n]
+the keymap tree (TLV[7]) superblock mem-tree, as a :class:`c_tibx.wrapped_key` header
+followed by the PKCS#7-padded key itself::
 
     KEK      = PBKDF2-HMAC-SHA256(password, salt, 1 << iter_log2, 32 bytes)
     data key = PKCS#7-unpad(AES-256-CBC-decrypt(wrapped, KEK, IV=0))
@@ -25,15 +24,18 @@ from typing import TYPE_CHECKING, NamedTuple
 # pycryptodome is only needed to actually derive/apply keys, not to *detect* encryption
 # (see has_password_wrapped_key), so it is imported where it is used rather than at module
 # import time -- the detection path runs on every archive open.
-from dissect.archive.tibx.c_tibx import TLV_KEYMAP
+from dissect.archive.tibx.c_tibx import (
+    TLV_KEYMAP,
+    WRAPPED_KEY_FORMAT_PASSWORD,
+    WRAPPED_KEY_FORMAT_PUBKEY,
+    WRAPPED_KEY_HEADER_SIZE,
+    c_tibx,
+)
 from dissect.archive.tibx.codecs import decompress_linked_lz4
 from dissect.archive.tibx.exceptions import InvalidPasswordError, UnsupportedFormatError
 
 if TYPE_CHECKING:
     from dissect.archive.tibx.lsm import ArchiveHeader
-
-FORMAT_PASSWORD = 0x01
-FORMAT_PUBKEY = 0x02
 
 # alg id -> AES key length in bytes (CBC variants); GCM variants are unsupported
 CBC_KEY_LENGTH = {1: 16, 2: 24, 3: 32}
@@ -41,7 +43,6 @@ GCM_ALG_IDS = {5, 6, 7}
 
 MIN_ITER_LOG2 = 10
 MAX_ITER_LOG2 = 24
-SALT_SIZE = 16
 # Bound the keymap scan: the mem-tree is tiny in practice
 MAX_KEYMAP_BLOB = 1 << 20
 
@@ -62,24 +63,45 @@ def _pkcs7_unpad(data: bytes) -> bytes | None:
     return None
 
 
+def _scan_offsets(blob: bytes) -> range:
+    """The offsets in ``blob`` at which a complete wrapped key could still begin.
+
+    The blob's framing inside the keymap mem-tree is opaque, so the key is found by
+    scanning; anything closer to the end than a header plus one AES block cannot be one.
+    """
+    return range(len(blob) - (WRAPPED_KEY_HEADER_SIZE + 16))
+
+
+def _parse_wrapped_key(blob: bytes, offset: int) -> tuple[c_tibx.wrapped_key, bytes] | None:
+    """Parse the wrapped-key header at ``offset`` and the padded key that follows it.
+
+    Returns ``None`` if there are not enough bytes left for a complete header plus at
+    least one AES block of wrapped key.
+    """
+    if len(blob) - offset < WRAPPED_KEY_HEADER_SIZE + 16:
+        return None
+    return c_tibx.wrapped_key(blob[offset:]), blob[offset + WRAPPED_KEY_HEADER_SIZE :]
+
+
 def _blob_is_well_formed(blob: bytes, offset: int, *, cbc_only: bool) -> bool:
     """Whether a wrapped-key blob at ``offset`` parses structurally -- no password needed.
 
     Checks only what the format fixes: a known algorithm id, a plausible PBKDF2 iteration
-    exponent, a full salt, and a wrapped key that is a non-empty AES block multiple.
+    exponent, and a wrapped key that is a non-empty AES block multiple. The salt is fixed
+    width, so parsing the header at all already proves it is complete.
 
     ``cbc_only`` restricts this to algorithms we can actually unwrap; the detection path
     passes ``False`` so a GCM archive is still reported as *encrypted* (it is), and fails
     later with a clear "not supported" rather than being mistaken for plaintext.
     """
-    alg = blob[offset + 1]
-    iter_log2 = blob[offset + 2]
-    known = CBC_KEY_LENGTH if cbc_only else {**CBC_KEY_LENGTH, **dict.fromkeys(GCM_ALG_IDS, 0)}
-    if alg not in known or not MIN_ITER_LOG2 <= iter_log2 <= MAX_ITER_LOG2:
+    parsed = _parse_wrapped_key(blob, offset)
+    if parsed is None:
         return False
-    salt = blob[offset + 4 : offset + 4 + SALT_SIZE]
-    wrapped = blob[offset + 4 + SALT_SIZE :]
-    return len(salt) == SALT_SIZE and len(wrapped) >= 16 and not len(wrapped) % 16
+    header, wrapped = parsed
+    known = CBC_KEY_LENGTH if cbc_only else {**CBC_KEY_LENGTH, **dict.fromkeys(GCM_ALG_IDS, 0)}
+    if header.alg not in known or not MIN_ITER_LOG2 <= header.iter_log2 <= MAX_ITER_LOG2:
+        return False
+    return not len(wrapped) % 16
 
 
 def _keymap_blob(header: ArchiveHeader) -> bytes | None:
@@ -115,13 +137,28 @@ def has_password_wrapped_key(header: ArchiveHeader) -> bool:
     answers ``False`` -- a missed detection still surfaces later as an explicit
     :class:`InvalidPasswordError` from the segment reader, not a silent misread.
     """
+    return _has_wrapped_key(header, WRAPPED_KEY_FORMAT_PASSWORD)
+
+
+def has_certificate_wrapped_key(header: ArchiveHeader) -> bool:
+    """Whether the keymap carries a certificate-wrapped data key.
+
+    Acronis can wrap the data key to a certificate instead of a password. Such an archive
+    is genuinely encrypted, but no password can open it -- telling the two apart is what
+    lets :meth:`TIBX.unlock` fail with something better than "wrong password".
+    """
+    return _has_wrapped_key(header, WRAPPED_KEY_FORMAT_PUBKEY)
+
+
+def _has_wrapped_key(header: ArchiveHeader, wrap_format: int) -> bool:
+    """Whether the keymap holds a structurally valid wrapped key of ``wrap_format``."""
     try:
         blob = _keymap_blob(header)
         if not blob:
             return False
         return any(
-            blob[offset] == FORMAT_PASSWORD and _blob_is_well_formed(blob, offset, cbc_only=False)
-            for offset in range(len(blob) - (4 + SALT_SIZE))
+            blob[offset] == wrap_format and _blob_is_well_formed(blob, offset, cbc_only=False)
+            for offset in _scan_offsets(blob)
         )
     except Exception:
         return False
@@ -132,19 +169,21 @@ def _try_unwrap(blob: bytes, offset: int, password: bytes) -> DataKey | None:
     from Crypto.Hash import SHA256
     from Crypto.Protocol.KDF import PBKDF2
 
-    alg = blob[offset + 1]
-    iter_log2 = blob[offset + 2]
-    if alg in GCM_ALG_IDS:
+    parsed = _parse_wrapped_key(blob, offset)
+    if parsed is None:
+        return None
+    header, wrapped = parsed
+
+    if header.alg in GCM_ALG_IDS:
         raise UnsupportedFormatError("AES-GCM encrypted TIBX archives are not supported")
     if not _blob_is_well_formed(blob, offset, cbc_only=True):
         return None
-    salt = blob[offset + 4 : offset + 4 + SALT_SIZE]
-    wrapped = blob[offset + 4 + SALT_SIZE :]
-    kek = PBKDF2(password, salt, dkLen=32, count=1 << iter_log2, hmac_hash_module=SHA256)
+
+    kek = PBKDF2(password, header.salt, dkLen=32, count=1 << header.iter_log2, hmac_hash_module=SHA256)
     key = _pkcs7_unpad(AES.new(kek, AES.MODE_CBC, b"\x00" * 16).decrypt(wrapped))
-    if key is None or len(key) != CBC_KEY_LENGTH[alg]:
+    if key is None or len(key) != CBC_KEY_LENGTH[header.alg]:
         return None
-    return DataKey(alg=alg, key=key)
+    return DataKey(alg=header.alg, key=key)
 
 
 def unwrap_data_key(header: ArchiveHeader, password: str | bytes) -> DataKey:
@@ -161,8 +200,8 @@ def unwrap_data_key(header: ArchiveHeader, password: str | bytes) -> DataKey:
     if blob is None:
         raise InvalidPasswordError("archive has no keymap tree")
 
-    for offset in range(len(blob) - (4 + SALT_SIZE)):
-        if blob[offset] != FORMAT_PASSWORD:
+    for offset in _scan_offsets(blob):
+        if blob[offset] != WRAPPED_KEY_FORMAT_PASSWORD:
             continue
         data_key = _try_unwrap(blob, offset, password)
         if data_key is not None:

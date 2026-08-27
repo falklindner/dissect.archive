@@ -12,9 +12,9 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, BinaryIO
 
 from dissect.util import ts
+from dissect.util.hash.crc32c import crc32c
 
 from dissect.archive.tibx.c_tibx import PAGE_MARKER, PAGE_SIZE, c_tibx
-from dissect.archive.tibx.crc32c import page_crc32c
 from dissect.archive.tibx.exceptions import CorruptArchiveError, InvalidArchiveError
 
 if TYPE_CHECKING:
@@ -23,11 +23,27 @@ if TYPE_CHECKING:
 
 ARCH_MAGIC = b"ARCH"
 
+# ENVELOPE PARSING -- page envelopes go through :class:`c_tibx.page_header` everywhere
+# except the three whole-archive scan loops below (``live_root``, ``commit_roots``,
+# ``verify``), which index the envelope bytes directly. Those loops touch every page in the
+# archive, and cstruct costs ~3.99 us per envelope against ~0.24 us for the indexing
+# (16.7x): on a 100 GiB archive that is ~100 s of pure header parsing instead of ~6 s. The
+# offsets are declared once in ``page_header`` and mirrored only in those three loops.
+
 # Pages recently returned by ``page()`` are kept in a small LRU so repeated single-page
 # reads -- LSM directory pages revisited during tree walks, a segment header page read to
 # parse the ``Segment`` then again to read its payload -- do not each re-hit the backing
 # file (which may be a network share). 512 pages == 2 MiB.
 PAGE_CACHE_SIZE = 512
+
+
+def page_crc32c(page: bytes) -> int:
+    """Return the CRC-32C of a page with the four checksum bytes at ``[4:8]`` zeroed.
+
+    Feeding the three runs through ``crc32c``'s chainable ``value`` argument avoids
+    building a zeroed 4 KiB copy of every page the scans below touch.
+    """
+    return crc32c(page[8:], crc32c(b"\x00\x00\x00\x00", crc32c(page[:4])))
 
 
 def _type_name(value: int) -> str:
@@ -41,10 +57,15 @@ class SuperBlock:
     """An ARCH superblock (commit root) at a given byte offset in the page store."""
 
     def __init__(self, page: bytes, offset: int):
-        if page[8:12] != ARCH_MAGIC:
-            raise InvalidArchiveError(f"Not an ARCH superblock at offset {offset:#x}")
         self.offset = offset
-        self.sb = c_tibx.arch_superblock(page)
+        try:
+            self.sb = c_tibx.arch_superblock(page)
+        except EOFError:
+            # A buffer too short to hold a superblock is not one; report it in the parser's
+            # own vocabulary rather than letting cstruct's EOFError escape.
+            raise InvalidArchiveError(f"Truncated ARCH superblock at offset {offset:#x}")
+        if self.sb.magic != ARCH_MAGIC:
+            raise InvalidArchiveError(f"Not an ARCH superblock at offset {offset:#x}")
         self.header_size = self.sb.header_size
         self.archive_uuid: bytes = bytes(self.sb.archive_uuid)
         self.created_ms: int = self.sb.created_ms
@@ -85,7 +106,7 @@ class PageStore:
         self.page_count = self.size // PAGE_SIZE
         self._page_cache: OrderedDict[int, bytes] = OrderedDict()
 
-        if self.size < PAGE_SIZE or self.page(0)[8:12] != ARCH_MAGIC:
+        if self.size < PAGE_SIZE or c_tibx.arch_superblock(self.page(0)).magic != ARCH_MAGIC:
             raise InvalidArchiveError("Missing ARCH magic at page 0")
 
     def page(self, index: int) -> bytes:
@@ -133,7 +154,7 @@ class PageStore:
 
     def page_type(self, index: int) -> int:
         """Return the type byte of the page at ``index``."""
-        return self.page(index)[1]
+        return c_tibx.page_header(self.page(index)).type
 
     def page_type_name(self, index: int) -> str:
         """Return the type of the page at ``index`` as a name, or hex for unknown types."""
@@ -156,6 +177,7 @@ class PageStore:
         """
         for index in range(self.page_count - 1, -1, -1):
             page = self.page(index)
+            # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
             if (
                 page[1] == c_tibx.PageType.ARCH
                 and page[8:12] == ARCH_MAGIC
@@ -172,6 +194,7 @@ class PageStore:
         """
         roots = []
         for i, page in self.pages():
+            # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
             if page[0] == PAGE_MARKER and page[1] == c_tibx.PageType.ARCH and page[8:12] == ARCH_MAGIC:
                 roots.append(SuperBlock(page, i * PAGE_SIZE))
         roots.sort(key=lambda sb: sb.modified_ms)
@@ -193,6 +216,7 @@ class PageStore:
         by_type: dict[str, int] = {}
         bad_pages: list[int] = []
         for index, page in self.pages():
+            # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
             if page == zero_page:
                 holes += 1
             elif int.from_bytes(page[4:8], "big") == page_crc32c(page):

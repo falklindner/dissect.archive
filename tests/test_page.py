@@ -5,9 +5,9 @@ import io
 import pytest
 from dissect.util import ts
 
-from dissect.archive.tibx.c_tibx import PAGE_SIZE, c_tibx
+from dissect.archive.tibx.c_tibx import PAGE_MARKER, PAGE_SIZE, c_tibx
 from dissect.archive.tibx.exceptions import CorruptArchiveError, InvalidArchiveError
-from dissect.archive.tibx.page import PageStore, SuperBlock
+from dissect.archive.tibx.page import PageStore, SuperBlock, page_crc32c
 from tests._synth import SEG_PAYLOAD, arch_page, build_archive, data_page
 
 
@@ -102,3 +102,25 @@ def test_commit_roots_ordered_by_commit_time() -> None:
     roots = PageStore(io.BytesIO(data)).commit_roots()
     assert [sb.modified_ms for sb in roots] == [2000, 5000, 7000]
     assert [sb.offset for sb in roots] == [2 * PAGE_SIZE, 3 * PAGE_SIZE, 0]
+
+
+def test_page_crc_ignores_checksum_field() -> None:
+    page = bytearray(PAGE_SIZE)
+    page[0], page[1] = PAGE_MARKER, c_tibx.PageType.ARCH
+    page[8:12] = b"ARCH"
+    base = page_crc32c(bytes(page))
+
+    # Whatever is stored in the CRC field must not affect the page CRC itself
+    page[4:8] = b"\xde\xad\xbe\xef"
+    assert page_crc32c(bytes(page)) == base
+
+    # But any body change must
+    page[0x80] ^= 0xFF
+    assert page_crc32c(bytes(page)) != base
+
+
+def test_superblock_rejects_truncated_page() -> None:
+    # cstruct raises EOFError on a short buffer; callers should only ever see the parser's
+    # own exception type.
+    with pytest.raises(InvalidArchiveError):
+        SuperBlock(b"\x41\x01\x00\x00\x00\x00\x00\x00ARCH", offset=0)

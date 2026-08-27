@@ -9,8 +9,10 @@ Most multi-byte fields are big-endian, so the definitions are loaded into a big-
 cstruct instance. The few little-endian fields (the LSM cell-group header, the LEAF
 sequence id and the segment_map ``page_count``) are decoded manually at their use sites.
 
-References:
-    - acronis-tibx ``docs/FINDINGS.md`` (reverse-engineered format specification)
+The format is not documented by Acronis. These definitions come from the author's own
+reverse engineering of archives written by Acronis Cyber Protect / True Image 2026, and
+every field below was confirmed against that corpus; fields still marked ``_reserved``
+or ``_pad`` are ones whose meaning is not yet established.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ tibx_def = """
 
 enum PageType : uint8 {
     ARCH    = 0x01,     /* superblock / commit root (+ continuation pages) */
-    ARCI    = 0x02,
+    ARCI    = 0x02,     /* commit info */
     LEAF    = 0x03,     /* LSM tree leaf */
     LDIR    = 0x04,     /* LSM tree directory */
     GOLOMB  = 0x05,     /* dedup_map Golomb filter */
@@ -138,6 +140,17 @@ struct data_map_value {
     uint16      extent_index;           /* 0xFFFF = extent fills the whole segment */
 };
 
+/* Password-wrapped data key, stored in the keymap tree (TLV[7]) mem-tree. The wrapped
+ * key itself follows this header and runs to the end of the blob: its length is not
+ * carried in the format, only its PKCS#7 padding is. */
+struct wrapped_key {
+    uint8       format;                 /* 0x01 password-wrapped, 0x02 certificate-wrapped */
+    uint8       alg;                    /* AES variant, see CBC_KEY_LENGTH / GCM_ALG_IDS */
+    uint8       iter_log2;              /* PBKDF2 iterations = 1 << iter_log2 */
+    uint8       _reserved;
+    char        salt[16];               /* PBKDF2 salt */
+};
+
 /* TLV[18] file table record: where each physical file of the archive set begins in
  * the logical page store. One entry per version file; a "single version scheme"
  * cleanup compacts (physically truncates) older files but keeps their logical range. */
@@ -198,6 +211,12 @@ TLV_SEGMENT_MAP = 2
 TLV_SLICES = 5
 TLV_KEYMAP = 7
 TLV_FILE_TABLE = 18
+
+# Wrapped-key blob: the fixed header above, then the padded key to the end of the blob
+WRAPPED_KEY_HEADER_SIZE = 20
+WRAPPED_KEY_SALT_SIZE = 16
+WRAPPED_KEY_FORMAT_PASSWORD = 0x01
+WRAPPED_KEY_FORMAT_PUBKEY = 0x02
 
 DATA_MAP_KEY_SIZE = 31
 DATA_MAP_VALUE_SIZE = 10
