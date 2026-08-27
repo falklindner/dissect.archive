@@ -7,7 +7,8 @@ Each L-SB describes the tree's on-disk ctree runs (B-tree roots of LEAF/LDIR pag
 plus a residual **mem-tree** holding not-yet-compacted records -- small archives keep
 *all* records in the mem-tree with empty ctrees.
 
-Ported from the MIT-licensed acronis-tib-reader engine (see THIRD_PARTY_NOTICES.md).
+Ported from the LSM engine of ``acronis-tibx``, a private research project by mniedermaier that is no longer
+publicly available.
 """
 
 from __future__ import annotations

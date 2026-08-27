@@ -9,10 +9,11 @@ Most multi-byte fields are big-endian, so the definitions are loaded into a big-
 cstruct instance. The few little-endian fields (the LSM cell-group header, the LEAF
 sequence id and the segment_map ``page_count``) are decoded manually at their use sites.
 
-The format is not documented by Acronis. These definitions come from the author's own
-reverse engineering of archives written by Acronis Cyber Protect / True Image 2026, and
-every field below was confirmed against that corpus; fields still marked ``_reserved``
-or ``_pad`` are ones whose meaning is not yet established.
+The format is not documented by Acronis. These definitions encode the format findings of
+``acronis-tibx``, a private research project by mniedermaier that is no longer
+publicly available, and were confirmed against archives
+written by Acronis Cyber Protect / True Image 2026; fields still marked ``_reserved`` or
+``_pad`` are ones whose meaning is not yet established.
 """
 
 from __future__ import annotations
