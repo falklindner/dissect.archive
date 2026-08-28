@@ -5,7 +5,7 @@ import struct
 
 import pytest
 
-from dissect.archive.tibx.exceptions import CorruptArchiveError
+from dissect.archive.tibx.exception import CorruptArchiveError
 from dissect.archive.tibx.lsm import (
     LsmSuperBlock,
     decode_cells_compact,

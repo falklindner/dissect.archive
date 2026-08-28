@@ -17,7 +17,7 @@ The LSM index engine and the layers built on it. Derived work, by module:
 - `dissect/archive/tibx/lsm.py` — L-SB superblock parsing, the ARCH TLV directory,
   LEAF/LDIR page framing and the cell-stream grammar (`tibread/tibx/lsm.py`,
   `tibread/tibx/lsm_cells.py`)
-- `dissect/archive/tibx/maps.py` — `data_map` extent decoding and `segment_map`
+- `dissect/archive/tibx/map.py` — `data_map` extent decoding and `segment_map`
   index construction (`tibread/tibx/data_map.py`, `tibread/tibx/segment_map.py`)
 - `dissect/archive/tibx/segment.py` — SG segment header parsing and segment
   decompression (`tibread/tibx/segment.py`)
@@ -36,11 +36,11 @@ work, by module:
   encode
 - `dissect/archive/tibx/page.py` — the 4 KiB page store and superblock/commit-root model
   (`tibx/container.py`)
-- `dissect/archive/tibx/codecs.py` — the zstd frame, linked-LZ4 and LSM cell-stream
+- `dissect/archive/tibx/codec.py` — the zstd frame, linked-LZ4 and LSM cell-stream
   decoders (`tibx/codecs.py`)
 - `dissect/archive/tibx/crypto.py` — the SE header and password-to-data-key flow
   (`tibx/crypto.py`)
-- `dissect/archive/tibx/lsm.py`, `dissect/archive/tibx/maps.py` — LSM mem-tree (C0)
+- `dissect/archive/tibx/lsm.py`, `dissect/archive/tibx/map.py` — LSM mem-tree (C0)
   reading, merged into the extent and segment-index loaders
 - `dissect/archive/tibx/segment.py` — the `comp=0x0001` (LZ4 / stored) segment variant
 - `tests/_synth.py` — the synthetic archive fixtures

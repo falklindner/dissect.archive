@@ -6,7 +6,7 @@ import pytest
 from dissect.util import ts
 
 from dissect.archive.tibx.c_tibx import PAGE_MARKER, PAGE_SIZE, c_tibx
-from dissect.archive.tibx.exceptions import CorruptArchiveError, InvalidArchiveError
+from dissect.archive.tibx.exception import CorruptArchiveError, InvalidArchiveError
 from dissect.archive.tibx.page import PageStore, SuperBlock, page_crc32c
 from tests._synth import SEG_PAYLOAD, arch_page, build_archive, data_page
 

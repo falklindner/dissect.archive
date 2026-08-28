@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from dissect.archive.tibx.maps import load_extents, load_segment_index
+from dissect.archive.tibx.map import load_extents, load_segment_index
 from dissect.archive.tibx.tibx import TIBX, resolve_extents
 from tests._synth import (
     PAGE,
@@ -188,7 +188,7 @@ def test_discard_extent_masks_older_data() -> None:
     base = ExtentSpec(10, 0, b"A" * 0x4000, slice_id=2, extent_id=1)
     tibx = _open(build_lsm_archive([base]))
     # Inject the discard extent directly (the builder always allocates segments)
-    from dissect.archive.tibx.maps import Extent
+    from dissect.archive.tibx.map import Extent
 
     discard = Extent(
         volume_id=10, source_offset=0x1000, extent_length=0x1000, slice_id=3, extent_id=2, segment_id=0, extent_index=0

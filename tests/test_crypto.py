@@ -12,7 +12,7 @@ from dissect.archive.tibx.crypto import (
     has_password_wrapped_key,
     unwrap_data_key,
 )
-from dissect.archive.tibx.exceptions import InvalidPasswordError, UnsupportedFormatError
+from dissect.archive.tibx.exception import InvalidPasswordError, UnsupportedFormatError
 from dissect.archive.tibx.lsm import read_archive_header
 from dissect.archive.tibx.page import PageStore
 from dissect.archive.tibx.tibx import TIBX

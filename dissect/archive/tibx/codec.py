@@ -26,7 +26,7 @@ if sys.version_info >= (3, 14):
 else:
     from backports import zstd
 
-from dissect.archive.tibx.exceptions import CorruptArchiveError
+from dissect.archive.tibx.exception import CorruptArchiveError
 
 # Generous ceiling for a single decompressed unit; real segments are a few MiB
 MAX_DECOMPRESSED = 2 << 30

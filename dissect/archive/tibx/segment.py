@@ -27,8 +27,8 @@ from dissect.archive.tibx.c_tibx import (
     SEGMENT_PAYLOAD_OFFSET,
     c_tibx,
 )
-from dissect.archive.tibx.codecs import decompress_zstd, lz4_block_decompress
-from dissect.archive.tibx.exceptions import (
+from dissect.archive.tibx.codec import decompress_zstd, lz4_block_decompress
+from dissect.archive.tibx.exception import (
     CorruptArchiveError,
     InvalidPasswordError,
     UnsupportedFormatError,

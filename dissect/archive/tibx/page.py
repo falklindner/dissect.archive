@@ -18,7 +18,7 @@ from dissect.util import ts
 from dissect.util.hash import crc32c
 
 from dissect.archive.tibx.c_tibx import PAGE_MARKER, PAGE_SIZE, c_tibx
-from dissect.archive.tibx.exceptions import CorruptArchiveError, InvalidArchiveError
+from dissect.archive.tibx.exception import CorruptArchiveError, InvalidArchiveError
 
 if TYPE_CHECKING:
     import datetime

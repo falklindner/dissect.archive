@@ -29,14 +29,14 @@ from dissect.archive.tibx.c_tibx import (
     TLV_KEYMAP,
     c_tibx,
 )
-from dissect.archive.tibx.exceptions import (
+from dissect.archive.tibx.exception import (
     CorruptArchiveError,
     Error,
     InvalidArchiveError,
     UnsupportedFormatError,
 )
 from dissect.archive.tibx.lsm import read_archive_header
-from dissect.archive.tibx.maps import load_extents, load_segment_index
+from dissect.archive.tibx.map import load_extents, load_segment_index
 from dissect.archive.tibx.page import PageStore
 from dissect.archive.tibx.segment import read_plaintext
 from dissect.archive.tibx.stream import TibxVolumeStream
@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
     from dissect.archive.tibx.lsm import ArchiveHeader
-    from dissect.archive.tibx.maps import Extent
+    from dissect.archive.tibx.map import Extent
     from dissect.archive.tibx.page import SuperBlock
 
 # Decompressed segments are cached per archive under a memory budget rather than a fixed

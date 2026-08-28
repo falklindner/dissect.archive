@@ -5,7 +5,7 @@ import random
 
 import pytest
 
-from dissect.archive.tibx.exceptions import CorruptArchiveError, InvalidPasswordError
+from dissect.archive.tibx.exception import CorruptArchiveError, InvalidPasswordError
 from dissect.archive.tibx.page import PageStore
 from dissect.archive.tibx.segment import Segment, read_plaintext
 from tests._synth import COMP_NONE, PAGE, arch_page, segment_pages

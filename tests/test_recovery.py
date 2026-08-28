@@ -4,7 +4,7 @@ import io
 
 import pytest
 
-from dissect.archive.tibx.exceptions import InvalidArchiveError
+from dissect.archive.tibx.exception import InvalidArchiveError
 from dissect.archive.tibx.tibx import TIBX
 from tests._synth import ExtentSpec, build_multiroot_archive
 

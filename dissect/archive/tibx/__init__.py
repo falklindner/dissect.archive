@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dissect.archive.tibx.exceptions import (
+from dissect.archive.tibx.exception import (
     CorruptArchiveError,
     Error,
     InvalidArchiveError,

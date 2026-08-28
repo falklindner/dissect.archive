@@ -31,8 +31,8 @@ from dissect.archive.tibx.c_tibx import (
     TLV_SLOT_COUNT,
     c_tibx,
 )
-from dissect.archive.tibx.codecs import decompress_cell_stream, decompress_linked_lz4
-from dissect.archive.tibx.exceptions import CorruptArchiveError, UnsupportedFormatError
+from dissect.archive.tibx.codec import decompress_cell_stream, decompress_linked_lz4
+from dissect.archive.tibx.exception import CorruptArchiveError, UnsupportedFormatError
 from dissect.archive.tibx.page import ARCH_MAGIC
 
 if TYPE_CHECKING:

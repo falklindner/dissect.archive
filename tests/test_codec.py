@@ -5,14 +5,14 @@ import sys
 
 import pytest
 
-from dissect.archive.tibx import codecs
-from dissect.archive.tibx.codecs import (
+from dissect.archive.tibx import codec
+from dissect.archive.tibx.codec import (
     decompress_cell_stream,
     decompress_linked_lz4,
     decompress_zstd,
     lz4_block_decompress,
 )
-from dissect.archive.tibx.exceptions import CorruptArchiveError
+from dissect.archive.tibx.exception import CorruptArchiveError
 
 if sys.version_info >= (3, 14):
     from compression import zstd  # novermin
@@ -50,14 +50,14 @@ def test_lz4_block_with_dictionary() -> None:
 def test_lz4_pure_python_fallback_matches_accelerator(monkeypatch: pytest.MonkeyPatch) -> None:
     # The C accelerator is optional; the pure-Python decoder is the no-dependency fallback.
     # Both must produce byte-identical output, including the growing-dictionary case.
-    if codecs._lz4_block is None:
+    if codec._lz4_block is None:
         pytest.skip("C lz4 accelerator not loaded; only the fallback path is available")
     dictionary = PLAIN[:1000]
     chunk = PLAIN[500:1800]
     compressed = lz4.compress(chunk, mode="high_compression", store_size=False, dict=dictionary)
 
     accelerated = lz4_block_decompress(compressed, len(chunk), dictionary)
-    monkeypatch.setattr(codecs, "_lz4_block", None)
+    monkeypatch.setattr(codec, "_lz4_block", None)
     fallback = lz4_block_decompress(compressed, len(chunk), dictionary)
     assert accelerated == fallback == chunk
 

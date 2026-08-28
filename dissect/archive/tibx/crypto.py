@@ -34,8 +34,8 @@ from dissect.archive.tibx.c_tibx import (
     WRAPPED_KEY_HEADER_SIZE,
     c_tibx,
 )
-from dissect.archive.tibx.codecs import decompress_linked_lz4
-from dissect.archive.tibx.exceptions import InvalidPasswordError, UnsupportedFormatError
+from dissect.archive.tibx.codec import decompress_linked_lz4
+from dissect.archive.tibx.exception import InvalidPasswordError, UnsupportedFormatError
 
 if TYPE_CHECKING:
     from dissect.archive.tibx.lsm import ArchiveHeader
