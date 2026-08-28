@@ -15,7 +15,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, BinaryIO
 
 from dissect.util import ts
-from dissect.util.hash.crc32c import crc32c
+from dissect.util.hash import crc32c
 
 from dissect.archive.tibx.c_tibx import PAGE_MARKER, PAGE_SIZE, c_tibx
 from dissect.archive.tibx.exceptions import CorruptArchiveError, InvalidArchiveError
@@ -27,11 +27,19 @@ if TYPE_CHECKING:
 ARCH_MAGIC = b"ARCH"
 
 # ENVELOPE PARSING -- page envelopes go through :class:`c_tibx.page_header` everywhere
-# except the three whole-archive scan loops below (``live_root``, ``commit_roots``,
-# ``verify``), which index the envelope bytes directly. Those loops touch every page in the
-# archive, and cstruct costs ~3.99 us per envelope against ~0.24 us for the indexing
-# (16.7x): on a 100 GiB archive that is ~100 s of pure header parsing instead of ~6 s. The
-# offsets are declared once in ``page_header`` and mirrored only in those three loops.
+# except :meth:`PageStore.commit_roots`, which indexes the envelope bytes directly.
+#
+# cstruct costs ~3.6 us per envelope against ~0.33 us for the indexing, but that ratio is
+# not the one that matters; measured end to end on a 949 MiB archive (242,977 pages):
+#
+#   live_root()      1.02x  -- scans backward from EOF and stops at the newest ARCH,
+#                              3 pages in practice, so the choice is unmeasurable
+#   verify()         1.06x  -- dominated by CRC-32C (13.1 s of the 13.9 s)
+#   commit_roots()   1.92x  -- 859 ms vs 1644 ms; the only loop where it pays
+#
+# So only ``commit_roots`` -- a full sweep whose per-page work is otherwise just a marker
+# comparison -- indexes directly, and the offsets are mirrored in that one place. Random
+# access never touches this path at all.
 
 # Pages recently returned by ``page()`` are kept in a small LRU so repeated single-page
 # reads -- LSM directory pages revisited during tree walks, a segment header page read to
@@ -43,10 +51,16 @@ PAGE_CACHE_SIZE = 512
 def page_crc32c(page: bytes) -> int:
     """Return the CRC-32C of a page with the four checksum bytes at ``[4:8]`` zeroed.
 
-    Feeding the three runs through ``crc32c``'s chainable ``value`` argument avoids
-    building a zeroed 4 KiB copy of every page the scans below touch.
+    The three runs are chained through ``crc32c``'s ``value`` argument rather than CRCing a
+    zeroed 4 KiB copy. Both measure the same (77.7 vs 77.5 MB/s over 30k pages) -- the
+    chained form is just the one that does not allocate.
+
+    Note the import: ``dissect.util.hash`` rebinds its ``crc32c`` attribute to the native
+    (Rust) implementation when available, so it has to be reached through the package.
+    ``from dissect.util.hash.crc32c import crc32c`` resolves through ``sys.modules`` to the
+    pure-Python submodule instead and is ~14x slower for identical output.
     """
-    return crc32c(page[8:], crc32c(b"\x00\x00\x00\x00", crc32c(page[:4])))
+    return crc32c.crc32c(page[8:], crc32c.crc32c(b"\x00\x00\x00\x00", crc32c.crc32c(page[:4])))
 
 
 def _type_name(value: int) -> str:
@@ -180,12 +194,8 @@ class PageStore:
         """
         for index in range(self.page_count - 1, -1, -1):
             page = self.page(index)
-            # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
-            if (
-                page[1] == c_tibx.PageType.ARCH
-                and page[8:12] == ARCH_MAGIC
-                and int.from_bytes(page[4:8], "big") == page_crc32c(page)
-            ):
+            header = c_tibx.page_header(page)
+            if header.type == c_tibx.PageType.ARCH and page[8:12] == ARCH_MAGIC and header.crc32c == page_crc32c(page):
                 return SuperBlock(page, index * PAGE_SIZE)
         raise CorruptArchiveError("No CRC-valid ARCH superblock found")
 
@@ -219,12 +229,13 @@ class PageStore:
         by_type: dict[str, int] = {}
         bad_pages: list[int] = []
         for index, page in self.pages():
-            # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
             if page == zero_page:
                 holes += 1
-            elif int.from_bytes(page[4:8], "big") == page_crc32c(page):
+                continue
+            header = c_tibx.page_header(page)
+            if header.crc32c == page_crc32c(page):
                 ok += 1
-                name = _type_name(page[1])
+                name = _type_name(header.type)
                 by_type[name] = by_type.get(name, 0) + 1
             else:
                 bad += 1
