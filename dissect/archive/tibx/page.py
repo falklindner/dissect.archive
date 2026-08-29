@@ -11,7 +11,6 @@ Ported from the page store of the MIT-licensed ``acronis-tibx``. See
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from typing import TYPE_CHECKING, BinaryIO
 
 from dissect.util import ts
@@ -41,11 +40,13 @@ ARCH_MAGIC = b"ARCH"
 # comparison -- indexes directly, and the offsets are mirrored in that one place. Random
 # access never touches this path at all.
 
-# Pages recently returned by ``page()`` are kept in a small LRU so repeated single-page
-# reads -- LSM directory pages revisited during tree walks, a segment header page read to
-# parse the ``Segment`` then again to read its payload -- do not each re-hit the backing
-# file (which may be a network share). 512 pages == 2 MiB.
-PAGE_CACHE_SIZE = 512
+# NO PAGE CACHE -- ``page()`` reads straight through, deliberately. A 512-page LRU used to
+# sit here, on the theory that tree walks and segment headers get revisited. Measured on
+# real archives it never once hit: :class:`TIBX`'s 256 MiB segment cache absorbs the
+# repeats, and segment payloads go through :meth:`read_run`, which does not consult it. What
+# reaches ``page()`` is one header page per distinct segment, read once -- 40 to 500
+# calls for 3000 scattered 4 KiB reads. The LRU only earned hits with the segment cache
+# shrunk to 256 KiB, which is not a configuration anyone runs.
 
 
 def page_crc32c(page: bytes) -> int:
@@ -121,30 +122,22 @@ class PageStore:
         fh.seek(0, 2)
         self.size = fh.tell()
         self.page_count = self.size // PAGE_SIZE
-        self._page_cache: OrderedDict[int, bytes] = OrderedDict()
 
         if self.size < PAGE_SIZE or c_tibx.arch_superblock(self.page(0)).magic != ARCH_MAGIC:
             raise InvalidArchiveError("Missing ARCH magic at page 0")
 
     def page(self, index: int) -> bytes:
-        """Read the page at ``index`` (LRU-cached).
+        """Read the page at ``index``.
 
         Raises:
             CorruptArchiveError: If the page does not exist or is truncated.
         """
-        cached = self._page_cache.get(index)
-        if cached is not None:
-            self._page_cache.move_to_end(index)
-            return cached
         if not 0 <= index < self.page_count:
             raise CorruptArchiveError(f"page {index} is out of bounds (archive has {self.page_count} pages)")
         self.fh.seek(index * PAGE_SIZE)
         page = self.fh.read(PAGE_SIZE)
         if len(page) != PAGE_SIZE:
             raise CorruptArchiveError(f"short read on page {index}")
-        self._page_cache[index] = page
-        if len(self._page_cache) > PAGE_CACHE_SIZE:
-            self._page_cache.popitem(last=False)
         return page
 
     def read_run(self, start: int, count: int) -> list[bytes]:
@@ -152,9 +145,7 @@ class PageStore:
 
         Collapses what would otherwise be ``count`` separate ``seek``+``read`` calls into
         one -- the pages of a multi-page segment are physically contiguous, so this is the
-        batch read path for :func:`segment.read_compressed`. Unlike :meth:`page` it does not
-        populate the LRU (segment payload pages are read once), but it does honour pages
-        already resident there.
+        batch read path for :func:`segment.read_compressed`.
 
         Raises:
             CorruptArchiveError: If the run extends past the end of the archive or is truncated.
