@@ -62,6 +62,32 @@ def test_lz4_pure_python_fallback_matches_accelerator(monkeypatch: pytest.Monkey
     assert accelerated == fallback == chunk
 
 
+def test_lz4_without_dictionary_uses_dissect_util(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without the C package, a block that needs no dictionary must go through
+    # dissect.util rather than the in-tree decoder, and agree with it byte for byte.
+    chunk = PLAIN[:1800]
+    compressed = lz4.compress(chunk, mode="high_compression", store_size=False)
+    monkeypatch.setattr(codec, "_lz4_block", None)
+
+    calls: list[int] = []
+    original = codec.util_lz4.decompress
+
+    def counted(src: bytes, uncompressed_size: int = -1, **kwargs: object) -> bytes:
+        calls.append(uncompressed_size)
+        return original(src, uncompressed_size=uncompressed_size, **kwargs)
+
+    monkeypatch.setattr(codec.util_lz4, "decompress", counted)
+    assert lz4_block_decompress(compressed, len(chunk)) == chunk
+    assert calls == [len(chunk)]
+
+
+def test_lz4_without_dictionary_rejects_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
+    # dissect.util's two backends raise different types; both must surface as ours.
+    monkeypatch.setattr(codec, "_lz4_block", None)
+    with pytest.raises(CorruptArchiveError):
+        lz4_block_decompress(b"\xff" * 64, 4096)
+
+
 def _linked_chain(chunks: list[bytes]) -> bytes:
     body = bytearray()
     history = b""

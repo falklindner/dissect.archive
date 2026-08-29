@@ -6,8 +6,12 @@
   back-reference previously decompressed output as its LZ4 dictionary
   (``LZ4_decompress_safe_continue`` semantics).
 
-``dissect.util``'s LZ4 has no dictionary parameter, so the raw block decoder here is
-adapted from ``dissect.util.compression.lz4_python`` with a dictionary seed added.
+Blocks that need no dictionary -- the first of every chain, and whole LZ4 segments -- go
+through ``dissect.util``'s decoder. The rest cannot: ``dissect.util`` exposes no dictionary
+parameter on either backend, so the in-tree decoder below (adapted from
+``dissect.util.compression.lz4_python``, with a dictionary seed added) stays as the
+fallback for them.
+
 A ``.tibx`` is untrusted input: every decode is bounded by the caller-supplied output
 size so malformed on-disk sizes can't drive unbounded allocations.
 
@@ -26,16 +30,19 @@ if sys.version_info >= (3, 14):
 else:
     from backports import zstd
 
+from dissect.util.compression import lz4 as util_lz4
+from dissect.util.exceptions import CorruptDataError
+
 from dissect.archive.tibx.exception import CorruptArchiveError
 
 # Generous ceiling for a single decompressed unit; real segments are a few MiB
 MAX_DECOMPRESSED = 2 << 30
 
-# Optional C-accelerated LZ4 block decoder. The pure-Python decoder below is always the
-# fallback (``lz4`` is not a hard dependency), so nothing breaks without it; when present
-# it is orders of magnitude faster and, per a capability probe, produces byte-identical
-# output including the growing-dictionary (``LZ4_decompress_safe_continue``) semantics the
-# linked-LZ4 chains rely on.
+# Optional C-accelerated LZ4 block decoder -- the only one of the three that takes a
+# dictionary, so it is tried first. ``lz4`` is not a hard dependency; without it,
+# dictionary blocks fall through to the in-tree decoder. A capability probe confirms it
+# produces byte-identical output including the growing-dictionary
+# (``LZ4_decompress_safe_continue``) semantics the linked-LZ4 chains rely on.
 try:
     import lz4.block as _lz4_block
 
@@ -64,18 +71,30 @@ def decompress_zstd(data: bytes, max_output: int) -> bytes:
 def lz4_block_decompress(src: bytes, uncompressed_size: int, dictionary: bytes = b"") -> bytes:
     """Raw LZ4 block decode with dictionary support.
 
-    Adapted from ``dissect.util.compression.lz4_python.decompress``, extended with a
-    ``dictionary`` seed: output starts as the dictionary so matches may reach back into
-    it; the seed is stripped from the returned data.
+    Three decoders, fastest first:
 
-    Uses the C ``lz4`` library when available (byte-identical, far faster), falling back
-    to the pure-Python decoder otherwise.
+    1. the C ``lz4`` library, the only one that takes a dictionary, so it serves every block
+    2. ``dissect.util`` (Rust-backed when built) for blocks that need no dictionary -- the
+       first block of every chain, and whole LZ4 segments
+    3. the decoder below, adapted from ``dissect.util.compression.lz4_python.decompress``
+       with a ``dictionary`` seed: output starts as the dictionary so matches may reach back
+       into it, and the seed is stripped from the returned data
+
+    All three are byte-identical on the real-sample corpus.
     """
     if _lz4_block is not None and uncompressed_size > 0:
         try:
             return _lz4_block.decompress(src, uncompressed_size=uncompressed_size, dict=dictionary)
         except Exception as e:
             # Malformed on-disk block on untrusted input -- normalise to our error type
+            raise CorruptArchiveError(f"LZ4: {e}")
+
+    if not dictionary and uncompressed_size > 0:
+        try:
+            return util_lz4.decompress(src, uncompressed_size=uncompressed_size)
+        except (CorruptDataError, ValueError) as e:
+            # The two backends disagree on type: the Rust one raises ValueError, the
+            # pure-Python one CorruptDataError, which is not a ValueError.
             raise CorruptArchiveError(f"LZ4: {e}")
 
     reader = io.BytesIO(src)
