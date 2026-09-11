@@ -83,6 +83,18 @@ struct segment_header {
     uint16      cache;                  /* cache hint flags */
 };
 
+/* Prefix of an encrypted ("SE") segment payload, ahead of the ciphertext. Which one
+ * applies is decided by the wrapped key's alg: a CBC variant carries the IV alone and
+ * pads the ciphertext, a GCM variant follows the IV with the tag over that ciphertext. */
+struct segment_cbc_header {
+    char        iv[16];
+};
+
+struct segment_gcm_header {
+    char        iv[16];
+    char        tag[16];                /* AES-GCM tag, computed with no additional data */
+};
+
 /* LSM superblock (L-SB), carried as a TLV payload in the ARCH header body */
 struct lsm_superblock {
     char        magic[4];               /* "L-SB" */
@@ -140,12 +152,26 @@ struct data_map_value {
     uint16      extent_index;           /* 0xFFFF = extent fills the whole segment */
 };
 
+/* TLV[5] "slices" record: one backup of the archive. Every data_map extent carries this
+ * key's slice id in its own slice_id, to say which backup wrote it. The record is longer
+ * than the value struct below; only the leading fields are understood. The guid is the one
+ * "acrocmd list backups" prints for the backup, and is stored mixed-endian. */
+struct slice_key {
+    uint32      slice_id;
+};
+
+struct slice_record {
+    char        guid[16];
+    uint64      created_ms;             /* ms since the Unix epoch */
+    uint64      modified_ms;
+};
+
 /* Password-wrapped data key, stored in the keymap tree (TLV[7]) mem-tree. The wrapped
  * key itself follows this header and runs to the end of the blob: its length is not
  * carried in the format, only its PKCS#7 padding is. */
 struct wrapped_key {
     uint8       format;                 /* 0x01 password-wrapped, 0x02 certificate-wrapped */
-    uint8       alg;                    /* AES variant, see CBC_KEY_LENGTH / GCM_ALG_IDS */
+    uint8       alg;                    /* segment cipher, see KEY_LENGTH; the wrap is always CBC */
     uint8       iter_log2;              /* PBKDF2 iterations = 1 << iter_log2 */
     uint8       _reserved;
     char        salt[16];               /* PBKDF2 salt */
@@ -176,6 +202,9 @@ SEGMENT_HEADER_OFFSET = 8
 SEGMENT_PAYLOAD_OFFSET = 0x2C
 # Compressed bytes on the segment's first page; the rest spills onto continuation pages
 SEGMENT_FIRST_PAGE_PAYLOAD = PAGE_SIZE - SEGMENT_PAYLOAD_OFFSET
+
+SEGMENT_CBC_HEADER_SIZE = len(c_tibx.segment_cbc_header)
+SEGMENT_GCM_HEADER_SIZE = len(c_tibx.segment_gcm_header)
 
 # segment_header.compression variants
 COMP_NONE = 0x0000

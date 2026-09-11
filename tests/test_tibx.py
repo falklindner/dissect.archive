@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from dissect.archive.tibx.map import load_extents, load_segment_index
-from dissect.archive.tibx.tibx import TIBX, resolve_extents
+from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX, resolve_extents
 from tests._synth import (
     PAGE,
     Cell,
@@ -51,7 +51,7 @@ def test_volume_reconstruction_with_holes(use_ctree: bool) -> None:
         ExtentSpec(10, 0xC000, b"B" * 0x4000),  # sparse hole at [0x8000, 0xC000)
     ]
     tibx = _open(build_lsm_archive(extents, use_ctree=use_ctree))
-    volumes = tibx.volumes()
+    volumes = tibx.streams()
     assert len(volumes) == 1
     volume = volumes[0]
     assert volume.volume_id == 10
@@ -71,7 +71,7 @@ def test_overlapping_extents_newest_slice_wins() -> None:
     # Note it carries a LOWER extent_id — only the slice id signals recency.
     patch = ExtentSpec(10, 0x2000, b"X" * 0x1000, slice_id=3, extent_id=1)
     tibx = _open(build_lsm_archive([base, patch]))
-    volume = tibx.volumes()[0]
+    volume = tibx.streams()[0]
 
     assert volume.read(0x2000, 0x1000) == b"X" * 0x1000
     # The tail of the longer base extent is NOT masked by the shorter newer one
@@ -85,14 +85,14 @@ def test_multiple_volumes_ranked_by_span() -> None:
         ExtentSpec(10, 0, b"L" * 0x20000),
     ]
     tibx = _open(build_lsm_archive(extents))
-    volumes = tibx.volumes()
+    volumes = tibx.streams()
     assert [v.volume_id for v in volumes] == [10, 6]
 
 
 def test_multi_page_segment_in_volume() -> None:
     data = random.Random(1).randbytes(4 * PAGE)  # incompressible, spans pages
     tibx = _open(build_lsm_archive([ExtentSpec(10, 0, data)]))
-    assert tibx.volumes()[0].read(0, len(data)) == data
+    assert tibx.streams()[0].read(0, len(data)) == data
 
 
 def test_stream_matches_direct_reads() -> None:
@@ -101,7 +101,7 @@ def test_stream_matches_direct_reads() -> None:
         ExtentSpec(10, 0x9000, b"B" * 0x3000),
     ]
     tibx = _open(build_lsm_archive(extents))
-    volume = tibx.volumes()[0]
+    volume = tibx.streams()[0]
     stream = volume.open()
 
     assert stream.size == volume.size
@@ -120,7 +120,7 @@ def test_volume_size_from_ntfs_boot_sector() -> None:
     struct.pack_into("<H", boot, 0x0B, 512)
     struct.pack_into("<Q", boot, 0x28, 100)
     tibx = _open(build_lsm_archive([ExtentSpec(10, 0, bytes(boot))]))
-    volume = tibx.volumes()[0]
+    volume = tibx.streams()[0]
     assert volume.size == 100 * 512
     # The tail past the last extent reads as zeros
     assert volume.read(0x1000, volume.size - 0x1000) == b"\x00" * (volume.size - 0x1000)
@@ -130,7 +130,7 @@ def test_volume_size_from_fat32_boot_sector() -> None:
     # FAT32 needs 65525+ clusters, so the image is ~32 MiB virtual with a sparse body
     image = build_fat32_image(b"fat32 file content")
     tibx = _open(build_lsm_archive(sparse_extents(10, image)))
-    volume = tibx.volumes()[0]
+    volume = tibx.streams()[0]
     assert volume.size == len(image)
     assert volume.read(0, 512) == image[:512]
 
@@ -139,7 +139,7 @@ def test_volume_size_from_exfat_boot_sector() -> None:
     image = build_exfat_image(b"exfat file content")
     # Pad the data_map span past the filesystem: the boot-sector size must win
     tibx = _open(build_lsm_archive([ExtentSpec(10, 0, image), ExtentSpec(10, len(image), b"\x00" * 512)]))
-    volume = tibx.volumes()[0]
+    volume = tibx.streams()[0]
     assert volume.size == len(image)
 
 
@@ -174,7 +174,7 @@ def test_multi_extent_shared_segment() -> None:
         ExtentSpec(8, 0, third, segment_group=1),
     ]
     tibx = _open(build_lsm_archive(extents))
-    volumes = {v.volume_id: v for v in tibx.volumes()}
+    volumes = {v.volume_id: v for v in tibx.streams()}
 
     assert volumes[6].read(0, 119) == first + second
     assert volumes[8].read(0, 100) == third
@@ -196,7 +196,7 @@ def test_discard_extent_masks_older_data() -> None:
     tibx._extents = [*tibx.extents, discard]
     tibx._volumes = None
 
-    volume = tibx.volumes()[0]
+    volume = tibx.streams()[0]
     assert volume.read(0, 0x1000) == b"A" * 0x1000
     assert volume.read(0x1000, 0x1000) == b"\x00" * 0x1000  # masked by the discard
     assert volume.read(0x2000, 0x1000) == b"A" * 0x1000  # older data past the marker
@@ -224,7 +224,7 @@ def test_tombstone_masks_older_records() -> None:
     )
 
     tibx = _open(archive)
-    volume = tibx.volumes()[0]
+    volume = tibx.streams()[0]
     assert [extent.source_offset for extent in volume.extents] == [0x1000]
     assert volume.read(0x1000, 64) == payload_b
     # The masked extent's range reads as a sparse hole, not the old data
@@ -246,7 +246,7 @@ def test_version_set_file_table(tmp_path: Path, use_ctree: bool) -> None:
 
     with TIBX.open(tmp_path / "Ver.tibx") as tibx:
         assert tibx.store.page_count == 8 + len(version) // PAGE
-        volume = tibx.volumes()[0]
+        volume = tibx.streams()[0]
         assert volume.read(0, len(data)) == data
         result = tibx.store.verify()
         assert result["bad"] == 0
@@ -258,4 +258,55 @@ def test_comp_stored_variants(compression: int) -> None:
     # Metadata-stream variants observed in real archives, only ever stored verbatim
     data = b"metadata stream content" * 5
     tibx = _open(build_lsm_archive([ExtentSpec(10, 0, data)], compression=compression))
-    assert tibx.volumes()[0].read(0, len(data)) == data
+    assert tibx.streams()[0].read(0, len(data)) == data
+
+
+def _ntfs_boot(total_sectors: int, sector_size: int = 512) -> bytes:
+    """A boot sector just complete enough for _boot_sector_size to size the volume."""
+    boot = bytearray(512)
+    boot[3:11] = b"NTFS    "
+    struct.pack_into("<H", boot, 0x0B, sector_size)
+    struct.pack_into("<Q", boot, 0x28, total_sectors)
+    return bytes(boot)
+
+
+def test_metadata_streams_are_not_volumes() -> None:
+    # Acronis keys its own metadata by volume id exactly like a partition: the metainfo
+    # XML, allocation bitmaps, small index tables, the disk's MBR region. Reporting those
+    # as volumes made a one-partition backup look like eight.
+    archive = build_lsm_archive(
+        [
+            ExtentSpec(4, 0, _ntfs_boot(0x18000) + b"\x00" * 512),  # a real 48 MB volume
+            ExtentSpec(8, 0, b'\xef\xbb\xbf<?xml version="1.0"?><metainfo/>'),
+            ExtentSpec(5, 0, b"\xff" * 520),
+            ExtentSpec(2, 0, b"\x00" * 16),
+        ]
+    )
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert [v.volume_id for v in tibx.volumes()] == [4]
+    assert len(tibx.streams()) == 4  # nothing is lost, just classified
+
+
+def test_unformatted_partition_is_still_a_volume() -> None:
+    # A partition Acronis cannot identify is reported by "acrocmd list content" as a
+    # partition of type None, so size has to carry it -- a filesystem check alone would
+    # silently drop it.
+    archive = build_lsm_archive(
+        [
+            ExtentSpec(4, 0, _ntfs_boot(0x18000) + b"\x00" * 512),
+            ExtentSpec(9, MIN_VOLUME_SIZE, b"unformatted tail"),  # span >= MIN_VOLUME_SIZE
+            ExtentSpec(3, 0, b"\x02\x00\x02\x00" * 8),
+        ]
+    )
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert sorted(v.volume_id for v in tibx.volumes()) == [4, 9]
+
+
+def test_small_recognised_filesystem_is_a_volume() -> None:
+    # Below the size threshold, but it says NTFS, so it is a volume.
+    archive = build_lsm_archive([ExtentSpec(4, 0, _ntfs_boot(0x40) + b"\x00" * 512)])
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert [v.volume_id for v in tibx.volumes()] == [4]

@@ -40,6 +40,10 @@ COMP_ZSTD = 0x0300
 
 FORMAT_PASSWORD = 0x01
 
+# Segment cipher ids, as carried in the wrapped-key header -> AES key length in bytes
+GCM_ALGS = (5, 6, 7)
+KEY_LENGTH = {1: 16, 2: 24, 3: 32, 5: 16, 6: 24, 7: 32}
+
 
 def finalize(pg: bytearray) -> bytes:
     """Stamp the page CRC-32C (big-endian at +0x04) and freeze the page."""
@@ -66,11 +70,15 @@ def data_page(payload: bytes) -> bytes:
     return pages[0]
 
 
-def segment_pages(payload: bytes, compression: int = COMP_ZSTD, data_key: bytes | None = None) -> list[bytes]:
+def segment_pages(
+    payload: bytes, compression: int = COMP_ZSTD, data_key: bytes | None = None, alg: int = 3
+) -> list[bytes]:
     """Build the DATA page(s) of one segment: header page + continuation pages.
 
-    With ``data_key`` set, an encrypted ``SE`` segment is produced: the compressed blob is
-    AES-256-CBC encrypted (random IV prepended, PKCS#7 padded) and the key id is 1.
+    With ``data_key`` set, an encrypted ``SE`` segment is produced and the key id is 1.
+    ``alg`` selects the framing, mirroring what Acronis writes: a CBC id (1-3) prepends a
+    random IV and PKCS#7-pads, a GCM id (5-7) prepends the IV and the tag and leaves the
+    ciphertext exactly as long as the plaintext.
     """
     if compression == COMP_ZSTD:
         blob = zstd.compress(payload)
@@ -83,8 +91,13 @@ def segment_pages(payload: bytes, compression: int = COMP_ZSTD, data_key: bytes 
         from Crypto.Cipher import AES
 
         iv = bytes(range(16))
-        padded = blob + bytes([16 - len(blob) % 16]) * (16 - len(blob) % 16)
-        blob = iv + AES.new(data_key, AES.MODE_CBC, iv).encrypt(padded)
+        if alg in GCM_ALGS:
+            ciphertext, tag = AES.new(data_key, AES.MODE_GCM, nonce=iv).encrypt_and_digest(blob)
+            blob = c_tibx.segment_gcm_header(iv=iv, tag=tag).dumps() + ciphertext
+        else:
+            padded = blob + bytes([16 - len(blob) % 16]) * (16 - len(blob) % 16)
+            ciphertext = AES.new(data_key, AES.MODE_CBC, iv).encrypt(padded)
+            blob = c_tibx.segment_cbc_header(iv=iv).dumps() + ciphertext
         magic, key_id = b"SE\x00\x00", 1
     else:
         magic, key_id = b"SG\x00\x01", 0
@@ -109,11 +122,14 @@ def segment_pages(payload: bytes, compression: int = COMP_ZSTD, data_key: bytes 
     return pages
 
 
-def wrap_data_key(data_key: bytes, password: bytes, iter_log2: int = 12) -> bytes:
+def wrap_data_key(data_key: bytes, password: bytes, iter_log2: int = 12, alg: int = 3) -> bytes:
     """Build a keymap mem-tree blob wrapping ``data_key`` with ``password``.
 
-    Mirrors the real layout ``[format=1][alg=3][iter_log2][reserved][salt·16][wrapped]``,
+    Mirrors the real layout ``[format=1][alg][iter_log2][reserved][salt·16][wrapped]``,
     preceded by a short opaque preamble like real archives carry. Raw-encoded (no LZ4).
+
+    The wrap is AES-256-CBC whatever ``alg`` says, because ``alg`` names the cipher used
+    for the *data segments* -- Acronis wraps the key the same way for CBC and GCM alike.
     """
     from Crypto.Cipher import AES
     from Crypto.Hash import SHA256
@@ -121,9 +137,10 @@ def wrap_data_key(data_key: bytes, password: bytes, iter_log2: int = 12) -> byte
 
     salt = bytes(range(100, 116))
     kek = PBKDF2(password, salt, dkLen=32, count=1 << iter_log2, hmac_hash_module=SHA256)
-    padded = data_key + bytes([16]) * 16  # 32-byte key -> full padding block
+    pad = 16 - len(data_key) % 16
+    padded = data_key + bytes([pad]) * pad
     wrapped = AES.new(kek, AES.MODE_CBC, b"\x00" * 16).encrypt(padded)
-    header = c_tibx.wrapped_key(format=FORMAT_PASSWORD, alg=3, iter_log2=iter_log2, _reserved=0, salt=salt)
+    header = c_tibx.wrapped_key(format=FORMAT_PASSWORD, alg=alg, iter_log2=iter_log2, _reserved=0, salt=salt)
     # Two leading bytes so the blob does not start on the format byte -- the parser locates
     # the wrapped key by scanning, and a blob at offset 0 would not exercise that.
     return b"\x00\x00" + header.dumps() + wrapped
@@ -461,6 +478,17 @@ class ExtentSpec(NamedTuple):
     segment_group: int | None = None
 
 
+# TLV[5] slices records are fixed width; only the leading fields are understood, and real
+# archives pad the rest out to this length.
+SLICE_VALUE_LENGTH = 132
+
+
+def slice_record(guid: bytes, created_ms: int, modified_ms: int) -> bytes:
+    """One TLV[5] slices record value: a backup's GUID and its start/finish times."""
+    body = c_tibx.slice_record(guid=guid, created_ms=created_ms, modified_ms=modified_ms).dumps()
+    return body + b"\x00" * (SLICE_VALUE_LENGTH - len(body))
+
+
 def build_lsm_archive(
     extents: list[ExtentSpec],
     *,
@@ -468,23 +496,25 @@ def build_lsm_archive(
     compression: int = COMP_ZSTD,
     uuid: bytes = b"\xab" * 16,
     password: bytes | None = None,
+    alg: int = 3,
     page_base: int = 0,
+    slices: list[int] | None = None,
     extra_slots: dict[int, bytes] | None = None,
 ) -> bytes:
     """Build a complete synthetic archive: ARCH header + LSM maps + SG segments.
 
     Each extent (or shared segment group) becomes one segment. The data_map /
     segment_map records live in the L-SB mem-trees by default, or in on-disk LEAF
-    ctrees when ``use_ctree`` is set. With ``password`` set, segments are AES-256-CBC
-    encrypted and a keymap tree wraps the data key.
+    ctrees when ``use_ctree`` is set. With ``password`` set, segments are encrypted
+    under ``alg`` (AES-256-CBC by default) and a keymap tree wraps the data key.
 
     ``page_base`` makes all absolute page/byte offsets (segment_map, ctrees) global
     for a *version file* mapped at that logical page offset of a version set;
     ``extra_slots`` adds raw TLV payloads (e.g. slot 18, the file table).
     """
-    data_key = bytes(range(32)) if password is not None else None
+    data_key = bytes(range(KEY_LENGTH[alg])) if password is not None else None
     pages, dm_cells, sm_cells, _ = _segments_and_maps(
-        extents, start_page=page_base + 1, compression=compression, data_key=data_key
+        extents, start_page=page_base + 1, compression=compression, data_key=data_key, alg=alg
     )
 
     if use_ctree:
@@ -499,8 +529,22 @@ def build_lsm_archive(
         sm_sb = lsb(8, 32, memtree_cells=sm_cells)
 
     slots = {1: dm_sb, 2: sm_sb}
+    if slices:
+        # One record per backup, keyed by slice id, exactly as the extents reference them.
+        # GUIDs and times are derived from the slice id so a test can predict them.
+        slots[5] = lsb(
+            4,
+            SLICE_VALUE_LENGTH,
+            memtree_cells=[
+                Cell(
+                    c_tibx.slice_key(slice_id=slice_id).dumps(),
+                    slice_record(bytes([slice_id]) * 16, 1000 * slice_id, 1000 * slice_id + 10),
+                )
+                for slice_id in slices
+            ],
+        )
     if password is not None:
-        keymap_blob = wrap_data_key(data_key, password)
+        keymap_blob = wrap_data_key(data_key, password, alg=alg)
         slots[7] = lsb(0, 0, memtree_cells=[Cell(b"", b"")], memtree_blob=keymap_blob, memtree_encoding=0)
     if extra_slots:
         slots.update(extra_slots)
@@ -536,6 +580,7 @@ def _segments_and_maps(
     start_page: int,
     compression: int,
     data_key: bytes | None,
+    alg: int = 3,
 ) -> tuple[list[bytes], list[Cell], list[Cell], int]:
     """Build the SG segment pages plus the data_map/segment_map cells for ``extents``.
 
@@ -571,7 +616,7 @@ def _segments_and_maps(
             )
             payload += spec.data
 
-        seg_pages = segment_pages(bytes(payload), compression=compression, data_key=data_key)
+        seg_pages = segment_pages(bytes(payload), compression=compression, data_key=data_key, alg=alg)
         sm_cells.append(Cell(struct.pack(">Q", segment_id), segment_map_value(len(seg_pages), next_page)))
         pages.extend(seg_pages)
         next_page += len(seg_pages)
@@ -580,31 +625,3 @@ def _segments_and_maps(
     dm_cells.sort(key=lambda c: c.key)
     sm_cells.sort(key=lambda c: c.key)
     return pages, dm_cells, sm_cells, next_page
-
-
-def build_multiroot_archive(roots: list[list[ExtentSpec]], *, compression: int = COMP_ZSTD) -> bytes:
-    """Build an archive with several ARCH commit roots (a synthetic backup chain).
-
-    Each entry in ``roots`` is the extent set of one recovery point, oldest first; each
-    becomes its own ARCH header + segments in one page store. The live root is the last
-    (highest-offset). An empty initial root is prepended, as real archives carry one.
-    """
-    out = bytearray()
-    page_cursor = 0
-
-    # Empty initial root (freshly-created archive, before any data)
-    empty = arch_header_page({1: lsb(31, 10), 2: lsb(8, 32)}, modified_ms=1, uuid=b"\xaa" * 16)
-    out += empty
-    page_cursor += 1
-
-    for root_index, extents in enumerate(roots):
-        pages, dm_cells, sm_cells, next_page = _segments_and_maps(
-            extents, start_page=page_cursor + 1, compression=compression, data_key=None
-        )
-        dm_sb = lsb(31, 10, memtree_cells=dm_cells)
-        sm_sb = lsb(8, 32, memtree_cells=sm_cells)
-        header = arch_header_page({1: dm_sb, 2: sm_sb}, modified_ms=1000 * (root_index + 1), uuid=b"\xab" * 16)
-        out += header + b"".join(pages)
-        page_cursor = next_page
-
-    return bytes(out)

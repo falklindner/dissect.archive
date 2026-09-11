@@ -162,10 +162,12 @@ def read_plaintext(store: PageStore, page_index: int, data_key: DataKey | None =
 
         plaintext = decrypt_segment(read_compressed(store, segment), data_key)
         if segment.compression in COMP_ZSTD:
-            # zstd frame parsing ignores the trailing CBC/PKCS#7 padding
+            # zstd frame parsing ignores any trailing CBC/PKCS#7 padding
             return decompress_zstd(plaintext, segment.length)
-        # Stored or LZ4: recover the exact payload length by removing PKCS#7 padding
-        payload = _pkcs7_unpad(plaintext)
+        # Stored or LZ4: CBC leaves PKCS#7 padding to strip, GCM is already exact -- and
+        # unpadding it there would eat real bytes whenever the payload happens to end in
+        # a valid padding pattern.
+        payload = plaintext if data_key.gcm else _pkcs7_unpad(plaintext)
         if segment.compression == COMP_LZ4 and len(payload) != segment.length:
             return lz4_block_decompress(payload, segment.length)
         if segment.compression in (COMP_NONE, COMP_LZ4) or segment.compression in COMP_STORED_VARIANTS:

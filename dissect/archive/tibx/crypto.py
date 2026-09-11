@@ -12,8 +12,15 @@ The blob sits at an offset inside the (linked-LZ4) keymap mem-tree; its exact fr
 opaque, so we scan for a candidate format byte that unwraps to a valid AES key -- verified
 against real Acronis Cyber Protect / True Image 2026 output.
 
-Each ``SE`` segment payload is ``IV||16 || AES-256-CBC ciphertext``; the plaintext is a
-zstd frame (or stored bytes when the segment's compression is NONE).
+``alg`` selects the cipher for the *data segments* only -- the data key itself is always
+CBC-wrapped as above, whichever variant the segments use. Each ``SE`` payload opens with
+the prefix that variant calls for, a :class:`c_tibx.segment_cbc_header` or a
+:class:`c_tibx.segment_gcm_header`, and the ciphertext follows it. CBC pads the ciphertext
+to a block boundary; GCM leaves it exactly as long as the plaintext, so a GCM segment's
+``zlength`` is its ``length`` plus that prefix.
+
+Either way the plaintext is a zstd frame (or stored bytes when the segment's compression
+is NONE).
 
 Ported from the MIT-licensed ``acronis-tib-reader`` and ``acronis-tibx``. See
 ``THIRD_PARTY_NOTICES.md``.
@@ -28,6 +35,8 @@ from typing import TYPE_CHECKING, NamedTuple
 # (see has_password_wrapped_key), so it is imported where it is used rather than at module
 # import time -- the detection path runs on every archive open.
 from dissect.archive.tibx.c_tibx import (
+    SEGMENT_CBC_HEADER_SIZE,
+    SEGMENT_GCM_HEADER_SIZE,
     TLV_KEYMAP,
     WRAPPED_KEY_FORMAT_PASSWORD,
     WRAPPED_KEY_FORMAT_PUBKEY,
@@ -35,14 +44,15 @@ from dissect.archive.tibx.c_tibx import (
     c_tibx,
 )
 from dissect.archive.tibx.codec import decompress_linked_lz4
-from dissect.archive.tibx.exception import InvalidPasswordError, UnsupportedFormatError
+from dissect.archive.tibx.exception import CorruptArchiveError, InvalidPasswordError
 
 if TYPE_CHECKING:
     from dissect.archive.tibx.lsm import ArchiveHeader
 
-# alg id -> AES key length in bytes (CBC variants); GCM variants are unsupported
+# alg id -> AES key length in bytes, per segment cipher. GOST2015 (4) stays unsupported.
 CBC_KEY_LENGTH = {1: 16, 2: 24, 3: 32}
-GCM_ALG_IDS = {5, 6, 7}
+GCM_KEY_LENGTH = {5: 16, 6: 24, 7: 32}
+KEY_LENGTH = {**CBC_KEY_LENGTH, **GCM_KEY_LENGTH}
 
 MIN_ITER_LOG2 = 10
 MAX_ITER_LOG2 = 24
@@ -55,6 +65,16 @@ class DataKey(NamedTuple):
 
     alg: int
     key: bytes
+
+    @property
+    def gcm(self) -> bool:
+        """Whether segments are AES-GCM.
+
+        GCM plaintext is exactly as long as the ciphertext, where CBC leaves PKCS#7 padding
+        for the caller to strip -- so this also says whether a segment's decrypted bytes may
+        be truncated to the declared length as they are, or need unpadding first.
+        """
+        return self.alg in GCM_KEY_LENGTH
 
 
 def _pkcs7_unpad(data: bytes) -> bytes | None:
@@ -86,23 +106,18 @@ def _parse_wrapped_key(blob: bytes, offset: int) -> tuple[c_tibx.wrapped_key, by
     return c_tibx.wrapped_key(blob[offset:]), blob[offset + WRAPPED_KEY_HEADER_SIZE :]
 
 
-def _blob_is_well_formed(blob: bytes, offset: int, *, cbc_only: bool) -> bool:
+def _blob_is_well_formed(blob: bytes, offset: int) -> bool:
     """Whether a wrapped-key blob at ``offset`` parses structurally -- no password needed.
 
     Checks only what the format fixes: a known algorithm id, a plausible PBKDF2 iteration
     exponent, and a wrapped key that is a non-empty AES block multiple. The salt is fixed
     width, so parsing the header at all already proves it is complete.
-
-    ``cbc_only`` restricts this to algorithms we can actually unwrap; the detection path
-    passes ``False`` so a GCM archive is still reported as *encrypted* (it is), and fails
-    later with a clear "not supported" rather than being mistaken for plaintext.
     """
     parsed = _parse_wrapped_key(blob, offset)
     if parsed is None:
         return False
     header, wrapped = parsed
-    known = CBC_KEY_LENGTH if cbc_only else {**CBC_KEY_LENGTH, **dict.fromkeys(GCM_ALG_IDS, 0)}
-    if header.alg not in known or not MIN_ITER_LOG2 <= header.iter_log2 <= MAX_ITER_LOG2:
+    if header.alg not in KEY_LENGTH or not MIN_ITER_LOG2 <= header.iter_log2 <= MAX_ITER_LOG2:
         return False
     return not len(wrapped) % 16
 
@@ -159,10 +174,7 @@ def _has_wrapped_key(header: ArchiveHeader, wrap_format: int) -> bool:
         blob = _keymap_blob(header)
         if not blob:
             return False
-        return any(
-            blob[offset] == wrap_format and _blob_is_well_formed(blob, offset, cbc_only=False)
-            for offset in _scan_offsets(blob)
-        )
+        return any(blob[offset] == wrap_format and _blob_is_well_formed(blob, offset) for offset in _scan_offsets(blob))
     except Exception:
         return False
 
@@ -177,14 +189,12 @@ def _try_unwrap(blob: bytes, offset: int, password: bytes) -> DataKey | None:
         return None
     header, wrapped = parsed
 
-    if header.alg in GCM_ALG_IDS:
-        raise UnsupportedFormatError("AES-GCM encrypted TIBX archives are not supported")
-    if not _blob_is_well_formed(blob, offset, cbc_only=True):
+    if not _blob_is_well_formed(blob, offset):
         return None
 
     kek = PBKDF2(password, header.salt, dkLen=32, count=1 << header.iter_log2, hmac_hash_module=SHA256)
     key = _pkcs7_unpad(AES.new(kek, AES.MODE_CBC, b"\x00" * 16).decrypt(wrapped))
-    if key is None or len(key) != CBC_KEY_LENGTH[header.alg]:
+    if key is None or len(key) != KEY_LENGTH[header.alg]:
         return None
     return DataKey(alg=header.alg, key=key)
 
@@ -194,7 +204,6 @@ def unwrap_data_key(header: ArchiveHeader, password: str | bytes) -> DataKey:
 
     Raises:
         InvalidPasswordError: If no wrapped key unwraps with this password.
-        UnsupportedFormatError: If the archive uses AES-GCM (write-side only).
     """
     if isinstance(password, str):
         password = password.encode("utf-8")
@@ -213,17 +222,33 @@ def unwrap_data_key(header: ArchiveHeader, password: str | bytes) -> DataKey:
 
 
 def decrypt_segment(payload: bytes, data_key: DataKey) -> bytes:
-    """Decrypt an ``SE`` segment payload (``IV||16 || ciphertext``) to its stored bytes.
+    """Decrypt an ``SE`` segment payload to its stored bytes.
 
     Returns the still-compressed (or stored) plaintext; the caller decompresses per the
-    segment's compression field. CBC padding is left intact -- the caller truncates to the
-    segment's declared length.
+    segment's compression field. For CBC the padding is left intact -- the caller truncates
+    to the segment's declared length; GCM plaintext is already exact.
+
+    Raises:
+        CorruptArchiveError: If the payload is too short for its framing, or a GCM tag does
+            not authenticate.
     """
     from Crypto.Cipher import AES
 
-    if len(payload) < 32:
-        raise InvalidPasswordError(f"encrypted segment payload too short: {len(payload)} bytes")
-    iv = payload[:16]
-    ciphertext = payload[16:]
+    if data_key.gcm:
+        if len(payload) < SEGMENT_GCM_HEADER_SIZE:
+            raise CorruptArchiveError(f"encrypted segment payload too short: {len(payload)} bytes")
+        header = c_tibx.segment_gcm_header(payload)
+        try:
+            return AES.new(data_key.key, AES.MODE_GCM, nonce=header.iv).decrypt_and_verify(
+                payload[SEGMENT_GCM_HEADER_SIZE:], header.tag
+            )
+        except ValueError as e:
+            # The data key is confirmed by its PKCS#7 unwrap, so a failing tag is damage
+            # to the archive rather than a wrong password.
+            raise CorruptArchiveError(f"segment failed AES-GCM authentication: {e}")
+
+    if len(payload) < SEGMENT_CBC_HEADER_SIZE + 16:
+        raise CorruptArchiveError(f"encrypted segment payload too short: {len(payload)} bytes")
+    ciphertext = payload[SEGMENT_CBC_HEADER_SIZE:]
     ciphertext = ciphertext[: len(ciphertext) // 16 * 16]
-    return AES.new(data_key.key, AES.MODE_CBC, iv).decrypt(ciphertext)
+    return AES.new(data_key.key, AES.MODE_CBC, c_tibx.segment_cbc_header(payload).iv).decrypt(ciphertext)

@@ -11,8 +11,10 @@ decompressed, so reads are fully lazy.
 
 from __future__ import annotations
 
+import datetime
 import re
 import struct
+import uuid
 from bisect import bisect_right
 from collections import OrderedDict, defaultdict
 from pathlib import Path
@@ -24,9 +26,9 @@ from dissect.archive.tibx.c_tibx import (
     EXTENT_ALIGNMENT,
     EXTENT_INDEX_WHOLE_SEGMENT,
     PAGE_SIZE,
-    TLV_DATA_MAP,
     TLV_FILE_TABLE,
     TLV_KEYMAP,
+    TLV_SLICES,
     c_tibx,
 )
 from dissect.archive.tibx.exception import (
@@ -35,20 +37,16 @@ from dissect.archive.tibx.exception import (
     InvalidArchiveError,
     UnsupportedFormatError,
 )
-from dissect.archive.tibx.lsm import read_archive_header
+from dissect.archive.tibx.lsm import iter_memtree_cells, read_archive_header
 from dissect.archive.tibx.map import load_extents, load_segment_index
 from dissect.archive.tibx.page import PageStore
 from dissect.archive.tibx.segment import read_plaintext
 from dissect.archive.tibx.stream import TibxVolumeStream
 
 if TYPE_CHECKING:
-    import datetime
-
     from typing_extensions import Self
 
-    from dissect.archive.tibx.lsm import ArchiveHeader
     from dissect.archive.tibx.map import Extent
-    from dissect.archive.tibx.page import SuperBlock
 
 # Decompressed segments are cached per archive under a memory budget rather than a fixed
 # count: random-access workloads (MFT, registry hives) touch thousands of distinct
@@ -58,37 +56,54 @@ SEGMENT_CACHE_BUDGET = 256 * 1024 * 1024
 
 SPLIT_PART_RE = re.compile(r"^(?P<stem>.+?)-(?P<num>\d{4})\.tibx$", re.IGNORECASE)
 
+# Smallest stream taken to be a partition rather than Acronis metadata, for a stream whose
+# filesystem this parser does not recognise. The two populations are far apart in practice:
+# across the sample corpora the largest metadata stream is ~2.6 KB and the smallest real
+# partition is 16 MB, so this sits in the middle of a gap of some four orders of magnitude.
+MIN_VOLUME_SIZE = 1 << 20
+
 Interval = tuple[int, int, "Extent"]
 
 
 class RecoveryPoint:
-    """One selectable point-in-time snapshot (a non-empty ARCH commit root).
+    """One backup in the archive: a *slice*, in the format's own terms.
 
-    Each backup operation appends a commit root carrying its own copy-on-write
-    data_map/segment_map, so any recovery point reconstructs the exact volume state at
-    that time. Points are indexed oldest-to-newest by commit time.
+    A slice is what Acronis calls a backup and what ``acrocmd list backups`` lists; its
+    :attr:`guid` is the id printed there. Every data_map extent records the slice that
+    wrote it, so selecting a recovery point means taking the extents up to and including
+    that slice -- which is how an incremental chain reconstructs an earlier state.
+
+    Slice ids are not contiguous: a differential chain here numbered its two backups 2 and
+    4. Address a point by its list index, and let :attr:`slice_id` stay whatever the
+    archive says it is.
     """
 
-    def __init__(self, index: int, root: SuperBlock, header: ArchiveHeader):
+    def __init__(self, index: int, slice_id: int, record: c_tibx.slice_record):
         self.index = index
-        self.root = root
-        self.header = header
+        self.slice_id = slice_id
+        self.guid = uuid.UUID(bytes_le=record.guid)
+        self._record = record
 
     def __repr__(self) -> str:
-        return f"<RecoveryPoint index={self.index} offset={self.root.offset:#x} modified={self.modified}>"
+        return f"<RecoveryPoint index={self.index} slice={self.slice_id} guid={self.guid} modified={self.modified}>"
+
+    @property
+    def created(self) -> datetime.datetime:
+        """When this backup started."""
+        return datetime.datetime.fromtimestamp(self._record.created_ms / 1000, datetime.timezone.utc)
 
     @property
     def modified(self) -> datetime.datetime:
-        """The commit time of this recovery point."""
-        return self.root.modified
+        """When this backup finished."""
+        return datetime.datetime.fromtimestamp(self._record.modified_ms / 1000, datetime.timezone.utc)
 
 
 class TIBX:
     """An Acronis TIBX ("archive3") backup archive.
 
-    Opens at the latest recovery point (the live commit root). Use
-    :meth:`recovery_points` to enumerate and :meth:`use_recovery_point` to select
-    another point in a backup chain.
+    Opens at the latest recovery point. Use :meth:`recovery_points` to enumerate the
+    backups the archive records and :meth:`use_recovery_point` to select an earlier one
+    in a chain.
 
     Args:
         fh: A file-like object of the archive, or the ordered file-like objects of a
@@ -105,6 +120,7 @@ class TIBX:
         self.header = read_archive_header(self.store, self.root)
 
         self._recovery_points: list[RecoveryPoint] | None = None
+        self._slice_limit: int | None = None
         self._data_key = None
         self._reset_snapshot_caches()
 
@@ -115,6 +131,7 @@ class TIBX:
         self._segment_cache: OrderedDict[int, bytes] = OrderedDict()
         self._segment_cache_bytes = 0
         self._segment_layout: dict[tuple[int, int], int] | None = None
+        self._streams: list[TibxVolume] | None = None
         self._volumes: list[TibxVolume] | None = None
 
     @classmethod
@@ -214,19 +231,27 @@ class TIBX:
         self._segment_cache.clear()
 
     def recovery_points(self) -> list[RecoveryPoint]:
-        """The selectable recovery points, oldest to newest by commit time.
+        """The backups in this archive, oldest first.
 
-        These are the non-empty commit roots (the empty initial root of a freshly
-        created archive is skipped). A single full backup has one; incremental and
-        differential chains have several.
+        Read from the slices tree (TLV[5]), which is the archive's own record of its
+        backups: one record per backup, keyed by slice id, carrying the same GUID that
+        ``acrocmd list backups`` prints.
+
+        This deliberately does not enumerate ARCH commit roots. A commit root is a
+        transactional checkpoint, not a backup, and Acronis writes a varying number of
+        them per backup -- two for a single full backup here, four for a file-level one --
+        so counting roots reports recovery points that were never taken.
         """
         if self._recovery_points is None:
-            points = []
-            for root in self.store.commit_roots():  # sorted oldest -> newest
-                header = read_archive_header(self.store, root)
-                data_map = header.tree(TLV_DATA_MAP)
-                if data_map is not None and data_map.has_records:
-                    points.append(RecoveryPoint(len(points), root, header))
+            points: list[RecoveryPoint] = []
+            slices = self.header.tree(TLV_SLICES)
+            if slices is not None and slices.has_records:
+                for cell in iter_memtree_cells(slices):
+                    # The tree opens with an empty placeholder record; a real backup has a value.
+                    if len(cell.value) < len(c_tibx.slice_record) or len(cell.key) < len(c_tibx.slice_key):
+                        continue
+                    key = c_tibx.slice_key(cell.key)
+                    points.append(RecoveryPoint(len(points), key.slice_id, c_tibx.slice_record(cell.value)))
             self._recovery_points = points
         return self._recovery_points
 
@@ -241,10 +266,11 @@ class TIBX:
             InvalidArchiveError: If an integer index is out of range.
         """
         if recovery_point == "latest":
-            self.root = self.store.live_root()
-            self.header = read_archive_header(self.store, self.root)
+            self._slice_limit = None
         else:
             points = self.recovery_points()
+            if not points:
+                raise InvalidArchiveError("archive records no backups to select from")
             if recovery_point == "oldest":
                 chosen = points[0]
             else:
@@ -255,8 +281,10 @@ class TIBX:
                 if not 0 <= index < len(points):
                     raise InvalidArchiveError(f"recovery point {index} out of range (0..{len(points) - 1})")
                 chosen = points[index]
-            self.root = chosen.root
-            self.header = chosen.header
+            # Extents carry the slice that wrote them, and resolve_extents already treats
+            # slice_id as the primary recency signal -- so dropping everything newer than
+            # the chosen slice is exactly the archive as it stood after that backup.
+            self._slice_limit = chosen.slice_id
         self._reset_snapshot_caches()
 
     def disks(self) -> list:
@@ -271,20 +299,27 @@ class TIBX:
 
     @property
     def extents(self) -> list[Extent]:
-        """All data_map extents of the live commit root."""
+        """The data_map extents in view: all of them, or those up to the selected slice."""
         if self._extents is None:
-            self._extents = load_extents(self.store, self.header)
+            extents = load_extents(self.store, self.header)
+            if self._slice_limit is not None:
+                extents = [extent for extent in extents if extent.slice_id <= self._slice_limit]
+            self._extents = extents
         return self._extents
 
-    def volumes(self) -> list[TibxVolume]:
-        """The backed-up volumes: newest backup generation first, then largest first.
+    def streams(self) -> list[TibxVolume]:
+        """Every data_map stream, backed-up volumes and Acronis's own metadata alike.
 
-        A differential backup opens *new* volume streams for the updated state while
-        the base generation's streams stay in the data_map (incrementals overlay the
-        existing stream instead). Ranking by the newest slice that touched a stream
-        puts the current generation first, so "latest by default" holds for both.
+        Ordered newest backup generation first, then largest first. A differential backup
+        opens *new* streams for the updated state while the base generation's streams stay
+        in the data_map (incrementals overlay the existing stream instead). Ranking by the
+        newest slice that touched a stream puts the current generation first, so "latest by
+        default" holds for both.
+
+        Most callers want :meth:`volumes`; this is here for inspecting an archive's
+        internals without having to reach into the data_map.
         """
-        if self._volumes is None:
+        if self._streams is None:
             by_volume: dict[int, list[Extent]] = defaultdict(list)
             for extent in self.extents:
                 by_volume[extent.volume_id].append(extent)
@@ -296,8 +331,43 @@ class TIBX:
                 ),
                 reverse=True,
             )
-            self._volumes = [TibxVolume(self, vid, by_volume[vid]) for vid in ranked]
+            self._streams = [TibxVolume(self, vid, by_volume[vid]) for vid in ranked]
+        return self._streams
+
+    def volumes(self) -> list[TibxVolume]:
+        """The backed-up volumes, newest backup generation first, then largest first.
+
+        An archive's data_map holds more streams than it holds volumes: alongside each
+        partition, Acronis stores its own metadata -- the ``metainfo`` XML, allocation
+        bitmaps, small index tables -- and the disk's MBR/GPT bootstrap region, all keyed
+        by volume id exactly like a partition. Returning those as volumes made a
+        single-partition backup look like eight, and a file-level backup like forty-five.
+
+        A stream counts as a volume if its content starts with a filesystem this parser
+        recognises, or if it is at least :data:`MIN_VOLUME_SIZE` -- which keeps an
+        unformatted or unrecognised partition, something ``acrocmd list content`` reports
+        as a partition of type ``None``. Use :meth:`streams` for the unfiltered list.
+        """
+        if self._volumes is None:
+            self._volumes = [stream for stream in self.streams() if self._is_volume(stream)]
         return self._volumes
+
+    @staticmethod
+    def _is_volume(stream: TibxVolume) -> bool:
+        """Whether a data_map stream is a backed-up volume rather than Acronis metadata.
+
+        The size test runs on :attr:`TibxVolume.span`, which comes from the data_map and
+        needs no read. That matters for an encrypted archive that has not been unlocked:
+        listing what a locked archive contains must not require the password, and reading
+        the boot sector would.
+        """
+        if stream.span >= MIN_VOLUME_SIZE:
+            return True
+        try:
+            return bool(_boot_sector_size(stream.open().read(2048)))
+        except Error:
+            # Locked, or unreadable for any other reason -- the span said no, so leave it.
+            return False
 
     def extent_base(self, extent: Extent) -> int:
         """The within-segment byte offset where ``extent``'s data starts.
@@ -360,6 +430,15 @@ class TibxVolume:
 
     def __repr__(self) -> str:
         return f"<TibxVolume volume_id={self.volume_id:#x} size={self.size}>"
+
+    @property
+    def span(self) -> int:
+        """How far this stream reaches, straight from the data_map.
+
+        Unlike :attr:`size` this needs no read, so it is available for an encrypted
+        archive that has not been unlocked.
+        """
+        return max((extent.end_offset for extent in self.extents), default=0)
 
     @property
     def size(self) -> int:

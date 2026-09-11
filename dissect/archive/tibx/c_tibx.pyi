@@ -71,6 +71,21 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
+    class segment_cbc_header(__cs__.Structure):
+        iv: __cs__.CharArray
+        @overload
+        def __init__(self, iv: __cs__.CharArray | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class segment_gcm_header(__cs__.Structure):
+        iv: __cs__.CharArray
+        tag: __cs__.CharArray
+        @overload
+        def __init__(self, iv: __cs__.CharArray | None = ..., tag: __cs__.CharArray | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
     class lsm_superblock(__cs__.Structure):
         magic: __cs__.CharArray
         format_version: _c_tibx.uint8
@@ -138,6 +153,22 @@ class _c_tibx(__cs__.cstruct):
         extent_index: _c_tibx.uint16
         @overload
         def __init__(self, segment_id: _c_tibx.uint64 | None = ..., extent_index: _c_tibx.uint16 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class slice_key(__cs__.Structure):
+        slice_id: _c_tibx.uint32
+        @overload
+        def __init__(self, slice_id: _c_tibx.uint32 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class slice_record(__cs__.Structure):
+        guid: __cs__.CharArray
+        created_ms: _c_tibx.uint64
+        modified_ms: _c_tibx.uint64
+        @overload
+        def __init__(self, guid: __cs__.CharArray | None = ..., created_ms: _c_tibx.uint64 | None = ..., modified_ms: _c_tibx.uint64 | None = ...): ...
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
