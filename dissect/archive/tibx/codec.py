@@ -33,6 +33,7 @@ else:
 from dissect.util.compression import lz4 as util_lz4
 from dissect.util.exceptions import CorruptDataError
 
+from dissect.archive.tibx.c_tibx import LZ4_BLOCK_HEADER_SIZE, c_tibx
 from dissect.archive.tibx.exception import CorruptArchiveError
 
 # Generous ceiling for a single decompressed unit; real segments are a few MiB
@@ -162,9 +163,10 @@ def decompress_linked_lz4(body: bytes, max_output: int, *, strict: bool = True) 
     out = bytearray()
     pos = 0
     body_len = len(body)
-    while pos + 8 <= body_len and len(out) < max_output:
-        compressed, uncompressed = struct.unpack_from(">II", body, pos)
-        pos += 8
+    while pos + LZ4_BLOCK_HEADER_SIZE <= body_len and len(out) < max_output:
+        header = c_tibx.lz4_block_header(body[pos : pos + LZ4_BLOCK_HEADER_SIZE])
+        compressed, uncompressed = header.compressed_size, header.uncompressed_size
+        pos += LZ4_BLOCK_HEADER_SIZE
         if compressed == 0 or compressed > body_len - pos:
             break
         if uncompressed > max_output - len(out):

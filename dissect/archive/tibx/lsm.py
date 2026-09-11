@@ -13,21 +13,25 @@ Ported from the LSM engine of the MIT-licensed ``acronis-tib-reader``, with the 
 
 from __future__ import annotations
 
-import struct
 from typing import TYPE_CHECKING, NamedTuple
 
 from dissect.archive.tibx.c_tibx import (
     CTREE_EMPTY_SENTINEL,
     ENVELOPE_SIZE,
+    LDIR_VALUE_SIZE,
     LSB_CTREE_OFFSET,
     LSB_FIXED_SIZE,
     LSB_MEMTREE_OFFSET,
+    LSM_CELL_GROUP_HEADER_SIZE,
+    LSM_CELL_GROUP_MAX,
     LSM_CELL_STREAM_OFFSET,
     LSM_MAGIC_LDIR,
     LSM_MAGIC_LEAF,
     LSM_MAGIC_SUPERBLOCK,
+    LZ4_BLOCK_HEADER_SIZE,
     PAGE_SIZE,
     TLV_DIRECTORY_OFFSET,
+    TLV_HEADER_SIZE,
     TLV_SLOT_COUNT,
     c_tibx,
 )
@@ -101,7 +105,7 @@ class LsmSuperBlock:
                 )
             )
 
-        # Residual mem-tree: header at +0x158, blob after the fixed L-SB record
+        # Residual mem-tree: header after the ctree slots, blob after the fixed L-SB record
         self.memtree_encoding = 0
         self.memtree_node_count = 0
         self.memtree_payload = b""
@@ -126,6 +130,14 @@ class LsmSuperBlock:
         )
 
 
+def _arch_header(body: bytes) -> c_tibx.arch_header:
+    """Parse the fixed fields at the start of an ARCH header body."""
+    try:
+        return c_tibx.arch_header(body)
+    except EOFError:
+        raise CorruptArchiveError(f"ARCH header body too short: {len(body)} bytes")
+
+
 class ArchiveHeader:
     """The decoded ARCH header of one commit root: TLV directory + LSM superblocks."""
 
@@ -133,8 +145,9 @@ class ArchiveHeader:
         if body[:4] != ARCH_MAGIC:
             raise CorruptArchiveError("ARCH magic missing in header body")
         self.body = body
-        self.size = struct.unpack_from(">I", body, 4)[0]
-        self.version = struct.unpack_from(">H", body, 8)[0]
+        header = _arch_header(body)
+        self.size = header.header_size
+        self.version = header.header_version
         self.tlv = parse_tlv_directory(body)
         self.lsm_trees: dict[int, LsmSuperBlock] = {}
         for slot in self.tlv:
@@ -153,25 +166,26 @@ def parse_tlv_directory(body: bytes) -> list[TlvSlot]:
     """
     if len(body) < TLV_DIRECTORY_OFFSET + 8:
         raise CorruptArchiveError(f"ARCH body too short for TLV directory: {len(body)} bytes")
-    header_size = struct.unpack_from(">I", body, 4)[0]
-    version = struct.unpack_from(">H", body, 8)[0]
-    if version < 7:
+    header = _arch_header(body)
+    if header.header_version < 7:
         skip = {8, 12, 13, 14, 15, 16}
-    elif version < 8:
+    elif header.header_version < 8:
         skip = {12, 13, 14, 15, 16}
     else:
         skip = set()
 
     pos = TLV_DIRECTORY_OFFSET
-    end = min(header_size, len(body))
+    end = min(header.header_size, len(body))
     slots = []
     for index in range(TLV_SLOT_COUNT):
-        if index in skip or pos + 4 > end:
+        if index in skip or pos + TLV_HEADER_SIZE > end:
             slots.append(TlvSlot(index=index, payload=b""))
             continue
-        length = struct.unpack_from(">I", body, pos)[0]
-        slots.append(TlvSlot(index=index, payload=bytes(body[pos + 4 : pos + 4 + length])))
-        pos += (length + 7) & ~3
+        length = c_tibx.tlv_header(body[pos : pos + TLV_HEADER_SIZE]).length
+        start = pos + TLV_HEADER_SIZE
+        slots.append(TlvSlot(index=index, payload=bytes(body[start : start + length])))
+        # The next entry starts at the next 4-byte boundary
+        pos = (start + length + 3) & ~3
     return slots
 
 
@@ -183,12 +197,13 @@ def read_header_body(store: PageStore, root: SuperBlock) -> bytes:
     envelope.
     """
     page_index = root.offset // PAGE_SIZE
-    body = bytearray(store.page(page_index)[ENVELOPE_SIZE:])
-    header_size = struct.unpack_from(">I", body, 4)[0]
+    first = store.page(page_index)
+    header_size = c_tibx.arch_superblock(first).body.header_size
+    body = bytearray(first[ENVELOPE_SIZE:])
     next_index = page_index + 1
     while len(body) < header_size and next_index < store.page_count:
         page = store.page(next_index)
-        if page[1] != c_tibx.PageType.ARCH:
+        if c_tibx.page_header(page).type != c_tibx.PageType.ARCH:
             break
         body.extend(page[ENVELOPE_SIZE:])
         next_index += 1
@@ -250,26 +265,24 @@ def decode_cells_variable(buf: bytes, count: int, key_length: int = 0, value_len
 def decode_cells_compact(buf: bytes, count: int, key_length: int, value_length: int) -> list[LsmCell]:
     """Decode ``count`` cells from a compact (LEAF, fixed-size) buffer.
 
-    Cells come in groups of up to 24, each preceded by a 4-byte LE header whose low
-    byte is the group size and whose upper bytes encode an alive-bitmap (bit ``i`` set
-    means cell ``i`` carries a value; tombstones store only the key).
+    Cells come in groups of up to 24, each preceded by a :class:`c_tibx.lsm_cell_group_header`
+    whose ``alive`` bitmap has bit ``i`` set when cell ``i`` carries a value; tombstones store
+    only the key.
     """
     cells = []
     pos = 0
     decoded = 0
     while decoded < count:
-        if pos + 4 > len(buf):
+        if pos + LSM_CELL_GROUP_HEADER_SIZE > len(buf):
             raise CorruptArchiveError(f"compact cells: short group header at {pos}")
-        header = struct.unpack_from("<I", buf, pos)[0]
-        pos += 4
-        group_count = header & 0xFF
-        bitmap = ((header >> 24) & 0xFF) | (((header >> 16) & 0xFF) << 8) | (((header >> 8) & 0xFF) << 16)
-        if group_count == 0 or group_count > 24:
-            raise CorruptArchiveError(f"compact cells: bad group count {group_count} at {pos - 4}")
-        for index in range(group_count):
+        group = c_tibx.lsm_cell_group_header(buf[pos : pos + LSM_CELL_GROUP_HEADER_SIZE])
+        if group.count == 0 or group.count > LSM_CELL_GROUP_MAX:
+            raise CorruptArchiveError(f"compact cells: bad group count {group.count} at {pos}")
+        pos += LSM_CELL_GROUP_HEADER_SIZE
+        for index in range(group.count):
             if decoded >= count:
                 break
-            alive = bool((bitmap >> index) & 1)
+            alive = bool((group.alive >> index) & 1)
             key = bytes(buf[pos : pos + key_length])
             pos += key_length
             value = b""
@@ -291,8 +304,7 @@ def decode_page_cells(body: bytes, key_length: int, value_length: int) -> list[L
 
     is_ldir = bytes(header.magic) == LSM_MAGIC_LDIR
     if is_ldir:
-        # LDIR values are always 8-byte child byte-offsets
-        value_length = 8
+        value_length = LDIR_VALUE_SIZE
 
     stream = body[LSM_CELL_STREAM_OFFSET : LSM_CELL_STREAM_OFFSET + header.on_disk_size]
     raw = decompress_cell_stream(stream, header.encoding & 0x7F, header.uncompressed_size)
@@ -307,8 +319,7 @@ def iter_memtree_cells(sb: LsmSuperBlock) -> list[LsmCell]:
     """Decode an L-SB's residual mem-tree into cells.
 
     Small archives keep all of a tree's records here rather than in on-disk ctrees.
-    The blob is a compact cell stream, raw or wrapped in a single LZ4 frame
-    (``[compressed BE u32][uncompressed BE u32][block]``).
+    The blob is a compact cell stream, raw or wrapped in a single linked-LZ4 block.
     """
     payload = sb.memtree_payload
     if not payload or sb.memtree_node_count == 0 or sb.key_length == 0:
@@ -320,9 +331,9 @@ def iter_memtree_cells(sb: LsmSuperBlock) -> list[LsmCell]:
     if codec == 0:
         decoded = bytes(payload)
     elif codec == 1:
-        if len(payload) < 8:
+        if len(payload) < LZ4_BLOCK_HEADER_SIZE:
             return []
-        uncompressed = struct.unpack_from(">I", payload, 4)[0]
+        uncompressed = c_tibx.lz4_block_header(payload[:LZ4_BLOCK_HEADER_SIZE]).uncompressed_size
         decoded = decompress_linked_lz4(payload, uncompressed, strict=True)
         if len(decoded) != uncompressed:
             raise CorruptArchiveError(f"mem-tree blob decoded {len(decoded)} bytes, expected {uncompressed}")
@@ -341,14 +352,14 @@ def walk_tree(store: PageStore, root_page: int, key_length: int, value_length: i
             return
         pages_walked += 1
         page = store.page(page_index)
+        page_type = c_tibx.page_header(page).type
         body = page[ENVELOPE_SIZE:]
-        if page[1] == c_tibx.PageType.LDIR:
+        if page_type == c_tibx.PageType.LDIR:
             for cell in decode_page_cells(body, key_length, value_length):
-                if len(cell.value) != 8:
+                if len(cell.value) != LDIR_VALUE_SIZE:
                     continue
-                child_offset = struct.unpack(">Q", cell.value)[0]
-                yield from _visit(child_offset // PAGE_SIZE)
-        elif page[1] == c_tibx.PageType.LEAF:
+                yield from _visit(c_tibx.ldir_value(cell.value).child_offset // PAGE_SIZE)
+        elif page_type == c_tibx.PageType.LEAF:
             yield from decode_page_cells(body, key_length, value_length)
         # other page types are silently skipped
 

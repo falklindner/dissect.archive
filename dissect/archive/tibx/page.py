@@ -82,16 +82,17 @@ class SuperBlock:
             # A buffer too short to hold a superblock is not one; report it in the parser's
             # own vocabulary rather than letting cstruct's EOFError escape.
             raise InvalidArchiveError(f"Truncated ARCH superblock at offset {offset:#x}")
-        if self.sb.magic != ARCH_MAGIC:
+        header = self.sb.body
+        if header.magic != ARCH_MAGIC:
             raise InvalidArchiveError(f"Not an ARCH superblock at offset {offset:#x}")
-        self.header_size = self.sb.header_size
-        self.archive_uuid: bytes = bytes(self.sb.archive_uuid)
-        self.created_ms: int = self.sb.created_ms
-        self.modified_ms: int = self.sb.modified_ms
-        self.compr_lvl: c_tibx.ComprLvl = self.sb.compr_lvl
-        self.encr_alg: c_tibx.EncrAlg = self.sb.encr_alg
-        self.hash_alg: int = self.sb.hash_alg
-        self.dedup: bool = bool(self.sb.dedup)
+        self.header_size = header.header_size
+        self.archive_uuid: bytes = bytes(header.archive_uuid)
+        self.created_ms: int = header.created_ms
+        self.modified_ms: int = header.modified_ms
+        self.compr_lvl: c_tibx.ComprLvl = header.compr_lvl
+        self.encr_alg: c_tibx.EncrAlg = header.encr_alg
+        self.hash_alg: int = header.hash_alg
+        self.dedup: bool = bool(header.dedup)
 
     def __repr__(self) -> str:
         return f"<SuperBlock offset={self.offset:#x} modified_ms={self.modified_ms}>"
@@ -123,7 +124,7 @@ class PageStore:
         self.size = fh.tell()
         self.page_count = self.size // PAGE_SIZE
 
-        if self.size < PAGE_SIZE or c_tibx.arch_superblock(self.page(0)).magic != ARCH_MAGIC:
+        if self.size < PAGE_SIZE or c_tibx.arch_superblock(self.page(0)).body.magic != ARCH_MAGIC:
             raise InvalidArchiveError("Missing ARCH magic at page 0")
 
     def page(self, index: int) -> bytes:

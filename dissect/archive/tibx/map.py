@@ -15,12 +15,13 @@ Ported from the MIT-licensed ``acronis-tib-reader``, with the mem-tree merge fro
 
 from __future__ import annotations
 
-import struct
 from typing import TYPE_CHECKING, NamedTuple
 
 from dissect.archive.tibx.c_tibx import (
     DATA_MAP_KEY_SIZE,
     DATA_MAP_VALUE_SIZE,
+    SEGMENT_MAP_KEY_SIZE,
+    SEGMENT_MAP_VALUE_SIZE,
     TLV_DATA_MAP,
     TLV_SEGMENT_MAP,
     c_tibx,
@@ -72,6 +73,17 @@ def decode_extent(raw_key: bytes, raw_value: bytes) -> Extent:
     )
 
 
+def decode_segment_locator(raw_key: bytes, raw_value: bytes) -> SegmentLocator:
+    """Decode one raw segment_map (key, value) record."""
+    value = c_tibx.segment_map_value(raw_value)
+    return SegmentLocator(
+        segment_id=c_tibx.segment_map_key(raw_key).segment_id,
+        # The record's one little-endian field; cstruct takes one byte order per instance
+        page_count=int.from_bytes(value.page_count, "little"),
+        page_offset=value.page_offset,
+    )
+
+
 def load_extents(store: PageStore, header: ArchiveHeader) -> list[Extent]:
     """Walk the data_map tree of ``header`` and return all extents.
 
@@ -112,17 +124,14 @@ def load_segment_index(store: PageStore, header: ArchiveHeader) -> dict[int, Seg
     index: dict[int, SegmentLocator] = {}
     dead: set[int] = set()
     for cell in iter_tree_cells(store, sb):
-        if len(cell.key) != 8:
+        if len(cell.key) != SEGMENT_MAP_KEY_SIZE:
             continue
-        segment_id = struct.unpack(">Q", cell.key)[0]
+        segment_id = c_tibx.segment_map_key(cell.key).segment_id
         if segment_id in index or segment_id in dead:
             continue
-        if not cell.alive or len(cell.value) < 8:
+        if not cell.alive or len(cell.value) < SEGMENT_MAP_VALUE_SIZE:
             # Keep-first as above: a tombstone masks older records for this segment
             dead.add(segment_id)
             continue
-        # Empirically mixed endianness: page_count is LE, page_offset is BE
-        page_count = struct.unpack_from("<I", cell.value, 0)[0]
-        page_offset = struct.unpack_from(">I", cell.value, 4)[0]
-        index[segment_id] = SegmentLocator(segment_id=segment_id, page_count=page_count, page_offset=page_offset)
+        index[segment_id] = decode_segment_locator(cell.key, cell.value)
     return index

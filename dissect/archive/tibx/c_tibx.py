@@ -6,8 +6,14 @@ zeroed) is stored at ``+0x04``. The page content ("body") starts after this 8-by
 envelope.
 
 Most multi-byte fields are big-endian, so the definitions are loaded into a big-endian
-cstruct instance. The few little-endian fields (the LSM cell-group header, the LEAF
-sequence id and the segment_map ``page_count``) are decoded manually at their use sites.
+cstruct instance. cstruct applies one byte order per instance, so the one little-endian
+field of a TIBX record -- the segment_map ``page_count`` -- is declared as raw bytes and
+decoded where it is used; the LEAF sequence id is little-endian too, but unused. The LSM
+cell-group header only looks little-endian: it is a count byte followed by a big-endian
+24-bit bitmap.
+
+:data:`c_boot` holds the few filesystem boot-sector fields the parser reads to size a
+volume. Those formats are not TIBX's and are little-endian, so they get their own instance.
 
 The format is not documented by Acronis. These definitions encode the format findings of
 the MIT-licensed ``acronis-tibx`` (see ``THIRD_PARTY_NOTICES.md``) and were confirmed
@@ -56,8 +62,9 @@ struct page_header {
     uint32      crc32c;                 /* CRC-32C of the page, checksum bytes zeroed */
 };
 
-struct arch_superblock {
-    page_header header;
+/* Start of an ARCH header body, i.e. of an ARCH page after its envelope. The TLV
+ * directory follows at TLV_DIRECTORY_OFFSET into the body. */
+struct arch_header {
     char        magic[4];               /* "ARCH" */
     uint32      header_size;            /* total header body size, may span pages */
     uint16      header_version;         /* 8 in current archives */
@@ -70,6 +77,17 @@ struct arch_superblock {
     uint64      created_ms;             /* creation time, ms since Unix epoch */
     uint64      modified_ms;            /* commit time, ms since Unix epoch */
     char        archive_uuid[16];
+};
+
+struct arch_superblock {
+    page_header header;
+    arch_header body;
+};
+
+/* One TLV directory entry: the payload follows, and the next entry starts at the next
+ * 4-byte boundary after it */
+struct tlv_header {
+    uint32      length;
 };
 
 /* Data segment header, at page offset +0x08 of a DATA page */
@@ -95,6 +113,13 @@ struct segment_gcm_header {
     char        tag[16];                /* AES-GCM tag, computed with no additional data */
 };
 
+/* Header of one block of a linked-LZ4 chain (LSM cell streams, mem-tree blobs); the
+ * compressed block follows */
+struct lz4_block_header {
+    uint32      compressed_size;
+    uint32      uncompressed_size;
+};
+
 /* LSM superblock (L-SB), carried as a TLV payload in the ARCH header body */
 struct lsm_superblock {
     char        magic[4];               /* "L-SB" */
@@ -106,7 +131,7 @@ struct lsm_superblock {
     uint32      ctree_size_hint;
     uint32      key_length;             /* per-record key bytes (0 = variable) */
     uint32      value_length;           /* per-record value bytes */
-    /* +0x18: ctree_count x ctree_ref slots, then mem-tree fields at +0x158 */
+    /* followed by LSB_CTREE_SLOTS x ctree_ref, then the mem-tree header */
 };
 
 struct ctree_ref {
@@ -135,7 +160,18 @@ struct lsm_page_header {
     uint32      on_disk_size;           /* size of the stored cell stream */
     uint32      key_size_param;
     char        _sequence_id[4];        /* LE u32, unused here */
-    /* zero pad up to +0x34, where the cell stream starts */
+    /* zero pad up to LSM_CELL_STREAM_OFFSET, where the cell stream starts */
+};
+
+/* Precedes each group of cells in a compact cell stream */
+struct lsm_cell_group_header {
+    uint8       count;                  /* cells in this group, 1-24 */
+    uint24      alive;                  /* bit i set: cell i carries a value; a tombstone only its key */
+};
+
+/* LDIR record value: where the child page is */
+struct ldir_value {
+    uint64      child_offset;           /* byte offset of the child LEAF / LDIR page */
 };
 
 /* data_map (TLV[1]) record: 31-byte key + 10-byte value */
@@ -150,6 +186,18 @@ struct data_map_key {
 struct data_map_value {
     uint64      segment_id;
     uint16      extent_index;           /* 0xFFFF = extent fills the whole segment */
+};
+
+/* segment_map (TLV[2]) record: 8-byte key + 32-byte value */
+struct segment_map_key {
+    uint64      segment_id;
+};
+
+struct segment_map_value {
+    char        page_count[4];          /* little-endian, unlike the rest of the record */
+    uint32      page_offset;            /* page index of the segment's header page */
+    uint32      slice_id;
+    char        hash[20];
 };
 
 /* TLV[5] "slices" record: one backup of the archive. Every data_map extent carries this
@@ -188,8 +236,62 @@ struct file_table_entry {
 
 c_tibx = cstruct(endian=">").load(tibx_def)
 
+# Only the fields needed to tell a volume's filesystem apart and read its size
+boot_def = """
+struct ntfs_boot_sector {
+    char        jump[3];
+    char        oem_id[8];              /* "NTFS    " */
+    uint16      bytes_per_sector;
+    char        _unused[27];
+    uint64      total_sectors;          /* +0x28 */
+};
+
+struct exfat_boot_sector {
+    char        jump[3];
+    char        fs_name[8];             /* "EXFAT   " */
+    char        _must_be_zero[53];
+    uint64      partition_offset;       /* +0x40 */
+    uint64      volume_length;          /* +0x48, in sectors */
+    char        _unused[28];
+    uint8       bytes_per_sector_shift; /* +0x6C */
+};
+
+struct fat_boot_sector {
+    char        jump[3];
+    char        oem_id[8];
+    uint16      bytes_per_sector;       /* +0x0B */
+    uint8       sectors_per_cluster;
+    uint16      reserved_sectors;
+    uint8       fat_count;
+    uint16      root_entries;
+    uint16      total_sectors_16;       /* +0x13, 0 if the volume needs total_sectors_32 */
+    uint8       media;
+    uint16      fat_size_16;
+    uint16      sectors_per_track;
+    uint16      heads;
+    uint32      hidden_sectors;
+    uint32      total_sectors_32;       /* +0x20 */
+    char        _fat16_ext[18];
+    char        fs_type_16[8];          /* +0x36, "FAT12   " / "FAT16   " */
+    char        _fat32_ext[20];
+    char        fs_type_32[8];          /* +0x52, "FAT32   " */
+};
+
+/* ext2/3/4 superblock, EXT_SUPERBLOCK_OFFSET bytes into the volume */
+struct ext_superblock {
+    uint32      inodes_count;
+    uint32      blocks_count;           /* +0x04, low 32 bits */
+    char        _unused0[16];
+    uint32      log_block_size;         /* +0x18, block size is 1024 << log_block_size */
+    char        _unused1[28];
+    uint16      magic;                  /* +0x38, EXT_MAGIC */
+};
+"""
+
+c_boot = cstruct(endian="<").load(boot_def)
+
 PAGE_SIZE: int = c_tibx.PAGE_SIZE
-ENVELOPE_SIZE = 8
+ENVELOPE_SIZE = len(c_tibx.page_header)
 PAGE_BODY_SIZE = PAGE_SIZE - ENVELOPE_SIZE
 
 PAGE_MARKER = 0x41
@@ -198,7 +300,7 @@ ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 SEGMENT_MAGIC = b"SG"
 SEGMENT_MAGIC_ENCRYPTED = b"SE"
-SEGMENT_HEADER_OFFSET = 8
+SEGMENT_HEADER_OFFSET = ENVELOPE_SIZE
 SEGMENT_PAYLOAD_OFFSET = 0x2C
 # Compressed bytes on the segment's first page; the rest spills onto continuation pages
 SEGMENT_FIRST_PAGE_PAYLOAD = PAGE_SIZE - SEGMENT_PAYLOAD_OFFSET
@@ -219,20 +321,28 @@ COMP_ZSTD = frozenset({0x0300, 0x0301, 0x0302, 0x0303})
 # each aligned up to this boundary (empirical: exact fit on all observed segments)
 EXTENT_ALIGNMENT = 16
 
+LZ4_BLOCK_HEADER_SIZE = len(c_tibx.lz4_block_header)
+
 LSM_MAGIC_SUPERBLOCK = b"L-SB"
 LSM_MAGIC_LEAF = b"LEAF"
 LSM_MAGIC_LDIR = b"LDIR"
 # Cell stream starts this many bytes into a LEAF/LDIR page body
 LSM_CELL_STREAM_OFFSET = 0x34
-# L-SB fixed layout: ctree slots at +0x18, mem-tree header at +0x158, extra payload at +0x178
-LSB_CTREE_OFFSET = 0x18
-LSB_MEMTREE_OFFSET = 0x158
+LSM_CELL_GROUP_HEADER_SIZE = len(c_tibx.lsm_cell_group_header)
+LSM_CELL_GROUP_MAX = 24
+LDIR_VALUE_SIZE = len(c_tibx.ldir_value)
+# L-SB fixed layout: the lsm_superblock fields, a fixed number of ctree_ref slots, the
+# mem-tree header, then reserved space up to LSB_FIXED_SIZE; the mem-tree blob follows
+LSB_CTREE_SLOTS = 10
+LSB_CTREE_OFFSET = len(c_tibx.lsm_superblock)
+LSB_MEMTREE_OFFSET = LSB_CTREE_OFFSET + LSB_CTREE_SLOTS * len(c_tibx.ctree_ref)
 LSB_FIXED_SIZE = 0x178
 
 CTREE_EMPTY_SENTINEL = 0xFFFFFFFFFFFFFFFF
 
 # ARCH header body: TLV directory location and slot count
 TLV_DIRECTORY_OFFSET = 0x400
+TLV_HEADER_SIZE = len(c_tibx.tlv_header)
 TLV_SLOT_COUNT = 19
 
 TLV_DATA_MAP = 1
@@ -242,12 +352,18 @@ TLV_KEYMAP = 7
 TLV_FILE_TABLE = 18
 
 # Wrapped-key blob: the fixed header above, then the padded key to the end of the blob
-WRAPPED_KEY_HEADER_SIZE = 20
+WRAPPED_KEY_HEADER_SIZE = len(c_tibx.wrapped_key)
 WRAPPED_KEY_SALT_SIZE = 16
 WRAPPED_KEY_FORMAT_PASSWORD = 0x01
 WRAPPED_KEY_FORMAT_PUBKEY = 0x02
 
-DATA_MAP_KEY_SIZE = 31
-DATA_MAP_VALUE_SIZE = 10
+DATA_MAP_KEY_SIZE = len(c_tibx.data_map_key)
+DATA_MAP_VALUE_SIZE = len(c_tibx.data_map_value)
 # data_map_value.extent_index for "extent fills its segment"
 EXTENT_INDEX_WHOLE_SEGMENT = 0xFFFF
+
+SEGMENT_MAP_KEY_SIZE = len(c_tibx.segment_map_key)
+SEGMENT_MAP_VALUE_SIZE = len(c_tibx.segment_map_value)
+
+EXT_SUPERBLOCK_OFFSET = 0x400
+EXT_MAGIC = 0xEF53

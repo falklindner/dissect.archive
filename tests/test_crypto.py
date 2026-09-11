@@ -183,7 +183,9 @@ def _with_encr_alg(archive: bytes, alg: int) -> bytes:
     from tests._synth import PAGE, finalize
 
     page = bytearray(archive[:PAGE])
-    page[0x13] = alg
+    superblock = c_tibx.arch_superblock(bytes(page))
+    superblock.body.encr_alg = alg
+    page[: len(c_tibx.arch_superblock)] = superblock.dumps()
     return finalize(page) + archive[PAGE:]
 
 

@@ -28,13 +28,13 @@ Ported from the MIT-licensed ``acronis-tib-reader`` and ``acronis-tibx``. See
 
 from __future__ import annotations
 
-import struct
 from typing import TYPE_CHECKING, NamedTuple
 
 # pycryptodome is only needed to actually derive/apply keys, not to *detect* encryption
 # (see has_password_wrapped_key), so it is imported where it is used rather than at module
 # import time -- the detection path runs on every archive open.
 from dissect.archive.tibx.c_tibx import (
+    LZ4_BLOCK_HEADER_SIZE,
     SEGMENT_CBC_HEADER_SIZE,
     SEGMENT_GCM_HEADER_SIZE,
     TLV_KEYMAP,
@@ -133,8 +133,8 @@ def _keymap_blob(header: ArchiveHeader) -> bytes | None:
         return None
 
     blob = keymap.memtree_payload
-    if keymap.memtree_encoding & 0x7F == 1 and len(blob) >= 8:
-        uncompressed = struct.unpack_from(">I", blob, 4)[0]
+    if keymap.memtree_encoding & 0x7F == 1 and len(blob) >= LZ4_BLOCK_HEADER_SIZE:
+        uncompressed = c_tibx.lz4_block_header(blob[:LZ4_BLOCK_HEADER_SIZE]).uncompressed_size
         blob = decompress_linked_lz4(blob, min(uncompressed + 64, MAX_KEYMAP_BLOB), strict=False)
     if len(blob) > MAX_KEYMAP_BLOB:
         raise InvalidPasswordError("keymap blob implausibly large")

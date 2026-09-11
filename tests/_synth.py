@@ -6,6 +6,10 @@ scratch — up to and including complete archives with a TLV directory, data_map
 segment_map LSM superblocks (mem-tree or on-disk LEAF/LDIR ctrees) and SG data
 segments.
 
+Every TIBX record is built from the same :mod:`c_tibx` structure the parser reads it
+with, so a builder cannot drift from the parser's idea of the layout. Only the foreign
+filesystem images (FAT, exFAT) are assembled by hand.
+
 The fixtures are derived from those of the MIT-licensed ``acronis-tibx`` (see
 ``THIRD_PARTY_NOTICES.md``) and extended here with the LSM layer. They are cross-checked
 against archives produced by Acronis Cyber Protect / True Image 2026 -- a synthetic page
@@ -18,7 +22,20 @@ import struct
 import sys
 from typing import TYPE_CHECKING, NamedTuple
 
-from dissect.archive.tibx.c_tibx import c_tibx
+from dissect.archive.tibx.c_tibx import (
+    ENVELOPE_SIZE,
+    LSB_CTREE_OFFSET,
+    LSB_FIXED_SIZE,
+    LSB_MEMTREE_OFFSET,
+    LSM_CELL_GROUP_MAX,
+    LSM_CELL_STREAM_OFFSET,
+    PAGE_MARKER,
+    SEGMENT_HEADER_OFFSET,
+    SEGMENT_PAYLOAD_OFFSET,
+    TLV_DIRECTORY_OFFSET,
+    TLV_SLOT_COUNT,
+    c_tibx,
+)
 from dissect.archive.tibx.page import page_crc32c
 
 if TYPE_CHECKING:
@@ -30,7 +47,7 @@ else:
     from backports import zstd
 
 PAGE = 0x1000
-BODY = PAGE - 8
+BODY = PAGE - ENVELOPE_SIZE
 
 SEG_PAYLOAD = b"hello synthetic volume" * 8
 
@@ -44,21 +61,31 @@ FORMAT_PASSWORD = 0x01
 GCM_ALGS = (5, 6, 7)
 KEY_LENGTH = {1: 16, 2: 24, 3: 32, 5: 16, 6: 24, 7: 32}
 
+# The ARCH header body offset of the commit sequence. Not modelled in c_tibx: the parser
+# never reads it, but real archives carry one, so the synthetic ones do too.
+ARCH_COMMIT_SEQUENCE_OFFSET = 0x188
+
+
+def blank_page(page_type: int) -> bytearray:
+    """A zeroed page carrying just the envelope marker and ``page_type``."""
+    page = bytearray(PAGE)
+    page[:ENVELOPE_SIZE] = c_tibx.page_header(marker=PAGE_MARKER, type=c_tibx.PageType(page_type)).dumps()
+    return page
+
 
 def finalize(pg: bytearray) -> bytes:
-    """Stamp the page CRC-32C (big-endian at +0x04) and freeze the page."""
-    pg[4:8] = struct.pack(">I", page_crc32c(bytes(pg)))
+    """Stamp the page CRC-32C into the envelope and freeze the page."""
+    header = c_tibx.page_header(bytes(pg[:ENVELOPE_SIZE]))
+    header.crc32c = page_crc32c(bytes(pg))
+    pg[:ENVELOPE_SIZE] = header.dumps()
     return bytes(pg)
 
 
 def arch_page(created_ms: int, modified_ms: int, uuid: bytes) -> bytes:
     """Build a minimal valid ARCH superblock page (no TLV directory)."""
-    pg = bytearray(PAGE)
-    pg[0], pg[1] = 0x41, 0x01
-    pg[8:12] = b"ARCH"
-    pg[0x18:0x20] = created_ms.to_bytes(8, "big")
-    pg[0x20:0x28] = modified_ms.to_bytes(8, "big")
-    pg[0x28:0x38] = uuid
+    pg = blank_page(c_tibx.PageType.ARCH)
+    body = c_tibx.arch_header(magic=b"ARCH", created_ms=created_ms, modified_ms=modified_ms, archive_uuid=uuid)
+    pg[ENVELOPE_SIZE : ENVELOPE_SIZE + len(c_tibx.arch_header)] = body.dumps()
     return finalize(pg)
 
 
@@ -98,25 +125,24 @@ def segment_pages(
             padded = blob + bytes([16 - len(blob) % 16]) * (16 - len(blob) % 16)
             ciphertext = AES.new(data_key, AES.MODE_CBC, iv).encrypt(padded)
             blob = c_tibx.segment_cbc_header(iv=iv).dumps() + ciphertext
-        magic, key_id = b"SE\x00\x00", 1
+        magic, version, key_id = b"SE", 0, 1
     else:
-        magic, key_id = b"SG\x00\x01", 0
+        magic, version, key_id = b"SG", 1, 0
 
-    first = bytearray(PAGE)
-    first[0], first[1] = 0x41, 0xFF
-    first[8:12] = magic
-    struct.pack_into(">III", first, 0x0C, len(payload), len(blob), key_id)
-    struct.pack_into(">HH", first, 0x18, compression, 0)
-    first_take = min(len(blob), PAGE - 0x2C)
-    first[0x2C : 0x2C + first_take] = blob[:first_take]
+    first = blank_page(c_tibx.PageType.DATA)
+    header = c_tibx.segment_header(
+        magic=magic, version=version, length=len(payload), zlength=len(blob), key_id=key_id, compression=compression
+    )
+    first[SEGMENT_HEADER_OFFSET : SEGMENT_HEADER_OFFSET + len(c_tibx.segment_header)] = header.dumps()
+    first_take = min(len(blob), PAGE - SEGMENT_PAYLOAD_OFFSET)
+    first[SEGMENT_PAYLOAD_OFFSET : SEGMENT_PAYLOAD_OFFSET + first_take] = blob[:first_take]
     pages = [finalize(first)]
 
     position = first_take
     while position < len(blob):
-        cont = bytearray(PAGE)
-        cont[0], cont[1] = 0x41, 0xFF
+        cont = blank_page(c_tibx.PageType.DATA)
         chunk = blob[position : position + BODY]
-        cont[8 : 8 + len(chunk)] = chunk
+        cont[ENVELOPE_SIZE : ENVELOPE_SIZE + len(chunk)] = chunk
         pages.append(finalize(cont))
         position += len(chunk)
     return pages
@@ -333,16 +359,13 @@ class Cell(NamedTuple):
 def compact_cells(cells: list[Cell]) -> bytes:
     """Encode cells as a compact cell stream (groups of up to 24 with alive-bitmaps)."""
     out = bytearray()
-    for group_start in range(0, len(cells), 24):
-        group = cells[group_start : group_start + 24]
-        bitmap = 0
+    for group_start in range(0, len(cells), LSM_CELL_GROUP_MAX):
+        group = cells[group_start : group_start + LSM_CELL_GROUP_MAX]
+        alive = 0
         for i, cell in enumerate(group):
             if cell.alive:
-                bitmap |= 1 << i
-        b3 = bitmap & 0xFF
-        b2 = (bitmap >> 8) & 0xFF
-        b1 = (bitmap >> 16) & 0xFF
-        out += struct.pack("<I", len(group) | (b1 << 8) | (b2 << 16) | (b3 << 24))
+                alive |= 1 << i
+        out += c_tibx.lsm_cell_group_header(count=len(group), alive=alive).dumps()
         for cell in group:
             out += cell.key
             if cell.alive:
@@ -370,32 +393,36 @@ def lsb(
     if memtree_blob is None:
         memtree_blob = compact_cells(memtree_cells) if memtree_cells else b""
 
-    record = bytearray(0x178)
-    record[0:4] = b"L-SB"
-    ctree_count = max(2, len(ctrees))
-    record[4] = 1  # format version
-    record[5] = ctree_count - 2
-    record[6] = 10 - 2  # ctree_max
-    struct.pack_into(">IIII", record, 8, seq, 0, key_length, value_length)
+    record = bytearray(LSB_FIXED_SIZE)
+    superblock = c_tibx.lsm_superblock(
+        magic=b"L-SB",
+        format_version=1,
+        ctree_count_minus_2=max(2, len(ctrees)) - 2,
+        ctree_max_minus_2=10 - 2,
+        seq=seq,
+        key_length=key_length,
+        value_length=value_length,
+    )
+    record[: len(c_tibx.lsm_superblock)] = superblock.dumps()
     for i, (root_offset, item_count) in enumerate(ctrees):
-        slot = 0x18 + i * 32
-        struct.pack_into(">QQI", record, slot, root_offset, PAGE, item_count)
-    # mem-tree header at +0x158: encoding, pad, node_count, extra_len, pages_total
-    record[0x158] = memtree_encoding
-    struct.pack_into(">H", record, 0x15A, len(memtree_cells))
-    struct.pack_into(">II", record, 0x15C, len(memtree_blob), 0)
+        slot = LSB_CTREE_OFFSET + i * len(c_tibx.ctree_ref)
+        ref = c_tibx.ctree_ref(offset=root_offset, num_pages=PAGE, item_count=item_count)
+        record[slot : slot + len(c_tibx.ctree_ref)] = ref.dumps()
+    memtree = c_tibx.lsm_memtree_header(
+        encoding=memtree_encoding, node_count=len(memtree_cells), extra_len=len(memtree_blob)
+    )
+    record[LSB_MEMTREE_OFFSET : LSB_MEMTREE_OFFSET + len(c_tibx.lsm_memtree_header)] = memtree.dumps()
     return bytes(record) + memtree_blob
 
 
 def tlv_directory(slots: dict[int, bytes]) -> bytes:
     """Encode a 19-slot TLV directory (missing slots are zero-length)."""
     out = bytearray()
-    for index in range(19):
+    for index in range(TLV_SLOT_COUNT):
         payload = slots.get(index, b"")
-        out += struct.pack(">I", len(payload))
+        out += c_tibx.tlv_header(length=len(payload)).dumps()
         out += payload
-        stride = (len(payload) + 7) & ~3
-        out += b"\x00" * (stride - 4 - len(payload))
+        out += b"\x00" * (-len(out) % 4)  # the next entry starts on a 4-byte boundary
     return bytes(out)
 
 
@@ -408,57 +435,70 @@ def arch_header_page(
 ) -> bytes:
     """Build a full ARCH commit-root page with a TLV directory (single page)."""
     directory = tlv_directory(slots)
-    header_size = 0x400 + len(directory)
-    if 8 + header_size > PAGE:
+    header_size = TLV_DIRECTORY_OFFSET + len(directory)
+    if ENVELOPE_SIZE + header_size > PAGE:
         raise ValueError("synthetic ARCH header does not fit a single page")
 
-    pg = bytearray(PAGE)
-    pg[0], pg[1] = 0x41, 0x01
-    pg[8:12] = b"ARCH"
-    struct.pack_into(">I", pg, 0x0C, header_size)  # body+4: header size
-    struct.pack_into(">H", pg, 0x10, 8)  # body+8: header version
-    pg[0x18:0x20] = created_ms.to_bytes(8, "big")
-    pg[0x20:0x28] = modified_ms.to_bytes(8, "big")
-    pg[0x28:0x38] = uuid
-    struct.pack_into(">Q", pg, 8 + 0x188, seq)  # body+0x188: commit sequence
-    pg[8 + 0x400 : 8 + 0x400 + len(directory)] = directory
+    pg = blank_page(c_tibx.PageType.ARCH)
+    body = c_tibx.arch_header(
+        magic=b"ARCH",
+        header_size=header_size,
+        header_version=8,
+        created_ms=created_ms,
+        modified_ms=modified_ms,
+        archive_uuid=uuid,
+    )
+    pg[ENVELOPE_SIZE : ENVELOPE_SIZE + len(c_tibx.arch_header)] = body.dumps()
+    sequence = ENVELOPE_SIZE + ARCH_COMMIT_SEQUENCE_OFFSET
+    pg[sequence : sequence + 8] = c_tibx.uint64.dumps(seq)
+    pg[ENVELOPE_SIZE + TLV_DIRECTORY_OFFSET : ENVELOPE_SIZE + header_size] = directory
     return finalize(pg)
 
 
 def lsm_page(page_type: int, magic: bytes, cells: list[Cell], key_length: int, compact: bool) -> bytes:
     """Build a LEAF (compact) or LDIR (plain ``key || value``) page, raw encoding."""
     stream = compact_cells(cells) if compact else b"".join(cell.key + cell.value for cell in cells)
-    if 8 + 0x34 + len(stream) > PAGE:
+    if ENVELOPE_SIZE + LSM_CELL_STREAM_OFFSET + len(stream) > PAGE:
         raise ValueError("synthetic LSM page overflow")
 
-    pg = bytearray(PAGE)
-    pg[0], pg[1] = 0x41, page_type
-    body = 8
-    pg[body : body + 4] = magic
-    pg[body + 4] = 1  # version
-    pg[body + 5] = 0  # encoding: raw
-    struct.pack_into(">H", pg, body + 6, len(cells))
-    struct.pack_into(">II", pg, body + 8, len(stream), len(stream))
-    struct.pack_into(">I", pg, body + 16, key_length)
-    pg[body + 0x34 : body + 0x34 + len(stream)] = stream
+    pg = blank_page(page_type)
+    header = c_tibx.lsm_page_header(
+        magic=magic,
+        version=1,
+        encoding=0,  # raw
+        cell_count=len(cells),
+        uncompressed_size=len(stream),
+        on_disk_size=len(stream),
+        key_size_param=key_length,
+    )
+    pg[ENVELOPE_SIZE : ENVELOPE_SIZE + len(c_tibx.lsm_page_header)] = header.dumps()
+    start = ENVELOPE_SIZE + LSM_CELL_STREAM_OFFSET
+    pg[start : start + len(stream)] = stream
     return finalize(pg)
 
 
 def data_map_key(volume_id: int, source_offset: int, length: int, slice_id: int, extent_id: int) -> bytes:
-    return (
-        struct.pack(">QQ", volume_id, source_offset)
-        + length.to_bytes(3, "big")
-        + struct.pack(">IQ", slice_id, extent_id)
-    )
+    return c_tibx.data_map_key(
+        volume_id=volume_id,
+        source_offset=source_offset,
+        extent_length=length,
+        slice_id=slice_id,
+        extent_id=extent_id,
+    ).dumps()
 
 
 def data_map_value(segment_id: int, extent_index: int = 0xFFFF) -> bytes:
-    return struct.pack(">QH", segment_id, extent_index)
+    return c_tibx.data_map_value(segment_id=segment_id, extent_index=extent_index).dumps()
+
+
+def segment_map_key(segment_id: int) -> bytes:
+    return c_tibx.segment_map_key(segment_id=segment_id).dumps()
 
 
 def segment_map_value(page_count: int, page_offset: int, slice_id: int = 2) -> bytes:
-    # Mixed endianness: page_count LE, page_offset and slice_id BE, then a 20-byte hash
-    return struct.pack("<I", page_count) + struct.pack(">II", page_offset, slice_id) + b"\x00" * 20
+    return c_tibx.segment_map_value(
+        page_count=page_count.to_bytes(4, "little"), page_offset=page_offset, slice_id=slice_id
+    ).dumps()
 
 
 class ExtentSpec(NamedTuple):
@@ -520,8 +560,8 @@ def build_lsm_archive(
     if use_ctree:
         next_page = page_base + 1 + len(pages)
         dm_leaf_page, sm_leaf_page = next_page, next_page + 1
-        pages.append(lsm_page(0x03, b"LEAF", dm_cells, key_length=31, compact=True))
-        pages.append(lsm_page(0x03, b"LEAF", sm_cells, key_length=8, compact=True))
+        pages.append(lsm_page(c_tibx.PageType.LEAF, b"LEAF", dm_cells, key_length=31, compact=True))
+        pages.append(lsm_page(c_tibx.PageType.LEAF, b"LEAF", sm_cells, key_length=8, compact=True))
         dm_sb = lsb(31, 10, ctrees=[(dm_leaf_page * PAGE, len(dm_cells))])
         sm_sb = lsb(8, 32, ctrees=[(sm_leaf_page * PAGE, len(sm_cells))])
     else:
@@ -555,7 +595,9 @@ def build_lsm_archive(
 
 def file_table(offsets: list[int]) -> bytes:
     """Encode a TLV[18] file table: the logical byte offset of each archive file."""
-    return b"".join(struct.pack(">IQ", index, offset) for index, offset in enumerate(offsets))
+    return b"".join(
+        c_tibx.file_table_entry(index=index, byte_offset=offset).dumps() for index, offset in enumerate(offsets)
+    )
 
 
 def build_version_set(
@@ -617,7 +659,7 @@ def _segments_and_maps(
             payload += spec.data
 
         seg_pages = segment_pages(bytes(payload), compression=compression, data_key=data_key, alg=alg)
-        sm_cells.append(Cell(struct.pack(">Q", segment_id), segment_map_value(len(seg_pages), next_page)))
+        sm_cells.append(Cell(segment_map_key(segment_id), segment_map_value(len(seg_pages), next_page)))
         pages.extend(seg_pages)
         next_page += len(seg_pages)
 

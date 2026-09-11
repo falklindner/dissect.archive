@@ -39,8 +39,7 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
-    class arch_superblock(__cs__.Structure):
-        header: _c_tibx.page_header
+    class arch_header(__cs__.Structure):
         magic: __cs__.CharArray
         header_size: _c_tibx.uint32
         header_version: _c_tibx.uint16
@@ -54,7 +53,22 @@ class _c_tibx(__cs__.cstruct):
         modified_ms: _c_tibx.uint64
         archive_uuid: __cs__.CharArray
         @overload
-        def __init__(self, header: _c_tibx.page_header | None = ..., magic: __cs__.CharArray | None = ..., header_size: _c_tibx.uint32 | None = ..., header_version: _c_tibx.uint16 | None = ..., compr_lvl: _c_tibx.ComprLvl | None = ..., encr_alg: _c_tibx.EncrAlg | None = ..., dedup: _c_tibx.uint8 | None = ..., hash_alg: _c_tibx.uint8 | None = ..., chunking_alg: _c_tibx.uint8 | None = ..., hash_window_width: _c_tibx.uint8 | None = ..., created_ms: _c_tibx.uint64 | None = ..., modified_ms: _c_tibx.uint64 | None = ..., archive_uuid: __cs__.CharArray | None = ...): ...
+        def __init__(self, magic: __cs__.CharArray | None = ..., header_size: _c_tibx.uint32 | None = ..., header_version: _c_tibx.uint16 | None = ..., compr_lvl: _c_tibx.ComprLvl | None = ..., encr_alg: _c_tibx.EncrAlg | None = ..., dedup: _c_tibx.uint8 | None = ..., hash_alg: _c_tibx.uint8 | None = ..., chunking_alg: _c_tibx.uint8 | None = ..., hash_window_width: _c_tibx.uint8 | None = ..., created_ms: _c_tibx.uint64 | None = ..., modified_ms: _c_tibx.uint64 | None = ..., archive_uuid: __cs__.CharArray | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class arch_superblock(__cs__.Structure):
+        header: _c_tibx.page_header
+        body: _c_tibx.arch_header
+        @overload
+        def __init__(self, header: _c_tibx.page_header | None = ..., body: _c_tibx.arch_header | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class tlv_header(__cs__.Structure):
+        length: _c_tibx.uint32
+        @overload
+        def __init__(self, length: _c_tibx.uint32 | None = ...): ...
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
@@ -83,6 +97,14 @@ class _c_tibx(__cs__.cstruct):
         tag: __cs__.CharArray
         @overload
         def __init__(self, iv: __cs__.CharArray | None = ..., tag: __cs__.CharArray | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class lz4_block_header(__cs__.Structure):
+        compressed_size: _c_tibx.uint32
+        uncompressed_size: _c_tibx.uint32
+        @overload
+        def __init__(self, compressed_size: _c_tibx.uint32 | None = ..., uncompressed_size: _c_tibx.uint32 | None = ...): ...
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
@@ -137,6 +159,21 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
+    class lsm_cell_group_header(__cs__.Structure):
+        count: _c_tibx.uint8
+        alive: _c_tibx.uint24
+        @overload
+        def __init__(self, count: _c_tibx.uint8 | None = ..., alive: _c_tibx.uint24 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class ldir_value(__cs__.Structure):
+        child_offset: _c_tibx.uint64
+        @overload
+        def __init__(self, child_offset: _c_tibx.uint64 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
     class data_map_key(__cs__.Structure):
         volume_id: _c_tibx.uint64
         source_offset: _c_tibx.uint64
@@ -153,6 +190,23 @@ class _c_tibx(__cs__.cstruct):
         extent_index: _c_tibx.uint16
         @overload
         def __init__(self, segment_id: _c_tibx.uint64 | None = ..., extent_index: _c_tibx.uint16 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class segment_map_key(__cs__.Structure):
+        segment_id: _c_tibx.uint64
+        @overload
+        def __init__(self, segment_id: _c_tibx.uint64 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class segment_map_value(__cs__.Structure):
+        page_count: __cs__.CharArray
+        page_offset: _c_tibx.uint32
+        slice_id: _c_tibx.uint32
+        hash: __cs__.CharArray
+        @overload
+        def __init__(self, page_count: __cs__.CharArray | None = ..., page_offset: _c_tibx.uint32 | None = ..., slice_id: _c_tibx.uint32 | None = ..., hash: __cs__.CharArray | None = ...): ...
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
@@ -193,3 +247,67 @@ class _c_tibx(__cs__.cstruct):
 
 # Technically `c_tibx` is an instance of `_c_tibx`, but then we can't use it in type hints
 c_tibx: TypeAlias = _c_tibx
+
+class _c_boot(__cs__.cstruct):
+    class ntfs_boot_sector(__cs__.Structure):
+        jump: __cs__.CharArray
+        oem_id: __cs__.CharArray
+        bytes_per_sector: _c_boot.uint16
+        _unused: __cs__.CharArray
+        total_sectors: _c_boot.uint64
+        @overload
+        def __init__(self, jump: __cs__.CharArray | None = ..., oem_id: __cs__.CharArray | None = ..., bytes_per_sector: _c_boot.uint16 | None = ..., _unused: __cs__.CharArray | None = ..., total_sectors: _c_boot.uint64 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class exfat_boot_sector(__cs__.Structure):
+        jump: __cs__.CharArray
+        fs_name: __cs__.CharArray
+        _must_be_zero: __cs__.CharArray
+        partition_offset: _c_boot.uint64
+        volume_length: _c_boot.uint64
+        _unused: __cs__.CharArray
+        bytes_per_sector_shift: _c_boot.uint8
+        @overload
+        def __init__(self, jump: __cs__.CharArray | None = ..., fs_name: __cs__.CharArray | None = ..., _must_be_zero: __cs__.CharArray | None = ..., partition_offset: _c_boot.uint64 | None = ..., volume_length: _c_boot.uint64 | None = ..., _unused: __cs__.CharArray | None = ..., bytes_per_sector_shift: _c_boot.uint8 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class fat_boot_sector(__cs__.Structure):
+        jump: __cs__.CharArray
+        oem_id: __cs__.CharArray
+        bytes_per_sector: _c_boot.uint16
+        sectors_per_cluster: _c_boot.uint8
+        reserved_sectors: _c_boot.uint16
+        fat_count: _c_boot.uint8
+        root_entries: _c_boot.uint16
+        total_sectors_16: _c_boot.uint16
+        media: _c_boot.uint8
+        fat_size_16: _c_boot.uint16
+        sectors_per_track: _c_boot.uint16
+        heads: _c_boot.uint16
+        hidden_sectors: _c_boot.uint32
+        total_sectors_32: _c_boot.uint32
+        _fat16_ext: __cs__.CharArray
+        fs_type_16: __cs__.CharArray
+        _fat32_ext: __cs__.CharArray
+        fs_type_32: __cs__.CharArray
+        @overload
+        def __init__(self, jump: __cs__.CharArray | None = ..., oem_id: __cs__.CharArray | None = ..., bytes_per_sector: _c_boot.uint16 | None = ..., sectors_per_cluster: _c_boot.uint8 | None = ..., reserved_sectors: _c_boot.uint16 | None = ..., fat_count: _c_boot.uint8 | None = ..., root_entries: _c_boot.uint16 | None = ..., total_sectors_16: _c_boot.uint16 | None = ..., media: _c_boot.uint8 | None = ..., fat_size_16: _c_boot.uint16 | None = ..., sectors_per_track: _c_boot.uint16 | None = ..., heads: _c_boot.uint16 | None = ..., hidden_sectors: _c_boot.uint32 | None = ..., total_sectors_32: _c_boot.uint32 | None = ..., _fat16_ext: __cs__.CharArray | None = ..., fs_type_16: __cs__.CharArray | None = ..., _fat32_ext: __cs__.CharArray | None = ..., fs_type_32: __cs__.CharArray | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class ext_superblock(__cs__.Structure):
+        inodes_count: _c_boot.uint32
+        blocks_count: _c_boot.uint32
+        _unused0: __cs__.CharArray
+        log_block_size: _c_boot.uint32
+        _unused1: __cs__.CharArray
+        magic: _c_boot.uint16
+        @overload
+        def __init__(self, inodes_count: _c_boot.uint32 | None = ..., blocks_count: _c_boot.uint32 | None = ..., _unused0: __cs__.CharArray | None = ..., log_block_size: _c_boot.uint32 | None = ..., _unused1: __cs__.CharArray | None = ..., magic: _c_boot.uint16 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+# Technically `c_boot` is an instance of `_c_boot`, but then we can't use it in type hints
+c_boot: TypeAlias = _c_boot

@@ -23,6 +23,7 @@ from tests._synth import (
     data_map_value,
     lsb,
     lsm_page,
+    segment_map_key,
     segment_map_value,
     segment_pages,
     sparse_extents,
@@ -210,11 +211,11 @@ def test_tombstone_masks_older_records() -> None:
     key_b = data_map_key(10, 0x1000, 64, 2, 2)
     dm_cells = [Cell(key_a, data_map_value(100)), Cell(key_b, data_map_value(101))]
     sm_cells = [
-        Cell(struct.pack(">Q", 100), segment_map_value(1, 1)),
-        Cell(struct.pack(">Q", 101), segment_map_value(1, 2)),
+        Cell(segment_map_key(100), segment_map_value(1, 1)),
+        Cell(segment_map_key(101), segment_map_value(1, 2)),
     ]
     dm_sb = lsb(31, 10, memtree_cells=[Cell(key_a, b"", alive=False)], ctrees=[(3 * PAGE, len(dm_cells))])
-    sm_sb = lsb(8, 32, memtree_cells=[Cell(struct.pack(">Q", 100), b"", alive=False)], ctrees=[(4 * PAGE, 2)])
+    sm_sb = lsb(8, 32, memtree_cells=[Cell(segment_map_key(100), b"", alive=False)], ctrees=[(4 * PAGE, 2)])
     archive = (
         arch_header_page({1: dm_sb, 2: sm_sb})
         + segment_pages(payload_a)[0]

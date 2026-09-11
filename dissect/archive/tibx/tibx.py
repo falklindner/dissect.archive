@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import datetime
 import re
-import struct
 import uuid
 from bisect import bisect_right
 from collections import OrderedDict, defaultdict
@@ -23,12 +22,15 @@ from typing import TYPE_CHECKING, BinaryIO
 from dissect.util.stream import AlignedStream, MappingStream
 
 from dissect.archive.tibx.c_tibx import (
+    EXT_MAGIC,
+    EXT_SUPERBLOCK_OFFSET,
     EXTENT_ALIGNMENT,
     EXTENT_INDEX_WHOLE_SEGMENT,
     PAGE_SIZE,
     TLV_FILE_TABLE,
     TLV_KEYMAP,
     TLV_SLICES,
+    c_boot,
     c_tibx,
 )
 from dissect.archive.tibx.exception import (
@@ -645,19 +647,19 @@ def _boot_sector_size(boot: bytes) -> int:
     if len(boot) < 512:
         return 0
     try:
-        if boot[3:11] == b"NTFS    ":
-            bytes_per_sector = struct.unpack_from("<H", boot, 0x0B)[0] or 512
-            return bytes_per_sector * struct.unpack_from("<Q", boot, 0x28)[0]
-        if boot[3:11] == b"EXFAT   ":
-            return struct.unpack_from("<Q", boot, 0x48)[0] << boot[0x6C]
-        if boot[0x52:0x57] == b"FAT32" or boot[0x36:0x39] == b"FAT":
-            bytes_per_sector = struct.unpack_from("<H", boot, 0x0B)[0] or 512
-            total = struct.unpack_from("<H", boot, 0x13)[0] or struct.unpack_from("<I", boot, 0x20)[0]
-            return bytes_per_sector * total
-        if len(boot) >= 1024 + 0x5C and boot[1024 + 0x38 : 1024 + 0x3A] == b"\x53\xef":
-            superblock = boot[1024:]
-            blocks = struct.unpack_from("<I", superblock, 0x04)[0]
-            return blocks << (10 + struct.unpack_from("<I", superblock, 0x18)[0])
-    except struct.error:
+        ntfs = c_boot.ntfs_boot_sector(boot)
+        if ntfs.oem_id == b"NTFS    ":
+            return (ntfs.bytes_per_sector or 512) * ntfs.total_sectors
+        exfat = c_boot.exfat_boot_sector(boot)
+        if exfat.fs_name == b"EXFAT   ":
+            return exfat.volume_length << exfat.bytes_per_sector_shift
+        fat = c_boot.fat_boot_sector(boot)
+        if fat.fs_type_32.startswith(b"FAT32") or fat.fs_type_16.startswith(b"FAT"):
+            return (fat.bytes_per_sector or 512) * (fat.total_sectors_16 or fat.total_sectors_32)
+        if len(boot) >= EXT_SUPERBLOCK_OFFSET + len(c_boot.ext_superblock):
+            ext = c_boot.ext_superblock(boot[EXT_SUPERBLOCK_OFFSET:])
+            if ext.magic == EXT_MAGIC:
+                return ext.blocks_count << (10 + ext.log_block_size)
+    except EOFError:
         return 0
     return 0
