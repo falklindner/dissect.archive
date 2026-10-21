@@ -44,9 +44,6 @@ if TYPE_CHECKING:
 
     from dissect.archive.tibx.page import PageStore, SuperBlock
 
-# Sanity bound on pages visited per tree walk (matches the reference engine)
-MAX_TREE_PAGES = 8192
-
 
 class CTreeRef(NamedTuple):
     """One on-disk ctree (frozen LSM run) slot from an L-SB. ``offset`` is None if empty."""
@@ -343,14 +340,23 @@ def iter_memtree_cells(sb: LsmSuperBlock) -> list[LsmCell]:
 
 
 def walk_tree(store: PageStore, root_page: int, key_length: int, value_length: int) -> Iterator[LsmCell]:
-    """Yield every cell of every LEAF reachable from ``root_page``, depth-first."""
-    pages_walked = 0
+    """Yield every cell of every LEAF reachable from ``root_page``, depth-first.
+
+    Every page is visited at most once, which bounds the walk on any input. A fixed page
+    budget does not: the segment_map of a ~200 GB archive already runs to ~8,000 pages,
+    and the budget of 8192 pages this replaces silently dropped whatever lay past it.
+
+    Raises:
+        CorruptArchiveError: If a page is reached twice, which no valid tree does.
+    """
+    visited: set[int] = set()
 
     def _visit(page_index: int) -> Iterator[LsmCell]:
-        nonlocal pages_walked
-        if pages_walked >= MAX_TREE_PAGES or not 0 <= page_index < store.page_count:
+        if not 0 <= page_index < store.page_count:
             return
-        pages_walked += 1
+        if page_index in visited:
+            raise CorruptArchiveError(f"LSM tree revisits page {page_index}")
+        visited.add(page_index)
         page = store.page(page_index)
         page_type = c_tibx.page_header(page).type
         body = page[ENVELOPE_SIZE:]

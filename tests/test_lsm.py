@@ -5,6 +5,7 @@ import struct
 
 import pytest
 
+from dissect.archive.tibx.c_tibx import ENVELOPE_SIZE, LSM_CELL_STREAM_OFFSET, c_tibx
 from dissect.archive.tibx.exception import CorruptArchiveError
 from dissect.archive.tibx.lsm import (
     LsmSuperBlock,
@@ -16,7 +17,7 @@ from dissect.archive.tibx.lsm import (
     walk_tree,
 )
 from dissect.archive.tibx.page import PageStore
-from tests._synth import PAGE, Cell, arch_header_page, arch_page, compact_cells, lsb, lsm_page
+from tests._synth import PAGE, Cell, arch_header_page, arch_page, blank_page, compact_cells, lsb, lsm_page
 
 
 def test_compact_cells_roundtrip_with_tombstone() -> None:
@@ -100,6 +101,60 @@ def test_walk_tree_through_ldir() -> None:
         (b"b" * 8, b"2" * 4),
         (b"c" * 8, b"3" * 4),
     ]
+
+
+def _unchecked_lsm_page(page_type: int, magic: bytes, cells: list[Cell], key_length: int, compact: bool) -> bytes:
+    """An LSM page without its CRC: tree walks do not check it, and thousands are needed."""
+    stream = compact_cells(cells) if compact else b"".join(cell.key + cell.value for cell in cells)
+    page = blank_page(page_type)
+    header = c_tibx.lsm_page_header(
+        magic=magic,
+        version=1,
+        encoding=0,
+        cell_count=len(cells),
+        uncompressed_size=len(stream),
+        on_disk_size=len(stream),
+        key_size_param=key_length,
+    )
+    page[ENVELOPE_SIZE : ENVELOPE_SIZE + len(c_tibx.lsm_page_header)] = header.dumps()
+    start = ENVELOPE_SIZE + LSM_CELL_STREAM_OFFSET
+    page[start : start + len(stream)] = stream
+    return bytes(page)
+
+
+def test_walk_tree_past_8192_pages() -> None:
+    # The segment_map of a large archive runs to thousands of pages; a walk that stops at
+    # a fixed page budget loses every record past it without an error
+    leaves_per_ldir, ldir_count = 100, 85
+    leaf_count = leaves_per_ldir * ldir_count
+    first_leaf = 2 + ldir_count
+    pages = []
+    root = [Cell(struct.pack(">Q", i * leaves_per_ldir), struct.pack(">Q", (2 + i) * PAGE)) for i in range(ldir_count)]
+    pages.append(_unchecked_lsm_page(0x04, b"LDIR", root, key_length=8, compact=False))
+    for i in range(ldir_count):
+        children = [
+            Cell(struct.pack(">Q", leaf), struct.pack(">Q", (first_leaf + leaf) * PAGE))
+            for leaf in range(i * leaves_per_ldir, (i + 1) * leaves_per_ldir)
+        ]
+        pages.append(_unchecked_lsm_page(0x04, b"LDIR", children, key_length=8, compact=False))
+    pages.extend(
+        _unchecked_lsm_page(0x03, b"LEAF", [Cell(struct.pack(">Q", leaf), b"v" * 4)], key_length=8, compact=True)
+        for leaf in range(leaf_count)
+    )
+    store = PageStore(io.BytesIO(arch_page(1000, 2000, b"\xab" * 16) + b"".join(pages)))
+
+    keys = [cell.key for cell in walk_tree(store, 1, key_length=8, value_length=4)]
+    assert len(pages) > 8192
+    assert keys == [struct.pack(">Q", leaf) for leaf in range(leaf_count)]
+
+
+def test_walk_tree_rejects_cycles() -> None:
+    # An LDIR that points back at itself would otherwise be walked forever
+    ldir = [Cell(b"a" * 8, struct.pack(">Q", 1 * PAGE))]
+    archive = arch_page(1000, 2000, b"\xab" * 16) + lsm_page(0x04, b"LDIR", ldir, key_length=8, compact=False)
+    store = PageStore(io.BytesIO(archive))
+    with pytest.raises(CorruptArchiveError, match="revisits page 1"):
+        list(walk_tree(store, 1, key_length=8, value_length=4))
 
 
 def test_archive_header_tlv_and_trees() -> None:
