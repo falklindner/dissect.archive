@@ -149,7 +149,11 @@ class TIBX:
         try:
             # Open one by one so a failure mid-list doesn't leak already-opened handles
             for part in parts:
-                handles.append(part.open("rb"))  # noqa: PERF401
+                # Unbuffered for a single file: every read seeks to a page boundary, so a
+                # buffer only doubled single-page reads to its 8 KiB, and split a page run
+                # that is no multiple of it into two reads. A split set goes through a
+                # MappingStream, which expects whole reads from its parts.
+                handles.append(part.open("rb", buffering=0 if len(parts) == 1 else -1))  # noqa: PERF401
             tibx = cls(handles if len(handles) > 1 else handles[0])
         except Exception:
             for handle in handles:
@@ -412,7 +416,7 @@ class TIBX:
         if locator is None:
             raise CorruptArchiveError(f"segment id {segment_id} not in segment_map")
 
-        plain = read_plaintext(self.store, locator.page_offset, self._data_key)
+        plain = read_plaintext(self.store, locator.page_offset, self._data_key, locator.page_count)
         self._segment_cache[segment_id] = plain
         self._segment_cache_bytes += len(plain)
         # Evict oldest until under budget, but always keep the just-added entry so a single

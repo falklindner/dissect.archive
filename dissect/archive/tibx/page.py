@@ -52,9 +52,10 @@ SCAN_CHUNK_MAX_PAGES = 1024
 # sit here, on the theory that tree walks and segment headers get revisited. Measured on
 # real archives it never once hit: :class:`TIBX`'s 256 MiB segment cache absorbs the
 # repeats, and segment payloads go through :meth:`read_run`, which does not consult it. What
-# reaches ``page()`` is one header page per distinct segment, read once -- 40 to 500
-# calls for 3000 scattered 4 KiB reads. The LRU only earned hits with the segment cache
-# shrunk to 256 KiB, which is not a configuration anyone runs.
+# reached ``page()`` was one header page per distinct segment, read once -- 40 to 500
+# calls for 3000 scattered 4 KiB reads -- and now the header comes with the payload too.
+# The LRU only earned hits with the segment cache shrunk to 256 KiB, which is not a
+# configuration anyone runs.
 
 
 def page_crc32c(page: bytes) -> int:
@@ -135,6 +136,23 @@ class PageStore:
         if self.size < PAGE_SIZE or c_tibx.arch_superblock(self.page(0)).body.magic != ARCH_MAGIC:
             raise InvalidArchiveError("Missing ARCH magic at page 0")
 
+    def _read_at(self, offset: int, size: int) -> bytes:
+        """Read ``size`` bytes at ``offset``, or fewer only at EOF.
+
+        :meth:`TIBX.open` opens a single-file archive unbuffered, and a raw file may return
+        a read in parts.
+        """
+        self.fh.seek(offset)
+        data = self.fh.read(size)
+        if len(data) == size or not data:
+            return data
+        parts = [data]
+        remaining = size - len(data)
+        while remaining > 0 and (data := self.fh.read(remaining)):
+            parts.append(data)
+            remaining -= len(data)
+        return b"".join(parts)
+
     def page(self, index: int) -> bytes:
         """Read the page at ``index``.
 
@@ -143,8 +161,7 @@ class PageStore:
         """
         if not 0 <= index < self.page_count:
             raise CorruptArchiveError(f"page {index} is out of bounds (archive has {self.page_count} pages)")
-        self.fh.seek(index * PAGE_SIZE)
-        page = self.fh.read(PAGE_SIZE)
+        page = self._read_at(index * PAGE_SIZE, PAGE_SIZE)
         if len(page) != PAGE_SIZE:
             raise CorruptArchiveError(f"short read on page {index}")
         return page
@@ -154,7 +171,8 @@ class PageStore:
 
         Collapses what would otherwise be ``count`` separate ``seek``+``read`` calls into
         one -- the pages of a multi-page segment are physically contiguous, so this is the
-        batch read path for :func:`segment.read_compressed`.
+        batch read path for :func:`segment.read_plaintext`, and for the backward scan of
+        :meth:`live_root`.
 
         Raises:
             CorruptArchiveError: If the run extends past the end of the archive or is truncated.
@@ -163,8 +181,7 @@ class PageStore:
             return []
         if start < 0 or start + count > self.page_count:
             raise CorruptArchiveError(f"page run {start}..{start + count} is out of bounds ({self.page_count} pages)")
-        self.fh.seek(start * PAGE_SIZE)
-        blob = self.fh.read(count * PAGE_SIZE)
+        blob = self._read_at(start * PAGE_SIZE, count * PAGE_SIZE)
         if len(blob) != count * PAGE_SIZE:
             raise CorruptArchiveError(f"short read on page run {start}..{start + count}")
         return [blob[i * PAGE_SIZE : (i + 1) * PAGE_SIZE] for i in range(count)]

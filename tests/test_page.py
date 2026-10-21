@@ -33,6 +33,19 @@ def test_page_access_and_types() -> None:
     assert store.page(0)[8:12] == b"ARCH"
 
 
+def test_reads_returned_in_parts() -> None:
+    # TIBX.open opens a single file unbuffered, and a raw file may return a read in parts
+    class Trickle(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            return super().read(min(size, 1000) if size is not None and size >= 0 else size)
+
+    archive = build_archive()
+    store = PageStore(Trickle(archive))
+    assert store.read_run(0, 2) == [archive[:PAGE_SIZE], archive[PAGE_SIZE:]]
+    assert store.page(1) == archive[PAGE_SIZE:]
+    assert store.live_root().offset == 0
+
+
 def test_superblock_fields() -> None:
     uuid = bytes(range(16))
     sb = SuperBlock(arch_page(1_720_000_000_123, 1_720_000_555_999, uuid), offset=0)

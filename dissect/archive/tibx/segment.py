@@ -38,6 +38,10 @@ if TYPE_CHECKING:
     from dissect.archive.tibx.crypto import DataKey
     from dissect.archive.tibx.page import PageStore
 
+# Most pages read along with a segment header on the strength of the segment_map's page
+# count (4 MiB); real segments hold 512 KiB of data, so ~130 pages at most
+MAX_PREFETCH_PAGES = 1024
+
 
 class Segment:
     """One parsed segment header at ``page_index``."""
@@ -73,13 +77,13 @@ def _pkcs7_unpad(data: bytes) -> bytes:
     return data
 
 
-def read_compressed(store: PageStore, segment: Segment) -> bytes:
+def read_compressed(store: PageStore, segment: Segment, continuation: list[bytes] | None = None) -> bytes:
     """Read exactly ``segment.zlength`` still-compressed bytes.
 
     Walks the segment's page plus as many continuation DATA pages as needed, stripping
     each page's 8-byte envelope. The physically-contiguous continuation pages are read in
     a single batched I/O (one ``read`` instead of one per page), which matters most over a
-    network share.
+    network share -- or come from ``continuation``, pages already read with the header.
     """
     remaining = segment.zlength
     first_take = min(SEGMENT_FIRST_PAGE_PAYLOAD, remaining)
@@ -91,7 +95,9 @@ def read_compressed(store: PageStore, segment: Segment) -> bytes:
         start = segment.page_index + 1
         if start + cont_count > store.page_count:
             raise CorruptArchiveError(f"segment at page {segment.page_index} runs off the end of the archive")
-        for offset, page in enumerate(store.read_run(start, cont_count)):
+        if continuation is None or len(continuation) < cont_count:
+            continuation = store.read_run(start, cont_count)
+        for offset, page in enumerate(continuation[:cont_count]):
             if page[1] != c_tibx.PageType.DATA:
                 raise CorruptArchiveError(
                     f"unexpected non-data page {start + offset} inside segment at page {segment.page_index}"
@@ -146,21 +152,27 @@ def decompress(raw: bytes, segment: Segment) -> bytes:
     return out
 
 
-def read_plaintext(store: PageStore, page_index: int, data_key: DataKey | None = None) -> bytes:
+def read_plaintext(store: PageStore, page_index: int, data_key: DataKey | None = None, page_count: int = 1) -> bytes:
     """Read and decompress the segment whose header is at ``page_index``.
 
     Encrypted (``SE``) segments are decrypted with ``data_key`` before decompression.
+    ``page_count``, the number of pages the segment_map says the segment takes, lets the
+    header and its continuation pages come in one read instead of two: one round trip per
+    segment over SMB. The header stays authoritative for where the segment ends.
 
     Raises:
         InvalidPasswordError: If the segment is encrypted but no data key was provided.
     """
-    segment = Segment(store.page(page_index), page_index)
+    # The count comes from the archive, so it only ever sizes the read
+    prefetch = max(1, min(page_count, MAX_PREFETCH_PAGES, store.page_count - page_index))
+    pages = store.read_run(page_index, prefetch)
+    segment = Segment(pages[0], page_index)
     if segment.encrypted or segment.key_id != 0:
         if data_key is None:
             raise InvalidPasswordError(f"segment at page {page_index} is encrypted and no data key is available")
         from dissect.archive.tibx.crypto import decrypt_segment
 
-        plaintext = decrypt_segment(read_compressed(store, segment), data_key)
+        plaintext = decrypt_segment(read_compressed(store, segment, pages[1:]), data_key)
         if segment.compression in COMP_ZSTD:
             # zstd frame parsing ignores any trailing CBC/PKCS#7 padding
             return decompress_zstd(plaintext, segment.length)
@@ -175,4 +187,4 @@ def read_plaintext(store: PageStore, page_index: int, data_key: DataKey | None =
         raise UnsupportedFormatError(
             f"encrypted segment at page {page_index} uses compression {segment.compression:#06x}"
         )
-    return decompress(read_compressed(store, segment), segment)
+    return decompress(read_compressed(store, segment, pages[1:]), segment)

@@ -8,7 +8,7 @@ import pytest
 from dissect.archive.tibx.exception import CorruptArchiveError, InvalidPasswordError
 from dissect.archive.tibx.page import PageStore
 from dissect.archive.tibx.segment import Segment, read_plaintext
-from tests._synth import COMP_NONE, PAGE, arch_page, segment_pages
+from tests._synth import COMP_NONE, PAGE, CountingIO, arch_page, segment_pages
 
 
 def _store(*pages: bytes) -> PageStore:
@@ -28,6 +28,31 @@ def test_multi_page_segment_continuation() -> None:
     assert len(pages) > 1
     store = _store(*pages)
     assert read_plaintext(store, 1) == payload
+
+
+def test_segment_read_in_one_io() -> None:
+    # Given the segment_map's page count, the header and the continuation pages come in
+    # one read instead of two
+    payload = random.Random(0).randbytes(3 * PAGE)
+    pages = segment_pages(payload)
+    fh = CountingIO(arch_page(1000, 2000, b"\xab" * 16) + b"".join(pages))
+    store = PageStore(fh)
+
+    fh.reads = 0
+    assert read_plaintext(store, 1, page_count=len(pages)) == payload
+    assert fh.reads == 1
+    fh.reads = 0
+    assert read_plaintext(store, 1) == payload
+    assert fh.reads == 2
+
+
+@pytest.mark.parametrize("page_count", [0, 2, 1000], ids=["zero", "short", "past-eof"])
+def test_segment_page_count_only_sizes_the_read(page_count: int) -> None:
+    # The count comes from the archive: too small costs a second read, too large stops at
+    # EOF, and the header decides where the segment ends either way
+    payload = random.Random(0).randbytes(3 * PAGE)
+    store = _store(*segment_pages(payload), *segment_pages(b"next segment"))
+    assert read_plaintext(store, 1, page_count=page_count) == payload
 
 
 def test_stored_segment() -> None:

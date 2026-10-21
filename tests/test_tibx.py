@@ -16,6 +16,7 @@ from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX, resolve_extents
 from tests._synth import (
     PAGE,
     Cell,
+    CountingIO,
     ExtentSpec,
     arch_header_page,
     build_exfat_image,
@@ -97,6 +98,19 @@ def test_multi_page_segment_in_volume() -> None:
     data = random.Random(1).randbytes(4 * PAGE)  # incompressible, spans pages
     tibx = _open(build_lsm_archive([ExtentSpec(10, 0, data)]))
     assert tibx.streams()[0].read(0, len(data)) == data
+
+
+def test_segment_read_in_one_io() -> None:
+    # The segment_map's page count lets a segment come in one read: one round trip per
+    # segment over SMB instead of two
+    first, second = random.Random(3).randbytes(3 * PAGE), random.Random(4).randbytes(3 * PAGE)
+    fh = CountingIO(build_lsm_archive([ExtentSpec(10, 0, first), ExtentSpec(10, len(first), second)]))
+    volume = TIBX(fh).streams()[0]
+    assert volume.read(0, len(first)) == first  # also loads the segment index
+
+    fh.reads = 0
+    assert volume.read(len(first), len(second)) == second
+    assert fh.reads == 1
 
 
 def test_stream_matches_direct_reads() -> None:
