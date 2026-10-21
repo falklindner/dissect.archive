@@ -293,18 +293,10 @@ def decode_cells_compact(buf: bytes, count: int, key_length: int, value_length: 
 
 def decode_page_cells(body: bytes, key_length: int, value_length: int) -> list[LsmCell]:
     """Decode every cell in a LEAF or LDIR page body (envelope already stripped)."""
-    if body[:4] not in (LSM_MAGIC_LEAF, LSM_MAGIC_LDIR):
-        raise CorruptArchiveError(f"not a LEAF/LDIR page: magic={bytes(body[:4])!r}")
-    header = c_tibx.lsm_page_header(body)
-    if header.encoding & 0x80:
-        raise UnsupportedFormatError("encrypted LSM pages are not supported")
-
+    header, raw = _decode_page_stream(body)
     is_ldir = bytes(header.magic) == LSM_MAGIC_LDIR
     if is_ldir:
         value_length = LDIR_VALUE_SIZE
-
-    stream = body[LSM_CELL_STREAM_OFFSET : LSM_CELL_STREAM_OFFSET + header.on_disk_size]
-    raw = decompress_cell_stream(stream, header.encoding & 0x7F, header.uncompressed_size)
 
     # Compact mode applies to LEAF pages of fixed-key trees only
     if not is_ldir and key_length != 0:
@@ -339,37 +331,91 @@ def iter_memtree_cells(sb: LsmSuperBlock) -> list[LsmCell]:
     return decode_cells_compact(decoded, sb.memtree_node_count, sb.key_length, sb.value_length)
 
 
-def walk_tree(store: PageStore, root_page: int, key_length: int, value_length: int) -> Iterator[LsmCell]:
-    """Yield every cell of every LEAF reachable from ``root_page``, depth-first.
+def _decode_page_stream(body: bytes) -> tuple[c_tibx.lsm_page_header, bytes]:
+    """Return the header and decoded cell stream of a LEAF or LDIR page body."""
+    if body[:4] not in (LSM_MAGIC_LEAF, LSM_MAGIC_LDIR):
+        raise CorruptArchiveError(f"not a LEAF/LDIR page: magic={bytes(body[:4])!r}")
+    header = c_tibx.lsm_page_header(body)
+    if header.encoding & 0x80:
+        raise UnsupportedFormatError("encrypted LSM pages are not supported")
+    stream = body[LSM_CELL_STREAM_OFFSET : LSM_CELL_STREAM_OFFSET + header.on_disk_size]
+    return header, decompress_cell_stream(stream, header.encoding & 0x7F, header.uncompressed_size)
+
+
+def walk_leaf_streams(store: PageStore, root_page: int, key_length: int) -> Iterator[tuple[bytes, int]]:
+    """Yield ``(cell_stream, cell_count)`` for every LEAF reachable from ``root_page``.
+
+    Depth-first and in key order, like :func:`walk_tree`, but without decoding the LEAF
+    cells: callers that know the record layout decode the stream in bulk.
 
     Every page is visited at most once, which bounds the walk on any input. A fixed page
     budget does not: the segment_map of a ~200 GB archive already runs to ~8,000 pages,
-    and the budget of 8192 pages this replaces silently dropped whatever lay past it.
+    and a budget silently drops whatever lies past it.
 
     Raises:
         CorruptArchiveError: If a page is reached twice, which no valid tree does.
     """
     visited: set[int] = set()
-
-    def _visit(page_index: int) -> Iterator[LsmCell]:
+    # An explicit stack rather than recursive generators: a record passed through one
+    # ``yield from`` per tree level, which cost more than decoding it
+    stack = [root_page]
+    while stack:
+        page_index = stack.pop()
         if not 0 <= page_index < store.page_count:
-            return
+            continue
         if page_index in visited:
             raise CorruptArchiveError(f"LSM tree revisits page {page_index}")
         visited.add(page_index)
         page = store.page(page_index)
         page_type = c_tibx.page_header(page).type
-        body = page[ENVELOPE_SIZE:]
         if page_type == c_tibx.PageType.LDIR:
-            for cell in decode_page_cells(body, key_length, value_length):
-                if len(cell.value) != LDIR_VALUE_SIZE:
-                    continue
-                yield from _visit(c_tibx.ldir_value(cell.value).child_offset // PAGE_SIZE)
+            header, raw = _decode_page_stream(page[ENVELOPE_SIZE:])
+            children = [
+                c_tibx.ldir_value(cell.value).child_offset // PAGE_SIZE
+                for cell in decode_cells_variable(raw, header.cell_count, key_length, LDIR_VALUE_SIZE)
+                if len(cell.value) == LDIR_VALUE_SIZE
+            ]
+            stack.extend(reversed(children))
         elif page_type == c_tibx.PageType.LEAF:
-            yield from decode_page_cells(body, key_length, value_length)
+            header, raw = _decode_page_stream(page[ENVELOPE_SIZE:])
+            yield raw, header.cell_count
         # other page types are silently skipped
 
-    yield from _visit(root_page)
+
+def walk_tree(store: PageStore, root_page: int, key_length: int, value_length: int) -> Iterator[LsmCell]:
+    """Yield every cell of every LEAF reachable from ``root_page``, depth-first.
+
+    Raises:
+        CorruptArchiveError: If a page is reached twice, which no valid tree does.
+    """
+    for raw, count in walk_leaf_streams(store, root_page, key_length):
+        # Compact mode applies to LEAF pages of fixed-key trees only
+        if key_length != 0:
+            yield from decode_cells_compact(raw, count, key_length, value_length)
+        else:
+            yield from decode_cells_variable(raw, count, key_length, value_length)
+
+
+def iter_tree_leaf_streams(store: PageStore, sb: LsmSuperBlock) -> Iterator[Iterator[tuple[bytes, int]]]:
+    """Yield the ctree runs of an LSM tree, newest first, as :func:`walk_leaf_streams`.
+
+    The mem-tree is not included; use :func:`iter_memtree_cells` for it.
+    """
+    for ctree in sb.ctrees:
+        if ctree.root_page is not None:
+            yield walk_leaf_streams(store, ctree.root_page, sb.key_length)
+
+
+def iter_tree_runs(store: PageStore, sb: LsmSuperBlock) -> Iterator[Iterator[LsmCell]]:
+    """Yield the runs of an LSM tree, newest first: the mem-tree, then each ctree.
+
+    Keys are unique within a run; across runs the first-yielded (newest) record wins.
+    """
+    if sb.memtree_node_count:
+        yield iter(iter_memtree_cells(sb))
+    for ctree in sb.ctrees:
+        if ctree.root_page is not None:
+            yield walk_tree(store, ctree.root_page, sb.key_length, sb.value_length)
 
 
 def iter_tree_cells(store: PageStore, sb: LsmSuperBlock) -> Iterator[LsmCell]:
@@ -378,7 +424,5 @@ def iter_tree_cells(store: PageStore, sb: LsmSuperBlock) -> Iterator[LsmCell]:
     LSM merge semantics: for duplicate keys the first-yielded (newest) record wins;
     callers implement keep-first.
     """
-    yield from iter_memtree_cells(sb)
-    for ctree in sb.ctrees:
-        if ctree.root_page is not None:
-            yield from walk_tree(store, ctree.root_page, sb.key_length, sb.value_length)
+    for run in iter_tree_runs(store, sb):
+        yield from run

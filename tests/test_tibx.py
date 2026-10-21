@@ -159,6 +159,59 @@ def test_maps_load_directly() -> None:
     assert index[loaded[0].segment_id].page_offset == 1
 
 
+def test_record_layouts_match_c_tibx() -> None:
+    # map.py decodes these records with struct for speed; c_tibx stays the definition
+    from dissect.archive.tibx import map as tibx_map
+    from dissect.archive.tibx.c_tibx import c_tibx
+
+    key = data_map_key(0x1122334455667788, 0x0102030405060708, 0xABCDEF, 0x0A0B0C0D, 0x99)
+    value = data_map_value(0xDEADBEEF, 0x1234)
+    extent = tibx_map.decode_extent(key, value)
+    parsed_key, parsed_value = c_tibx.data_map_key(key), c_tibx.data_map_value(value)
+    assert extent == (
+        parsed_key.volume_id,
+        parsed_key.source_offset,
+        parsed_key.extent_length,
+        parsed_key.slice_id,
+        parsed_key.extent_id,
+        parsed_value.segment_id,
+        parsed_value.extent_index,
+    )
+    # Plain ints: cstruct's int subclasses are tracked by the GC, at a million records a tree
+    assert all(type(field) is int for field in extent)
+
+    raw = segment_map_value(0x01020304, 0x0A0B0C0D, slice_id=7)
+    locator = tibx_map.decode_segment_locator(segment_map_key(42), raw)
+    assert locator == (42, 0x01020304, c_tibx.segment_map_value(raw).page_offset)
+
+
+def test_segment_index_merges_runs() -> None:
+    # A newer run (the mem-tree) holding a higher segment id than the older ctree comes
+    # out of the tree walk unsorted; the index must still look every id up
+    sm_sb = lsb(8, 32, memtree_cells=[Cell(segment_map_key(300), segment_map_value(3, 30))], ctrees=[(PAGE, 2)])
+    leaf = lsm_page(
+        0x03,
+        b"LEAF",
+        [Cell(segment_map_key(100), segment_map_value(1, 10)), Cell(segment_map_key(200), segment_map_value(2, 20))],
+        key_length=8,
+        compact=True,
+    )
+    tibx = _open(arch_header_page({2: sm_sb}) + leaf)
+    index = load_segment_index(tibx.store, tibx.header)
+
+    assert list(index) == [100, 200, 300]
+    assert len(index) == 3
+    assert index[300].page_offset == 30
+    assert index[100].page_count == 1
+    assert 200 in index
+    assert 250 not in index
+    assert "200" not in index
+    assert index.get(250) is None
+    assert dict(index.items())[200] == (200, 2, 20)
+    with pytest.raises(KeyError):
+        index[250]
+
+
 def test_resolve_extents_empty() -> None:
     assert resolve_extents([]) == ([], [])
 
