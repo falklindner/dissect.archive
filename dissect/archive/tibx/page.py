@@ -25,20 +25,28 @@ if TYPE_CHECKING:
 
 ARCH_MAGIC = b"ARCH"
 
+# Pages read per step of the backward scan for the live root: 64 KiB growing to 4 MiB
+SCAN_CHUNK_MIN_PAGES = 16
+SCAN_CHUNK_MAX_PAGES = 1024
+
 # ENVELOPE PARSING -- page envelopes go through :class:`c_tibx.page_header` everywhere
-# except :meth:`PageStore.commit_roots`, which indexes the envelope bytes directly.
+# except :meth:`PageStore.commit_roots` and :meth:`PageStore.live_root`, which index the
+# envelope bytes directly.
 #
 # cstruct costs ~3.6 us per envelope against ~0.33 us for the indexing, but that ratio is
 # not the one that matters; measured end to end on a 949 MiB archive (242,977 pages):
 #
-#   live_root()      1.02x  -- scans backward from EOF and stops at the newest ARCH,
-#                              3 pages in practice, so the choice is unmeasurable
 #   verify()         1.06x  -- dominated by CRC-32C (13.1 s of the 13.9 s)
-#   commit_roots()   1.92x  -- 859 ms vs 1644 ms; the only loop where it pays
+#   commit_roots()   1.92x  -- 859 ms vs 1644 ms
 #
-# So only ``commit_roots`` -- a full sweep whose per-page work is otherwise just a marker
-# comparison -- indexes directly, and the offsets are mirrored in that one place. Random
-# access never touches this path at all.
+# and on an archive whose live root is 84k pages before EOF, as in one real archive (most
+# have it within the last 3 pages, where the choice is unmeasurable):
+#
+#   live_root()      2.8x   -- 291 ms vs 801 ms
+#
+# So only these two -- sweeps whose per-page work is otherwise just a marker comparison
+# -- index directly, and the offsets are mirrored in those two places. Random access never
+# touches this path at all.
 
 # NO PAGE CACHE -- ``page()`` reads straight through, deliberately. A 512-page LRU used to
 # sit here, on the theory that tree walks and segment headers get revisited. Measured on
@@ -181,14 +189,31 @@ class PageStore:
         the highest-offset ARCH is the newest commit, and skipping CRC-invalid ones
         recovers from a torn final commit.
 
+        The newest root is usually within the last few pages, but not always: one real
+        archive had 84k pages after it, and reading those one by one took 71 s over SMB.
+        So the scan reads backward in chunks, small first, doubling up to
+        :data:`SCAN_CHUNK_MAX_PAGES`.
+
         Raises:
             CorruptArchiveError: If no CRC-valid ARCH superblock exists.
         """
-        for index in range(self.page_count - 1, -1, -1):
-            page = self.page(index)
-            header = c_tibx.page_header(page)
-            if header.type == c_tibx.PageType.ARCH and page[8:12] == ARCH_MAGIC and header.crc32c == page_crc32c(page):
-                return SuperBlock(page, index * PAGE_SIZE)
+        end = self.page_count
+        count = SCAN_CHUNK_MIN_PAGES
+        while end > 0:
+            start = max(0, end - count)
+            pages = self.read_run(start, end - start)
+            for index in range(end - 1, start - 1, -1):
+                page = pages[index - start]
+                # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
+                if (
+                    page[0] == PAGE_MARKER
+                    and page[1] == c_tibx.PageType.ARCH
+                    and page[8:12] == ARCH_MAGIC
+                    and c_tibx.page_header(page).crc32c == page_crc32c(page)
+                ):
+                    return SuperBlock(page, index * PAGE_SIZE)
+            end = start
+            count = min(count * 2, SCAN_CHUNK_MAX_PAGES)
         raise CorruptArchiveError("No CRC-valid ARCH superblock found")
 
     def commit_roots(self) -> list[SuperBlock]:

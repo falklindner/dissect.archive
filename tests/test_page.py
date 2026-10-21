@@ -8,7 +8,7 @@ from dissect.util import ts
 from dissect.archive.tibx.c_tibx import PAGE_MARKER, PAGE_SIZE, c_tibx
 from dissect.archive.tibx.exception import CorruptArchiveError, InvalidArchiveError
 from dissect.archive.tibx.page import PageStore, SuperBlock, page_crc32c
-from tests._synth import SEG_PAYLOAD, arch_page, build_archive, data_page
+from tests._synth import SEG_PAYLOAD, CountingIO, arch_page, build_archive, data_page
 
 
 def test_rejects_non_tibx() -> None:
@@ -81,6 +81,21 @@ def test_live_root_skips_torn_final_commit() -> None:
     root = PageStore(io.BytesIO(good + bytes(torn))).live_root()
     assert root.offset == 0
     assert root.modified_ms == 2000
+
+
+@pytest.mark.parametrize("trailing", [0, 15, 16, 47, 48, 5000])
+def test_live_root_far_from_eof(trailing: int) -> None:
+    # The newest root can be far from EOF -- 84k pages in one real archive -- and is found
+    # in growing chunks, not a read per page. The counts put the root on chunk boundaries.
+    data = arch_page(1000, 2000, b"\x01" * 16) + arch_page(3000, 5000, b"\x02" * 16)
+    fh = CountingIO(data + data_page(SEG_PAYLOAD) * trailing)
+    store = PageStore(fh)
+    fh.reads = 0
+
+    root = store.live_root()
+    assert root.offset == PAGE_SIZE
+    assert root.modified_ms == 5000
+    assert fh.reads <= 10  # one per page before: up to 5001
 
 
 def test_live_root_all_roots_torn() -> None:

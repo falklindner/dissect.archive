@@ -18,6 +18,7 @@ store is only useful for as long as a real parser would accept it.
 
 from __future__ import annotations
 
+import io
 import struct
 import sys
 from typing import TYPE_CHECKING, NamedTuple
@@ -175,6 +176,18 @@ def wrap_data_key(data_key: bytes, password: bytes, iter_log2: int = 12, alg: in
 def build_archive(uuid: bytes = b"\xab" * 16) -> bytes:
     """Build the minimal two-page archive: one ARCH root + one DATA page."""
     return arch_page(1000, 2000, uuid) + data_page(SEG_PAYLOAD)
+
+
+class CountingIO(io.BytesIO):
+    """An in-memory archive that counts the reads made on it."""
+
+    def __init__(self, data: bytes):
+        super().__init__(data)
+        self.reads = 0
+
+    def read(self, size: int | None = -1) -> bytes:
+        self.reads += 1
+        return super().read(size)
 
 
 def build_fat12_image(content: bytes, filename: bytes = b"HELLO   TXT") -> bytes:
