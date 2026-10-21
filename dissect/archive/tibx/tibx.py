@@ -12,6 +12,7 @@ decompressed, so reads are fully lazy.
 from __future__ import annotations
 
 import datetime
+import heapq
 import re
 import uuid
 from bisect import bisect_right
@@ -325,15 +326,11 @@ class TIBX:
             by_volume: dict[int, list[Extent]] = defaultdict(list)
             for extent in self.extents:
                 by_volume[extent.volume_id].append(extent)
-            ranked = sorted(
-                by_volume,
-                key=lambda vid: (
-                    max(extent.slice_id for extent in by_volume[vid]),
-                    max(extent.end_offset for extent in by_volume[vid]),
-                ),
-                reverse=True,
+            streams = [TibxVolume(self, vid, extents) for vid, extents in by_volume.items()]
+            streams.sort(
+                key=lambda stream: (max(extent.slice_id for extent in stream.extents), stream.span), reverse=True
             )
-            self._streams = [TibxVolume(self, vid, by_volume[vid]) for vid in ranked]
+            self._streams = streams
         return self._streams
 
     def volumes(self) -> list[TibxVolume]:
@@ -428,6 +425,7 @@ class TibxVolume:
         self.volume_id = volume_id
         self.extents = extents
         self._starts, self._intervals = resolve_extents(extents)
+        self._span = max((extent.source_offset + extent.extent_length for extent in extents), default=0)
         self._size: int | None = None
 
     def __repr__(self) -> str:
@@ -440,13 +438,13 @@ class TibxVolume:
         Unlike :attr:`size` this needs no read, so it is available for an encrypted
         archive that has not been unlocked.
         """
-        return max((extent.end_offset for extent in self.extents), default=0)
+        return self._span
 
     @property
     def size(self) -> int:
         """The volume size in bytes, from its boot sector, capped by the data_map span."""
         if self._size is None:
-            span = max((extent.end_offset for extent in self.extents), default=0)
+            span = self._span
             size = _boot_sector_size(self.read(0, 2048))
             # An absent or absurd boot-sector size means this is not a filesystem
             # volume (or the BPB was misread) -- trust the data_map span instead
@@ -499,49 +497,55 @@ class TibxVolume:
 def resolve_extents(extents: list[Extent]) -> tuple[list[int], list[Interval]]:
     """Flatten possibly-overlapping extents into a recency-resolved interval list.
 
-    Interval painting: at every extent boundary, the covering extent is the one with the
-    highest ``(slice_id, extent_id, segment_id)`` -- the slice id (the backup in the
-    chain that wrote the extent) is the primary recency signal, because a differential
-    backup can reuse or even lower extent and segment ids of the base it supersedes.
-    Resolving per byte rather than per start offset matters: a newer *shorter* extent
-    must not mask the tail of an older *longer* one at the same offset.
+    The covering extent of every byte is the one with the highest ``(slice_id, extent_id,
+    segment_id)`` -- the slice id (the backup in the chain that wrote the extent) is the
+    primary recency signal, because a differential backup can reuse or even lower extent
+    and segment ids of the base it supersedes. Resolving per byte rather than per start
+    offset matters: a newer *shorter* extent must not mask the tail of an older *longer*
+    one at the same offset.
+
+    Extents that do not overlap at all, as in a full backup, are each an interval of their
+    own. Otherwise a sweep in offset order keeps the extents that cover the current offset
+    in a heap, most recent on top: an interval runs until that extent ends or the next one
+    starts.
 
     Returns ``(starts, intervals)``: a sorted non-overlapping list of
     ``(start, end, extent)`` plus the parallel list of starts for bisect.
     """
-    if not extents:
-        return [], []
+    # An empty extent covers nothing
+    ordered = sorted(
+        (extent for extent in extents if extent.extent_length > 0), key=lambda extent: extent.source_offset
+    )
+    starts = [extent.source_offset for extent in ordered]
+    ends = [extent.source_offset + extent.extent_length for extent in ordered]
+    if all(end <= start for end, start in zip(ends, starts[1:], strict=False)):
+        return starts, list(zip(starts, ends, ordered, strict=True))
 
-    by_start: dict[int, list[Extent]] = defaultdict(list)
-    by_end: dict[int, list[Extent]] = defaultdict(list)
-    for extent in extents:
-        by_start[extent.source_offset].append(extent)
-        by_end[extent.end_offset].append(extent)
-    points = sorted(set(by_start) | set(by_end))
-
-    def _recency(extent: Extent) -> tuple[int, int, int]:
-        return (extent.slice_id, extent.extent_id, extent.segment_id)
-
-    def _identity(extent: Extent) -> tuple:
-        return (extent.source_offset, extent.end_offset, *_recency(extent))
-
-    active: dict[tuple, Extent] = {}
+    count = len(ordered)
+    covering: list[tuple[int, int, int, int]] = []  # (-slice_id, -extent_id, -segment_id, index)
     intervals: list[Interval] = []
-    for index in range(len(points) - 1):
-        point = points[index]
-        for extent in by_end.get(point, []):  # half-open: extents ending here stop covering
-            active.pop(_identity(extent), None)
-        for extent in by_start.get(point, []):
-            active[_identity(extent)] = extent
-        if not active:
+    index = position = 0
+    while index < count or covering:
+        if not covering:
+            position = starts[index]  # skip the hole up to the next extent
+        while index < count and starts[index] <= position:
+            extent = ordered[index]
+            heapq.heappush(covering, (-extent.slice_id, -extent.extent_id, -extent.segment_id, index))
+            index += 1
+        while covering and ends[covering[0][3]] <= position:
+            heapq.heappop(covering)
+        if not covering:
             continue
-        winner = max(active.values(), key=_recency)
-        next_point = points[index + 1]
-        if intervals and intervals[-1][2] is winner and intervals[-1][1] == point:
-            # Coalesce contiguous runs of the same extent
-            intervals[-1] = (intervals[-1][0], next_point, winner)
+        winner = ordered[covering[0][3]]
+        stop = ends[covering[0][3]]
+        if index < count and starts[index] < stop:
+            stop = starts[index]
+        if intervals and intervals[-1][2] is winner and intervals[-1][1] == position:
+            # Still the same extent: only a less recent one started underneath it
+            intervals[-1] = (intervals[-1][0], stop, winner)
         else:
-            intervals.append((point, next_point, winner))
+            intervals.append((position, stop, winner))
+        position = stop
     return [interval[0] for interval in intervals], intervals
 
 

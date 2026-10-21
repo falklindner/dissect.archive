@@ -4,11 +4,12 @@ import hashlib
 import io
 import random
 import struct
+from itertools import pairwise
 from typing import TYPE_CHECKING
 
 import pytest
 
-from dissect.archive.tibx.map import load_extents, load_segment_index
+from dissect.archive.tibx.map import Extent, load_extents, load_segment_index
 from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX, resolve_extents
 from tests._synth import (
     PAGE,
@@ -214,6 +215,43 @@ def test_segment_index_merges_runs() -> None:
 
 def test_resolve_extents_empty() -> None:
     assert resolve_extents([]) == ([], [])
+
+
+def _resolve_by_boundary(extents: list[Extent]) -> list[tuple[int, int, Extent]]:
+    # Reference for resolve_extents: between two boundaries, the most recent covering extent
+    # wins, and a run of the same extent is one interval
+    points = sorted({offset for extent in extents for offset in (extent.source_offset, extent.end_offset)})
+    intervals = []
+    for start, end in pairwise(points):
+        covering = [extent for extent in extents if extent.source_offset <= start < extent.end_offset]
+        if not covering:
+            continue
+        winner = max(covering, key=lambda extent: (extent.slice_id, extent.extent_id, extent.segment_id))
+        if intervals and intervals[-1][2] is winner and intervals[-1][1] == start:
+            intervals[-1] = (intervals[-1][0], end, winner)
+        else:
+            intervals.append((start, end, winner))
+    return intervals
+
+
+@pytest.mark.parametrize("overlapping", [True, False], ids=["overlapping", "disjoint"])
+@pytest.mark.parametrize("seed", range(25))
+def test_resolve_extents_matches_reference(seed: int, overlapping: bool) -> None:
+    rng = random.Random(seed)
+    extents = []
+    offset = 0
+    for extent_id in range(1, rng.randrange(2, 80)):
+        length = rng.randrange(0, 16) * 0x1000
+        if overlapping:
+            offset = rng.randrange(0, 64) * 0x1000
+        extents.append(Extent(10, offset, length, rng.randrange(1, 6), extent_id, rng.randrange(1, 100), 0xFFFF))
+        if not overlapping:
+            offset += length + rng.randrange(0, 3) * 0x1000
+    rng.shuffle(extents)
+
+    starts, intervals = resolve_extents(extents)
+    assert intervals == _resolve_by_boundary(extents)
+    assert starts == [interval[0] for interval in intervals]
 
 
 def test_multi_extent_shared_segment() -> None:
