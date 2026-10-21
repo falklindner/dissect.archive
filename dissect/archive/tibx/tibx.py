@@ -489,37 +489,35 @@ class TibxVolume:
         """Read ``length`` bytes at volume offset ``offset`` (sparse gaps read as zeros)."""
         if length <= 0:
             return b""
-        result = bytearray()
+        # Views into the cached segments and runs of zeros, joined once at the end
+        parts: list[bytes | memoryview] = []
         cursor = offset
         end = offset + length
-        while cursor < end:
-            index = bisect_right(self._starts, cursor) - 1
-            interval = self._intervals[index] if index >= 0 else None
-            if interval is not None and interval[0] <= cursor < interval[1]:
-                extent = interval[2]
-                take = min(end, interval[1])
-                if extent.segment_id == 0:
-                    # Discard marker: a newer slice recorded this range as unallocated
-                    # (e.g. a file deleted between incrementals) -- it reads as zeros
-                    # and must keep masking the older data underneath
-                    result.extend(b"\x00" * (take - cursor))
-                    cursor = take
-                    continue
-                segment = self.tibx.read_segment(extent.segment_id)
-                segment_offset = self.tibx.extent_base(extent) + (cursor - extent.source_offset)
-                chunk = segment[segment_offset : segment_offset + (take - cursor)]
-                if len(chunk) < take - cursor:
-                    # Damaged archive: segment shorter than its mapped extent -- zero-fill
-                    chunk = chunk + b"\x00" * ((take - cursor) - len(chunk))
-                result.extend(chunk)
-                cursor = take
-            else:
-                # Sparse hole: zero-fill up to the next interval (or the requested end)
-                index = bisect_right(self._starts, cursor)
-                until = min(end, self._starts[index]) if index < len(self._starts) else end
-                result.extend(b"\x00" * (until - cursor))
-                cursor = until
-        return bytes(result)
+        index = bisect_right(self._starts, offset) - 1
+        if index < 0 or self._intervals[index][1] <= offset:
+            index += 1
+        while index < len(self._intervals) and self._intervals[index][0] < end:
+            start, stop, extent = self._intervals[index]
+            index += 1
+            if extent.segment_id == 0:
+                # Discard marker: a newer slice recorded this range as unallocated
+                # (e.g. a file deleted between incrementals) -- it reads as zeros
+                # and must keep masking the older data underneath
+                continue
+            begin, finish = max(start, offset), min(stop, end)
+            if begin > cursor:
+                parts.append(bytes(begin - cursor))  # a sparse hole or a discarded range
+            segment = self.tibx.read_segment(extent.segment_id)
+            segment_offset = self.tibx.extent_base(extent) + (begin - extent.source_offset)
+            chunk = memoryview(segment)[segment_offset : segment_offset + (finish - begin)]
+            parts.append(chunk)
+            if len(chunk) < finish - begin:
+                # Damaged archive: segment shorter than its mapped extent -- zero-fill
+                parts.append(bytes(finish - begin - len(chunk)))
+            cursor = finish
+        if cursor < end:
+            parts.append(bytes(end - cursor))
+        return b"".join(parts)
 
 
 def resolve_extents(extents: list[Extent]) -> tuple[list[int], list[Interval]]:

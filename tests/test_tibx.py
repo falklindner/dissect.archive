@@ -310,6 +310,18 @@ def test_discard_extent_masks_older_data() -> None:
     assert volume.read(0x2000, 0x1000) == b"A" * 0x1000  # older data past the marker
 
 
+def test_segment_shorter_than_its_extent_reads_zeros() -> None:
+    # Damaged archive: the data_map maps more bytes than the segment holds
+    tibx = _open(build_lsm_archive([ExtentSpec(10, 0, b"A" * 0x1000)]))
+    tibx._extents = [tibx.extents[0]._replace(extent_length=0x3000)]
+    volume = tibx.streams()[0]
+
+    assert volume.read(0, 0x3000) == b"A" * 0x1000 + b"\x00" * 0x2000
+    assert volume.read(0xF00, 0x200) == b"A" * 0x100 + b"\x00" * 0x100
+    assert volume.read(0x2F00, 0x200) == b"\x00" * 0x200  # and on past the end
+    assert volume.read(0x100, 0) == b""
+
+
 def test_tombstone_masks_older_records() -> None:
     # A backup-version cleanup writes tombstones into the mem-tree (newest LSM layer)
     # that must mask the deleted version's records still present in the on-disk ctree
