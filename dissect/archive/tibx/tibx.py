@@ -159,13 +159,19 @@ class TIBX:
         return tibx
 
     def close(self) -> None:
-        """Close the file handles owned by this instance (opened via :meth:`open`)."""
+        """Close the file handles owned by this instance (opened via :meth:`open`).
+
+        Also drops the index and the segment cache. Volumes refer back to their archive, so
+        without this the index outlived ``with TIBX.open(...)`` until the cyclic garbage
+        collector got to it -- hundreds of MiB for a large archive.
+        """
         for handle in self._handles:
             try:
                 handle.close()
             except OSError:  # noqa: PERF203
                 pass
         self._handles = []
+        self._reset_snapshot_caches()
 
     def __enter__(self) -> Self:
         return self

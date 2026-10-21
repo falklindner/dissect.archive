@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import io
 import random
 import struct
+import weakref
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
@@ -402,3 +404,19 @@ def test_small_recognised_filesystem_is_a_volume() -> None:
     tibx = TIBX(io.BytesIO(archive))
 
     assert [v.volume_id for v in tibx.volumes()] == [4]
+
+
+def test_close_releases_the_index() -> None:
+    # Volumes refer back to their archive. close() drops the archive's side of that cycle,
+    # so the index is freed by reference counting rather than whenever the cyclic GC runs.
+    tibx = _open(build_lsm_archive([ExtentSpec(10, 0, b"A" * 0x1000)]))
+    volume = weakref.ref(tibx.streams()[0])
+    assert volume().read(0, 4) == b"AAAA"
+
+    gc.disable()
+    try:
+        tibx.close()
+        assert volume() is None
+        assert not tibx._segment_cache
+    finally:
+        gc.enable()
