@@ -58,8 +58,31 @@ def test_lz4_pure_python_fallback_matches_accelerator(monkeypatch: pytest.Monkey
 
     accelerated = lz4_block_decompress(compressed, len(chunk), dictionary)
     monkeypatch.setattr(codec, "_lz4_block", None)
+    monkeypatch.setattr(codec, "_UTIL_LZ4_DICTIONARY", False)
     fallback = lz4_block_decompress(compressed, len(chunk), dictionary)
     assert accelerated == fallback == chunk
+
+
+def test_lz4_dictionary_uses_dissect_util(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without the C package, dictionary blocks go through dissect.util where it takes a
+    # dictionary (fox-it/dissect.util#141) instead of the byte-by-byte in-tree decoder
+    if not codec._UTIL_LZ4_DICTIONARY:
+        pytest.skip("this dissect.util takes no dictionary")
+    dictionary = PLAIN[:1000]
+    chunk = PLAIN[500:1800]
+    compressed = lz4.compress(chunk, mode="high_compression", store_size=False, dict=dictionary)
+    monkeypatch.setattr(codec, "_lz4_block", None)
+
+    calls: list[bytes] = []
+    original = codec.util_lz4.decompress
+
+    def counted(src: bytes, uncompressed_size: int = -1, **kwargs: bytes) -> bytes:
+        calls.append(kwargs.get("dictionary", b""))
+        return original(src, uncompressed_size=uncompressed_size, **kwargs)
+
+    monkeypatch.setattr(codec.util_lz4, "decompress", counted)
+    assert lz4_block_decompress(compressed, len(chunk), dictionary) == chunk
+    assert calls == [dictionary]
 
 
 def test_lz4_without_dictionary_uses_dissect_util(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -101,6 +124,14 @@ def _linked_chain(chunks: list[bytes]) -> bytes:
 
 def test_linked_lz4_chain() -> None:
     chunks = [PLAIN[:1000], PLAIN[500:1800], PLAIN[200:1500]]
+    body = _linked_chain(chunks)
+    assert decompress_linked_lz4(body, sum(map(len, chunks))) == b"".join(chunks)
+
+
+def test_linked_lz4_chain_longer_than_a_dictionary() -> None:
+    # Only the last 64 KiB of the output can be referenced, so that is all that is passed on
+    first = bytes(range(256)) * 300  # 75 KiB
+    chunks = [first, first[-40000:-20000]]
     body = _linked_chain(chunks)
     assert decompress_linked_lz4(body, sum(map(len, chunks))) == b"".join(chunks)
 

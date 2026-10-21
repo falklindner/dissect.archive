@@ -7,8 +7,9 @@
   (``LZ4_decompress_safe_continue`` semantics).
 
 Blocks that need no dictionary -- the first of every chain, and whole LZ4 segments -- go
-through ``dissect.util``'s decoder. The rest cannot: ``dissect.util`` exposes no dictionary
-parameter on either backend, so the in-tree decoder below (adapted from
+through ``dissect.util``'s decoder, and so do the rest where ``dissect.util`` takes a
+dictionary (fox-it/dissect.util#141). Older versions expose no dictionary parameter on
+either backend, so the in-tree decoder below (adapted from
 ``dissect.util.compression.lz4_python``, with a dictionary seed added) stays as the
 fallback for them.
 
@@ -56,6 +57,21 @@ try:
 except Exception:
     _lz4_block = None
 
+# Whether dissect.util's LZ4 takes a dictionary (fox-it/dissect.util#141), natively when it is
+# built with Rust. Probed rather than pinned to a version until that is released: a linked-LZ4
+# chain is ~8 dictionary blocks per LSM page, and the in-tree fallback copies byte by byte.
+try:
+    # A 4-byte match at distance 1 that only the dictionary can serve, then the 12 literals a
+    # valid block ends with
+    _UTIL_LZ4_DICTIONARY = (
+        util_lz4.decompress(b"\x00\x01\x00\xc0" + b"B" * 12, 16, dictionary=b"A") == b"AAAA" + b"B" * 12
+    )
+except Exception:
+    _UTIL_LZ4_DICTIONARY = False
+
+# LZ4 back-references reach at most this far, so a longer dictionary is never read
+LZ4_MAX_DISTANCE = 0xFFFF
+
 
 def decompress_zstd(data: bytes, max_output: int) -> bytes:
     """Decompress one zstd frame, ignoring trailing padding, bounded by ``max_output``."""
@@ -74,9 +90,10 @@ def lz4_block_decompress(src: bytes, uncompressed_size: int, dictionary: bytes =
 
     Three decoders, fastest first:
 
-    1. the C ``lz4`` library, the only one that takes a dictionary, so it serves every block
+    1. the C ``lz4`` library, which takes a dictionary, so it serves every block
     2. ``dissect.util`` (Rust-backed when built) for blocks that need no dictionary -- the
-       first block of every chain, and whole LZ4 segments
+       first block of every chain, and whole LZ4 segments -- and for the dictionary blocks
+       too where it takes a dictionary
     3. the decoder below, adapted from ``dissect.util.compression.lz4_python.decompress``
        with a ``dictionary`` seed: output starts as the dictionary so matches may reach back
        into it, and the seed is stripped from the returned data
@@ -90,8 +107,10 @@ def lz4_block_decompress(src: bytes, uncompressed_size: int, dictionary: bytes =
             # Malformed on-disk block on untrusted input -- normalise to our error type
             raise CorruptArchiveError(f"LZ4: {e}")
 
-    if not dictionary and uncompressed_size > 0:
+    if (not dictionary or _UTIL_LZ4_DICTIONARY) and uncompressed_size > 0:
         try:
+            if dictionary:
+                return util_lz4.decompress(src, uncompressed_size=uncompressed_size, dictionary=dictionary)
             return util_lz4.decompress(src, uncompressed_size=uncompressed_size)
         except (CorruptDataError, ValueError) as e:
             # The two backends disagree on type: the Rust one raises ValueError, the
@@ -177,7 +196,8 @@ def decompress_linked_lz4(body: bytes, max_output: int, *, strict: bool = True) 
                 f"only {max_output - len(out)} remain of the {max_output}-byte target"
             )
         try:
-            out += lz4_block_decompress(body[pos : pos + compressed], uncompressed, dictionary=bytes(out))
+            dictionary = bytes(out[-LZ4_MAX_DISTANCE:])
+            out += lz4_block_decompress(body[pos : pos + compressed], uncompressed, dictionary=dictionary)
         except CorruptArchiveError:
             if not strict:
                 break
