@@ -378,6 +378,15 @@ def _ntfs_boot(total_sectors: int, sector_size: int = 512) -> bytes:
     return bytes(boot)
 
 
+def _mbr(*partitions: tuple[int, int, int, int]) -> bytes:
+    """A disk's MBR with the given ``(boot_flag, type, lba_start, sectors)`` entries."""
+    mbr = bytearray(512)
+    for index, (boot_flag, partition_type, lba_start, sectors) in enumerate(partitions):
+        struct.pack_into("<B3xB3xII", mbr, 0x1BE + index * 16, boot_flag, partition_type, lba_start, sectors)
+    mbr[510:512] = b"\x55\xaa"
+    return bytes(mbr)
+
+
 def test_metadata_streams_are_not_volumes() -> None:
     # Acronis keys its own metadata by volume id exactly like a partition: the metainfo
     # XML, allocation bitmaps, small index tables, the disk's MBR region. Reporting those
@@ -403,13 +412,58 @@ def test_unformatted_partition_is_still_a_volume() -> None:
     archive = build_lsm_archive(
         [
             ExtentSpec(4, 0, _ntfs_boot(0x18000) + b"\x00" * 512),
-            ExtentSpec(9, MIN_VOLUME_SIZE, b"unformatted tail"),  # span >= MIN_VOLUME_SIZE
+            ExtentSpec(9, MIN_VOLUME_SIZE, b"unformatted tail".ljust(512, b"\x00")),  # partition-sized
             ExtentSpec(3, 0, b"\x02\x00\x02\x00" * 8),
         ]
     )
     tibx = TIBX(io.BytesIO(archive))
 
     assert sorted(v.volume_id for v in tibx.volumes()) == [4, 9]
+
+
+def test_allocation_bitmap_is_not_a_volume() -> None:
+    # A volume's allocation bitmap is a bit per cluster, so on a real disk it passes
+    # MIN_VOLUME_SIZE (one was 2.9 MB). Its span is no whole number of sectors.
+    archive = build_lsm_archive(
+        [
+            ExtentSpec(4, 0, _ntfs_boot(0x18000) + b"\x00" * 512),
+            ExtentSpec(5, 0, b"\xff" * (MIN_VOLUME_SIZE + 0x2C5)),
+        ]
+    )
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert [v.volume_id for v in tibx.volumes()] == [4]
+
+
+@pytest.mark.parametrize(
+    "mbr", [_mbr((0x80, 0x07, 2048, 0x18000)), _mbr((0x00, 0xEE, 1, 0xFFFFFFFF))], ids=["mbr", "gpt"]
+)
+def test_disk_bootstrap_region_is_not_a_volume(mbr: bytes) -> None:
+    # The region before a disk's first partition is a whole 1 MiB on a disk partitioned
+    # the Windows way, and starts with its partition table: an MBR whose partitions all
+    # start past the region, or the protective MBR of a GPT disk.
+    archive = build_lsm_archive(
+        [
+            ExtentSpec(4, 0, _ntfs_boot(0x18000) + b"\x00" * 512),
+            ExtentSpec(1, 0, mbr),
+            ExtentSpec(1, MIN_VOLUME_SIZE - 512, b"\x00" * 512),
+        ]
+    )
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert [v.volume_id for v in tibx.volumes()] == [4]
+
+
+def test_partition_with_unrecognised_boot_sector_is_a_volume() -> None:
+    # A boot sector that ends in 55 AA, as BitLocker's does, is no partition table unless
+    # its entries say so
+    boot = bytearray(512)
+    boot[:11] = b"\xeb\x58\x90-FVE-FS-"
+    boot[510:512] = b"\x55\xaa"
+    archive = build_lsm_archive([ExtentSpec(9, 0, bytes(boot)), ExtentSpec(9, MIN_VOLUME_SIZE, b"\x00" * 512)])
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert [v.volume_id for v in tibx.volumes()] == [9]
 
 
 def test_small_recognised_filesystem_is_a_volume() -> None:

@@ -13,7 +13,8 @@ cell-group header only looks little-endian: it is a count byte followed by a big
 24-bit bitmap.
 
 :data:`c_boot` holds the few filesystem boot-sector fields the parser reads to size a
-volume. Those formats are not TIBX's and are little-endian, so they get their own instance.
+volume, and the MBR partition table it reads to tell a disk's bootstrap region from one.
+Those formats are not TIBX's and are little-endian, so they get their own instance.
 
 The format is not documented by Acronis. These definitions encode the format findings of
 the MIT-licensed ``acronis-tibx`` (see ``THIRD_PARTY_NOTICES.md``) and were confirmed
@@ -236,7 +237,8 @@ struct file_table_entry {
 
 c_tibx = cstruct(endian=">").load(tibx_def)
 
-# Only the fields needed to tell a volume's filesystem apart and read its size
+# Only the fields needed to tell a volume's filesystem apart and read its size, and to
+# recognise a disk's partition table
 boot_def = """
 struct ntfs_boot_sector {
     char        jump[3];
@@ -285,6 +287,22 @@ struct ext_superblock {
     uint32      log_block_size;         /* +0x18, block size is 1024 << log_block_size */
     char        _unused1[28];
     uint16      magic;                  /* +0x38, EXT_MAGIC */
+};
+
+struct mbr_partition {
+    uint8       boot_flag;              /* 0x80 active, 0x00 inactive */
+    char        chs_first[3];
+    uint8       type;                   /* 0x00 for an unused entry */
+    char        chs_last[3];
+    uint32      lba_start;
+    uint32      sectors;
+};
+
+/* A disk's master boot record */
+struct mbr {
+    char            bootstrap[446];
+    mbr_partition   partitions[4];      /* +0x1BE */
+    uint16          signature;          /* +0x1FE, MBR_SIGNATURE */
 };
 """
 
@@ -367,3 +385,7 @@ SEGMENT_MAP_VALUE_SIZE = len(c_tibx.segment_map_value)
 
 EXT_SUPERBLOCK_OFFSET = 0x400
 EXT_MAGIC = 0xEF53
+
+MBR_SIGNATURE = 0xAA55
+# mbr_partition.type of the one partition covering a GPT disk in its protective MBR
+MBR_TYPE_GPT_PROTECTIVE = 0xEE

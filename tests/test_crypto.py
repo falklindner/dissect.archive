@@ -247,7 +247,9 @@ def test_locked_archive_can_still_be_enumerated() -> None:
 def test_locked_large_stream_is_a_volume_without_the_password() -> None:
     # A partition-sized stream is classified on its data_map span, which needs no read --
     # so it is still reported as a volume while the archive is locked.
-    archive = build_lsm_archive([ExtentSpec(10, MIN_VOLUME_SIZE, b"encrypted tail")], password=PASSWORD, alg=7)
+    archive = build_lsm_archive(
+        [ExtentSpec(10, MIN_VOLUME_SIZE, b"encrypted tail".ljust(512, b"\x00"))], password=PASSWORD, alg=7
+    )
     tibx = TIBX(io.BytesIO(archive))
 
     assert [v.volume_id for v in tibx.volumes()] == [10]

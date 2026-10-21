@@ -27,6 +27,8 @@ from dissect.archive.tibx.c_tibx import (
     EXT_SUPERBLOCK_OFFSET,
     EXTENT_ALIGNMENT,
     EXTENT_INDEX_WHOLE_SEGMENT,
+    MBR_SIGNATURE,
+    MBR_TYPE_GPT_PROTECTIVE,
     PAGE_SIZE,
     TLV_FILE_TABLE,
     TLV_KEYMAP,
@@ -63,7 +65,11 @@ SPLIT_PART_RE = re.compile(r"^(?P<stem>.+?)-(?P<num>\d{4})\.tibx$", re.IGNORECAS
 # filesystem this parser does not recognise. The two populations are far apart in practice:
 # across the sample corpora the largest metadata stream is ~2.6 KB and the smallest real
 # partition is 16 MB, so this sits in the middle of a gap of some four orders of magnitude.
+# On real disks two kinds of metadata do reach it; see TIBX._is_volume.
 MIN_VOLUME_SIZE = 1 << 20
+
+# Partitions are imaged in whole sectors of at least this size
+SECTOR_SIZE = 512
 
 Interval = tuple[int, int, "Extent"]
 
@@ -353,9 +359,10 @@ class TIBX:
         single-partition backup look like eight, and a file-level backup like forty-five.
 
         A stream counts as a volume if its content starts with a filesystem this parser
-        recognises, or if it is at least :data:`MIN_VOLUME_SIZE` -- which keeps an
-        unformatted or unrecognised partition, something ``acrocmd list content`` reports
-        as a partition of type ``None``. Use :meth:`streams` for the unfiltered list.
+        recognises, or if it is at least :data:`MIN_VOLUME_SIZE`, a whole number of sectors
+        and does not start with a partition table -- which keeps an unformatted or
+        unrecognised partition, something ``acrocmd list content`` reports as a partition
+        of type ``None``. Use :meth:`streams` for the unfiltered list.
         """
         if self._volumes is None:
             self._volumes = [stream for stream in self.streams() if self._is_volume(stream)]
@@ -365,18 +372,29 @@ class TIBX:
     def _is_volume(stream: TibxVolume) -> bool:
         """Whether a data_map stream is a backed-up volume rather than Acronis metadata.
 
-        The size test runs on :attr:`TibxVolume.span`, which comes from the data_map and
+        Size alone does not tell the two apart on real disks. A volume's allocation bitmap
+        holds a bit per cluster, so it reaches :data:`MIN_VOLUME_SIZE` for any volume over
+        32 GiB, and the bootstrap region before a disk's first partition is a whole 1 MiB
+        on a disk partitioned the Windows way. But a partition is imaged in whole sectors,
+        so its span is sector-aligned where a bitmap's is not, and the bootstrap region
+        starts with the disk's partition table.
+
+        The size tests run on :attr:`TibxVolume.span`, which comes from the data_map and
         needs no read. That matters for an encrypted archive that has not been unlocked:
-        listing what a locked archive contains must not require the password, and reading
-        the boot sector would.
+        listing what a locked archive contains must not require the password, so a stream
+        that cannot be read is judged by its span alone.
         """
-        if stream.span >= MIN_VOLUME_SIZE:
-            return True
         try:
-            return bool(_boot_sector_size(stream.open().read(2048)))
+            head = stream.read(0, 2048)
         except Error:
-            # Locked, or unreadable for any other reason -- the span said no, so leave it.
+            # Locked, or unreadable for any other reason
+            head = None
+
+        if head is not None and _boot_sector_size(head):
+            return True
+        if stream.span < MIN_VOLUME_SIZE or stream.span % SECTOR_SIZE:
             return False
+        return head is None or not _is_partition_table(head, stream.span)
 
     def extent_base(self, extent: Extent) -> int:
         """The within-segment byte offset where ``extent``'s data starts.
@@ -650,6 +668,25 @@ def _stitch(handles: list[BinaryIO]) -> MappingStream:
         stream.add(offset, size, handle, 0)
         position = offset + size
     return stream
+
+
+def _is_partition_table(head: bytes, span: int) -> bool:
+    """Whether ``head`` starts a disk's bootstrap region rather than a partition.
+
+    That region runs from the MBR to the first partition, so its MBR is either the
+    protective one of a GPT disk, or describes partitions that all start at or beyond the
+    end of the region itself -- a test the boot code of a partition does not pass by
+    chance.
+    """
+    if len(head) < len(c_boot.mbr):
+        return False
+    mbr = c_boot.mbr(head)
+    if mbr.signature != MBR_SIGNATURE or any(entry.boot_flag not in (0x00, 0x80) for entry in mbr.partitions):
+        return False
+    used = [entry for entry in mbr.partitions if entry.type and entry.lba_start and entry.sectors]
+    if any(entry.type == MBR_TYPE_GPT_PROTECTIVE for entry in used):
+        return True
+    return bool(used) and min(entry.lba_start for entry in used) * SECTOR_SIZE >= span
 
 
 def _boot_sector_size(boot: bytes) -> int:

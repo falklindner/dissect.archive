@@ -309,5 +309,38 @@ class _c_boot(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
+    class mbr_partition(__cs__.Structure):
+        boot_flag: _c_boot.uint8
+        chs_first: __cs__.CharArray
+        type: _c_boot.uint8
+        chs_last: __cs__.CharArray
+        lba_start: _c_boot.uint32
+        sectors: _c_boot.uint32
+        @overload
+        def __init__(self, boot_flag: _c_boot.uint8 | None = ..., chs_first: __cs__.CharArray | None = ..., type: _c_boot.uint8 | None = ..., chs_last: __cs__.CharArray | None = ..., lba_start: _c_boot.uint32 | None = ..., sectors: _c_boot.uint32 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class mbr(__cs__.Structure):
+        bootstrap: __cs__.CharArray
+        class mbr_partition(__cs__.Structure):
+            boot_flag: _c_boot.uint8
+            chs_first: __cs__.CharArray
+            type: _c_boot.uint8
+            chs_last: __cs__.CharArray
+            lba_start: _c_boot.uint32
+            sectors: _c_boot.uint32
+            @overload
+            def __init__(self, boot_flag: _c_boot.uint8 | None = ..., chs_first: __cs__.CharArray | None = ..., type: _c_boot.uint8 | None = ..., chs_last: __cs__.CharArray | None = ..., lba_start: _c_boot.uint32 | None = ..., sectors: _c_boot.uint32 | None = ...): ...
+            @overload
+            def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+        partitions: __cs__.Array[mbr_partition]
+        signature: _c_boot.uint16
+        @overload
+        def __init__(self, bootstrap: __cs__.CharArray | None = ..., partitions: __cs__.Array[mbr_partition] | None = ..., signature: _c_boot.uint16 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
 # Technically `c_boot` is an instance of `_c_boot`, but then we can't use it in type hints
 c_boot: TypeAlias = _c_boot
