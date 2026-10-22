@@ -317,7 +317,7 @@ def test_segment_index_sorts_a_run_out_of_order() -> None:
 
     index = load_segment_index(tibx.store, tibx.header)
     assert list(index) == [100, 200, 300]
-    assert index[200].page_offset == 200
+    assert [index[segment_id].page_offset for segment_id in (100, 200, 300)] == [100, 200, 300]
 
 
 @pytest.mark.parametrize("overlapping", [True, False], ids=["overlapping", "disjoint"])

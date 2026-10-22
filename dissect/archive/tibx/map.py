@@ -19,8 +19,8 @@ import struct
 from array import array
 from bisect import bisect_left, bisect_right
 from collections.abc import Mapping, Sequence
-from itertools import compress, islice, pairwise, repeat
-from operator import eq, itemgetter, le, lshift, or_
+from itertools import compress, islice, repeat
+from operator import eq, itemgetter, le, lshift, lt, or_
 from typing import TYPE_CHECKING, NamedTuple, overload
 
 from dissect.archive.tibx.c_tibx import (
@@ -55,6 +55,8 @@ _DATA_MAP_TYPECODES = "QQBHIQQH"
 _EXTENT_TYPECODES = "QQQIQQH"
 _SEGMENT_MAP_KEY = struct.Struct(">Q")
 _SEGMENT_MAP_RECORD = struct.Struct(">Q4sI24x")
+# The same record with the page_count as a big-endian int, to unpack in bulk and byteswap after
+_SEGMENT_MAP_COLUMNS = struct.Struct(">QII24x")
 
 # A record as decoded from a compact cell stream: the key and value fields of a live record,
 # the key fields alone of a tombstone
@@ -410,111 +412,115 @@ def load_extents(store: PageStore, header: ArchiveHeader) -> ExtentTable:
 
 
 class SegmentIndex(Mapping[int, SegmentLocator]):
-    """``{segment_id: SegmentLocator}`` for a whole segment_map, in about 24 bytes a segment.
+    """``{segment_id: SegmentLocator}`` for a whole segment_map, in about 16 bytes a segment.
 
     A dict of locators costs ~200 bytes a segment, and real archives hold a million
-    segments. This keeps sorted parallel arrays instead and builds a locator on lookup.
+    segments. This keeps the runs of the tree apart, newest first, each as sorted parallel
+    arrays, and looks a segment id up in one run after the other: the first run with a
+    record for it decides, which is LSM keep-first. A locator is built on lookup.
+
+    Merging the runs instead took up to a second on a large archive, for nothing: real
+    archives have two to five runs whose segment ids overlap, newer runs holding rewritten
+    locations of older segments, and a read looks up a few segments at most.
     """
 
-    def __init__(self, segment_ids: array, page_counts: array, page_offsets: array):
-        self._ids = segment_ids
-        self._counts = page_counts
-        self._offsets = page_offsets
+    def __init__(self, runs: list[_SegmentRun]):
+        self._runs = runs
+        self._ids: array | None = None
 
-    def _find(self, segment_id: object) -> int:
+    def _find(self, segment_id: object) -> tuple[_SegmentRun, int] | None:
         if not isinstance(segment_id, int):
-            return -1
-        index = bisect_left(self._ids, segment_id)
-        return index if index < len(self._ids) and self._ids[index] == segment_id else -1
+            return None
+        for run in self._runs:
+            index = bisect_left(run.ids, segment_id)
+            if index < len(run.ids) and run.ids[index] == segment_id:
+                return run, index
+            index = bisect_left(run.deleted, segment_id)
+            if index < len(run.deleted) and run.deleted[index] == segment_id:
+                # A tombstone: the segment is gone, whatever older runs say
+                return None
+        return None
 
     def __getitem__(self, segment_id: int) -> SegmentLocator:
-        index = self._find(segment_id)
-        if index < 0:
+        found = self._find(segment_id)
+        if found is None:
             raise KeyError(segment_id)
-        return SegmentLocator(segment_id, self._counts[index], self._offsets[index])
+        run, index = found
+        return SegmentLocator(segment_id, run.page_counts[index], run.page_offsets[index])
 
     def __contains__(self, segment_id: object) -> bool:
-        return self._find(segment_id) >= 0
+        return self._find(segment_id) is not None
+
+    def _live_ids(self) -> array:
+        # Only iterating needs the runs merged, so they are merged when it does
+        if self._ids is None:
+            live: set[int] = set()
+            decided: set[int] = set()
+            for run in self._runs:
+                live.update(set(run.ids).difference(decided))
+                decided.update(run.ids)
+                decided.update(run.deleted)
+            self._ids = array("Q", sorted(live))
+        return self._ids
 
     def __iter__(self) -> Iterator[int]:
-        return iter(self._ids)
+        return iter(self._live_ids())
 
     def __len__(self) -> int:
-        return len(self._ids)
+        return len(self._live_ids())
 
 
 class _SegmentRun(NamedTuple):
-    """One run of the segment_map, decoded: its live records as arrays, its tombstones apart."""
+    """One run of the segment_map, decoded: its live records as arrays, its tombstones apart, in segment id order."""
 
     ids: array
     page_counts: array
     page_offsets: array
-    deleted: list[int]
-
-    def id_range(self) -> tuple[int, int]:
-        """The lowest and highest segment id the run mentions, for runs whose ids are sorted."""
-        mentioned = [*self.ids[:1], *self.ids[-1:], *self.deleted]
-        return min(mentioned), max(mentioned)
+    deleted: array
 
 
-def _decode_segment_run(records: Iterable[Record]) -> _SegmentRun:
-    run = _SegmentRun(array("Q"), array("L"), array("L"), [])
-    for alive, fields in records:
-        if alive:
-            segment_id, page_count, page_offset = fields
-            run.ids.append(segment_id)
-            run.page_counts.append(int.from_bytes(page_count, "little"))
-            run.page_offsets.append(page_offset)
+def _decode_segment_run(items: Iterable[bytes | Record], record: struct.Struct) -> _SegmentRun:
+    """One segment_map run from the items of :func:`_run_items`, unpacked with ``record``.
+
+    ``record`` reads the page_count as a big-endian int, like :data:`_SEGMENT_MAP_COLUMNS`.
+    """
+    ids, page_counts, page_offsets, deleted = array("Q"), array("I"), array("I"), array("Q")
+    for item in items:
+        if type(item) is bytes:
+            for column, values in zip(
+                (ids, page_counts, page_offsets), zip(*record.iter_unpack(item), strict=True), strict=True
+            ):
+                column.extend(values)
         else:
-            run.deleted.append(fields[0])
-    return run
+            alive, fields = item
+            if alive:
+                ids.append(fields[0])
+                page_counts.append(fields[1])
+                page_offsets.append(fields[2])
+            else:
+                deleted.append(fields[0])
+    # The page_count is the record's one little-endian field
+    page_counts.byteswap()
+    if not all(map(lt, ids, islice(ids, 1, None))):
+        # Out of id order, as in a damaged tree: the lookups bisect
+        order = sorted(range(len(ids)), key=ids.__getitem__)
+        ids, page_counts, page_offsets = (
+            array(column.typecode, map(column.__getitem__, order)) for column in (ids, page_counts, page_offsets)
+        )
+    return _SegmentRun(ids, page_counts, page_offsets, array("Q", sorted(deleted)))
 
 
 def load_segment_index(store: PageStore, header: ArchiveHeader) -> SegmentIndex:
     """Walk the segment_map tree of ``header`` and index it by segment id.
 
-    The runs of the tree (the mem-tree, then the ctrees, newest first) are merged with LSM
-    keep-first semantics: the newest record for a segment id wins, and a tombstone masks
-    it. Segment ids are handed out in increasing order, so each run normally covers an id
-    range of its own, and real archives have two to four runs. Then no record can shadow
-    another, and the runs only need putting in id order.
+    The runs of the tree (the mem-tree, then the ctrees, newest first) keep LSM keep-first
+    semantics: the newest record for a segment id wins, and a tombstone masks it. See
+    :class:`SegmentIndex`.
     """
     sb = header.tree(TLV_SEGMENT_MAP)
     runs: list[_SegmentRun] = []
     if sb is not None and sb.value_length >= SEGMENT_MAP_VALUE_SIZE:
         # Only the leading fields of the value are known; a longer value just pads further
-        record = struct.Struct(f"{_SEGMENT_MAP_RECORD.format}{sb.value_length - SEGMENT_MAP_VALUE_SIZE}x")
-        runs = [_decode_segment_run(records) for records in _record_runs(store, sb, _SEGMENT_MAP_KEY, record)]
-
-    ids = array("Q")
-    page_counts = array("L")
-    page_offsets = array("L")
-    nonempty = [run for run in runs if run.ids or run.deleted]
-    if all(left < right for run in nonempty for left, right in pairwise(run.ids)):
-        nonempty.sort(key=_SegmentRun.id_range)
-        bounds = [run.id_range() for run in nonempty]
-        if all(left[1] < right[0] for left, right in pairwise(bounds)):
-            for run in nonempty:
-                ids.extend(run.ids)
-                page_counts.extend(run.page_counts)
-                page_offsets.extend(run.page_offsets)
-            return SegmentIndex(ids, page_counts, page_offsets)
-
-    # Runs that share segment ids: the first record seen for an id, newest run first, wins.
-    # Ids are unique within a run, so only those of the runs before the last need remembering.
-    seen: set[int] = set()
-    for number, run in enumerate(runs):
-        for segment_id, page_count, page_offset in zip(run.ids, run.page_counts, run.page_offsets, strict=True):
-            if segment_id not in seen:
-                ids.append(segment_id)
-                page_counts.append(page_count)
-                page_offsets.append(page_offset)
-        if number < len(runs) - 1:
-            seen.update(run.ids)
-            seen.update(run.deleted)
-    order = sorted(range(len(ids)), key=ids.__getitem__)
-    return SegmentIndex(
-        array("Q", (ids[index] for index in order)),
-        array("L", (page_counts[index] for index in order)),
-        array("L", (page_offsets[index] for index in order)),
-    )
+        record = struct.Struct(f"{_SEGMENT_MAP_COLUMNS.format}{sb.value_length - SEGMENT_MAP_VALUE_SIZE}x")
+        runs = [_decode_segment_run(items, record) for items in _run_items(store, sb, _SEGMENT_MAP_KEY, record)]
+    return SegmentIndex([run for run in runs if run.ids or run.deleted])
