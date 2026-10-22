@@ -229,6 +229,53 @@ def test_segment_index_merges_runs() -> None:
         index[250]
 
 
+def test_segment_index_sorts_a_run_out_of_order() -> None:
+    # A run out of id order, as in a damaged tree, must not break the lookups by bisection
+    cells = [Cell(segment_map_key(segment_id), segment_map_value(1, segment_id)) for segment_id in (300, 100, 200)]
+    leaf = lsm_page(0x03, b"LEAF", cells, key_length=8, compact=True)
+    tibx = _open(arch_header_page({2: lsb(8, 32, ctrees=[(PAGE, len(cells))])}) + leaf)
+
+    index = load_segment_index(tibx.store, tibx.header)
+    assert list(index) == [100, 200, 300]
+    assert index[200].page_offset == 200
+
+
+@pytest.mark.parametrize("overlapping", [True, False], ids=["overlapping", "disjoint"])
+@pytest.mark.parametrize("seed", range(10))
+def test_segment_index_matches_keep_first_reference(seed: int, overlapping: bool) -> None:
+    # The mem-tree and two ctrees, newest first. Written as ids are handed out, each run holds
+    # an id range of its own; runs that share ids (rewrites, tombstones) must merge keep-first
+    rng = random.Random(seed)
+    runs = []
+    locations = {}
+    for number in range(3):
+        low = 0 if overlapping else (2 - number) * 1000
+        segment_ids = sorted(rng.sample(range(low, low + (60 if overlapping else 1000)), rng.randrange(1, 30)))
+        cells = []
+        for segment_id in segment_ids:
+            if rng.random() < 0.2:
+                cells.append(Cell(segment_map_key(segment_id), b"", alive=False))
+            else:
+                location = (rng.randrange(1, 9), rng.randrange(1, 1 << 20))
+                locations[number, segment_id] = location
+                cells.append(Cell(segment_map_key(segment_id), segment_map_value(*location)))
+        runs.append(cells)
+    sm_sb = lsb(8, 32, memtree_cells=runs[0], ctrees=[(PAGE, len(runs[1])), (2 * PAGE, len(runs[2]))])
+    leaves = b"".join(lsm_page(0x03, b"LEAF", cells, key_length=8, compact=True) for cells in runs[1:])
+    tibx = _open(arch_header_page({2: sm_sb}) + leaves)
+
+    expected = {}
+    for number, cells in enumerate(runs):
+        for cell in cells:
+            segment_id = int.from_bytes(cell.key, "big")
+            expected.setdefault(segment_id, locations.get((number, segment_id)))
+    expected = {segment_id: location for segment_id, location in sorted(expected.items()) if location is not None}
+
+    index = load_segment_index(tibx.store, tibx.header)
+    assert list(index) == list(expected)
+    assert [(locator.page_count, locator.page_offset) for locator in index.values()] == list(expected.values())
+
+
 def test_resolve_extents_empty() -> None:
     assert resolve_extents([]) == ([], [], [])
 

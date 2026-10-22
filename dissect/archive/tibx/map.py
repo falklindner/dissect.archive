@@ -19,6 +19,7 @@ import struct
 from array import array
 from bisect import bisect_left
 from collections.abc import Mapping
+from itertools import pairwise
 from typing import TYPE_CHECKING, NamedTuple
 
 from dissect.archive.tibx.c_tibx import (
@@ -238,33 +239,78 @@ class SegmentIndex(Mapping[int, SegmentLocator]):
         return len(self._ids)
 
 
+class _SegmentRun(NamedTuple):
+    """One run of the segment_map, decoded: its live records as arrays, its tombstones apart."""
+
+    ids: array
+    page_counts: array
+    page_offsets: array
+    deleted: list[int]
+
+    def id_range(self) -> tuple[int, int]:
+        """The lowest and highest segment id the run mentions, for runs whose ids are sorted."""
+        mentioned = [*self.ids[:1], *self.ids[-1:], *self.deleted]
+        return min(mentioned), max(mentioned)
+
+
+def _decode_segment_run(records: Iterable[Record]) -> _SegmentRun:
+    run = _SegmentRun(array("Q"), array("L"), array("L"), [])
+    for alive, fields in records:
+        if alive:
+            segment_id, page_count, page_offset = fields
+            run.ids.append(segment_id)
+            run.page_counts.append(int.from_bytes(page_count, "little"))
+            run.page_offsets.append(page_offset)
+        else:
+            run.deleted.append(fields[0])
+    return run
+
+
 def load_segment_index(store: PageStore, header: ArchiveHeader) -> SegmentIndex:
     """Walk the segment_map tree of ``header`` and index it by segment id.
 
-    The mem-tree is yielded before the ctrees, so keep-first implements LSM merge
-    semantics (the newest record for a segment id wins, and a tombstone masks it).
+    The runs of the tree (the mem-tree, then the ctrees, newest first) are merged with LSM
+    keep-first semantics: the newest record for a segment id wins, and a tombstone masks
+    it. Segment ids are handed out in increasing order, so each run normally covers an id
+    range of its own, and real archives have two to four runs. Then no record can shadow
+    another, and the runs only need putting in id order.
     """
-    ids = array("Q")
-    counts = array("L")
-    offsets = array("L")
     sb = header.tree(TLV_SEGMENT_MAP)
-    runs = []
+    runs: list[_SegmentRun] = []
     if sb is not None and sb.value_length >= SEGMENT_MAP_VALUE_SIZE:
         # Only the leading fields of the value are known; a longer value just pads further
         record = struct.Struct(f"{_SEGMENT_MAP_RECORD.format}{sb.value_length - SEGMENT_MAP_VALUE_SIZE}x")
-        runs = _record_runs(store, sb, _SEGMENT_MAP_KEY, record)
-    ordered = True
-    for alive, fields in _keep_first(runs, 1):
-        if alive:
-            segment_id, page_count, page_offset = fields
-            ordered = ordered and (not ids or ids[-1] < segment_id)
-            ids.append(segment_id)
-            counts.append(int.from_bytes(page_count, "little"))
-            offsets.append(page_offset)
-    if not ordered:
-        # Only merged runs come out of order, and keep-first already dropped duplicates
-        order = sorted(range(len(ids)), key=ids.__getitem__)
-        ids = array("Q", (ids[index] for index in order))
-        counts = array("L", (counts[index] for index in order))
-        offsets = array("L", (offsets[index] for index in order))
-    return SegmentIndex(ids, counts, offsets)
+        runs = [_decode_segment_run(records) for records in _record_runs(store, sb, _SEGMENT_MAP_KEY, record)]
+
+    ids = array("Q")
+    page_counts = array("L")
+    page_offsets = array("L")
+    nonempty = [run for run in runs if run.ids or run.deleted]
+    if all(left < right for run in nonempty for left, right in pairwise(run.ids)):
+        nonempty.sort(key=_SegmentRun.id_range)
+        bounds = [run.id_range() for run in nonempty]
+        if all(left[1] < right[0] for left, right in pairwise(bounds)):
+            for run in nonempty:
+                ids.extend(run.ids)
+                page_counts.extend(run.page_counts)
+                page_offsets.extend(run.page_offsets)
+            return SegmentIndex(ids, page_counts, page_offsets)
+
+    # Runs that share segment ids: the first record seen for an id, newest run first, wins.
+    # Ids are unique within a run, so only those of the runs before the last need remembering.
+    seen: set[int] = set()
+    for number, run in enumerate(runs):
+        for segment_id, page_count, page_offset in zip(run.ids, run.page_counts, run.page_offsets, strict=True):
+            if segment_id not in seen:
+                ids.append(segment_id)
+                page_counts.append(page_count)
+                page_offsets.append(page_offset)
+        if number < len(runs) - 1:
+            seen.update(run.ids)
+            seen.update(run.deleted)
+    order = sorted(range(len(ids)), key=ids.__getitem__)
+    return SegmentIndex(
+        array("Q", (ids[index] for index in order)),
+        array("L", (page_counts[index] for index in order)),
+        array("L", (page_offsets[index] for index in order)),
+    )
