@@ -71,8 +71,6 @@ MIN_VOLUME_SIZE = 1 << 20
 # Partitions are imaged in whole sectors of at least this size
 SECTOR_SIZE = 512
 
-Interval = tuple[int, int, "Extent"]
-
 
 class RecoveryPoint:
     """One backup in the archive: a *slice*, in the format's own terms.
@@ -452,7 +450,8 @@ class TibxVolume:
         self.tibx = tibx
         self.volume_id = volume_id
         self.extents = extents
-        self._starts, self._intervals = resolve_extents(extents)
+        # Interval i runs from _starts[i] up to _stops[i] and reads from extent _covering[i]
+        self._starts, self._stops, self._covering = resolve_extents(extents)
         self._span = max((extent.source_offset + extent.extent_length for extent in extents), default=0)
         self._size: int | None = None
 
@@ -493,11 +492,12 @@ class TibxVolume:
         parts: list[bytes | memoryview] = []
         cursor = offset
         end = offset + length
-        index = bisect_right(self._starts, offset) - 1
-        if index < 0 or self._intervals[index][1] <= offset:
+        starts, stops, covering = self._starts, self._stops, self._covering
+        index = bisect_right(starts, offset) - 1
+        if index < 0 or stops[index] <= offset:
             index += 1
-        while index < len(self._intervals) and self._intervals[index][0] < end:
-            start, stop, extent = self._intervals[index]
+        while index < len(starts) and starts[index] < end:
+            start, stop, extent = starts[index], stops[index], covering[index]
             index += 1
             if extent.segment_id == 0:
                 # Discard marker: a newer slice recorded this range as unallocated
@@ -520,7 +520,7 @@ class TibxVolume:
         return b"".join(parts)
 
 
-def resolve_extents(extents: list[Extent]) -> tuple[list[int], list[Interval]]:
+def resolve_extents(extents: list[Extent]) -> tuple[list[int], list[int], list[Extent]]:
     """Flatten possibly-overlapping extents into a recency-resolved interval list.
 
     The covering extent of every byte is the one with the highest ``(slice_id, extent_id,
@@ -535,8 +535,11 @@ def resolve_extents(extents: list[Extent]) -> tuple[list[int], list[Interval]]:
     in a heap, most recent on top: an interval runs until that extent ends or the next one
     starts.
 
-    Returns ``(starts, intervals)``: a sorted non-overlapping list of
-    ``(start, end, extent)`` plus the parallel list of starts for bisect.
+    Returns ``(starts, stops, covering)``: non-overlapping intervals in offset order as
+    parallel lists, interval ``i`` running from ``starts[i]`` up to ``stops[i]`` and read
+    from extent ``covering[i]``. Parallel lists rather than a tuple per interval, because
+    for a full backup they are the sorted lists already at hand: a tuple each made a
+    million more objects for the cyclic GC to traverse on a large archive.
     """
     # An empty extent covers nothing
     ordered = sorted(
@@ -545,11 +548,13 @@ def resolve_extents(extents: list[Extent]) -> tuple[list[int], list[Interval]]:
     starts = [extent.source_offset for extent in ordered]
     ends = [extent.source_offset + extent.extent_length for extent in ordered]
     if all(end <= start for end, start in zip(ends, starts[1:], strict=False)):
-        return starts, list(zip(starts, ends, ordered, strict=True))
+        return starts, ends, ordered
 
     count = len(ordered)
     covering: list[tuple[int, int, int, int]] = []  # (-slice_id, -extent_id, -segment_id, index)
-    intervals: list[Interval] = []
+    interval_starts: list[int] = []
+    interval_stops: list[int] = []
+    interval_covering: list[Extent] = []
     index = position = 0
     while index < count or covering:
         if not covering:
@@ -566,13 +571,15 @@ def resolve_extents(extents: list[Extent]) -> tuple[list[int], list[Interval]]:
         stop = ends[covering[0][3]]
         if index < count and starts[index] < stop:
             stop = starts[index]
-        if intervals and intervals[-1][2] is winner and intervals[-1][1] == position:
+        if interval_covering and interval_covering[-1] is winner and interval_stops[-1] == position:
             # Still the same extent: only a less recent one started underneath it
-            intervals[-1] = (intervals[-1][0], stop, winner)
+            interval_stops[-1] = stop
         else:
-            intervals.append((position, stop, winner))
+            interval_starts.append(position)
+            interval_stops.append(stop)
+            interval_covering.append(winner)
         position = stop
-    return [interval[0] for interval in intervals], intervals
+    return interval_starts, interval_stops, interval_covering
 
 
 def find_split_parts(path: Path) -> list[Path]:

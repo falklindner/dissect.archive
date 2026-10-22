@@ -230,7 +230,7 @@ def test_segment_index_merges_runs() -> None:
 
 
 def test_resolve_extents_empty() -> None:
-    assert resolve_extents([]) == ([], [])
+    assert resolve_extents([]) == ([], [], [])
 
 
 def _resolve_by_boundary(extents: list[Extent]) -> list[tuple[int, int, Extent]]:
@@ -265,9 +265,24 @@ def test_resolve_extents_matches_reference(seed: int, overlapping: bool) -> None
             offset += length + rng.randrange(0, 3) * 0x1000
     rng.shuffle(extents)
 
-    starts, intervals = resolve_extents(extents)
-    assert intervals == _resolve_by_boundary(extents)
-    assert starts == [interval[0] for interval in intervals]
+    starts, stops, covering = resolve_extents(extents)
+    assert list(zip(starts, stops, covering, strict=True)) == _resolve_by_boundary(extents)
+
+
+def test_resolve_extents_full_backup_creates_no_object_per_interval() -> None:
+    # Extents that do not overlap are their own intervals: the result reuses them rather than
+    # wrapping each in a new tuple for the GC to traverse
+    extents = [Extent(10, index * 0x1000, 0x1000, 1, index, index + 100, 0xFFFF) for index in range(1000)]
+    shuffled = extents[::-1]
+    gc.collect()
+    tracked = len(gc.get_objects())
+
+    starts, stops, covering = resolve_extents(shuffled)
+
+    assert len(gc.get_objects()) - tracked < 10
+    assert all(found is extent for found, extent in zip(covering, extents, strict=True))
+    assert starts == [extent.source_offset for extent in extents]
+    assert stops == [extent.end_offset for extent in extents]
 
 
 def test_multi_extent_shared_segment() -> None:
