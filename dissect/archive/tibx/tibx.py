@@ -15,8 +15,11 @@ import datetime
 import heapq
 import re
 import uuid
+from array import array
 from bisect import bisect_right
 from collections import OrderedDict, defaultdict
+from itertools import compress, islice, repeat
+from operator import add, itemgetter, le, ne
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO
 
@@ -51,7 +54,7 @@ from dissect.archive.tibx.stream import TibxVolumeStream
 if TYPE_CHECKING:
     from typing_extensions import Self
 
-    from dissect.archive.tibx.map import Extent
+    from dissect.archive.tibx.map import Extent, ExtentTable
 
 # Decompressed segments are cached per archive under a memory budget rather than a fixed
 # count: random-access workloads (MFT, registry hives) touch thousands of distinct
@@ -133,7 +136,7 @@ class TIBX:
 
     def _reset_snapshot_caches(self) -> None:
         # Everything derived from the currently-selected commit root (not the data key)
-        self._extents: list[Extent] | None = None
+        self._extents: ExtentTable | None = None
         self._segment_index = None
         self._segment_cache: OrderedDict[int, bytes] = OrderedDict()
         self._segment_cache_bytes = 0
@@ -315,12 +318,12 @@ class TIBX:
         return []
 
     @property
-    def extents(self) -> list[Extent]:
+    def extents(self) -> ExtentTable:
         """The data_map extents in view: all of them, or those up to the selected slice."""
         if self._extents is None:
             extents = load_extents(self.store, self.header)
             if self._slice_limit is not None:
-                extents = [extent for extent in extents if extent.slice_id <= self._slice_limit]
+                extents = extents.select(map(le, extents.slice_ids, repeat(self._slice_limit)))
             self._extents = extents
         return self._extents
 
@@ -337,13 +340,9 @@ class TIBX:
         internals without having to reach into the data_map.
         """
         if self._streams is None:
-            by_volume: dict[int, list[Extent]] = defaultdict(list)
-            for extent in self.extents:
-                by_volume[extent.volume_id].append(extent)
-            streams = [TibxVolume(self, vid, extents) for vid, extents in by_volume.items()]
-            streams.sort(
-                key=lambda stream: (max(extent.slice_id for extent in stream.extents), stream.span), reverse=True
-            )
+            extents = self.extents
+            streams = [TibxVolume(self, vid, extents, start, stop) for vid, start, stop in extents.volume_ranges()]
+            streams.sort(key=lambda stream: (stream._newest_slice, stream.span), reverse=True)
             self._streams = streams
         return self._streams
 
@@ -402,22 +401,26 @@ class TIBX:
         bytes (empirical rule, exact fit on every observed multi-extent segment --
         including sparse index sequences).
         """
-        if extent.extent_index == EXTENT_INDEX_WHOLE_SEGMENT:
+        return self._extent_base(extent.segment_id, extent.extent_index)
+
+    def _extent_base(self, segment_id: int, extent_index: int) -> int:
+        if extent_index == EXTENT_INDEX_WHOLE_SEGMENT:
             return 0
         if self._segment_layout is None:
             layout: dict[tuple[int, int], int] = {}
-            shared: dict[int, list[Extent]] = defaultdict(list)
-            for entry in self.extents:
-                if entry.extent_index != EXTENT_INDEX_WHOLE_SEGMENT:
-                    shared[entry.segment_id].append(entry)
-            for segment_id, entries in shared.items():
+            shared: dict[int, list[tuple[int, int]]] = defaultdict(list)
+            extents = self.extents
+            indexes = extents.extent_indexes
+            for row in compress(range(len(indexes)), map(ne, indexes, repeat(EXTENT_INDEX_WHOLE_SEGMENT))):
+                shared[extents.segment_ids[row]].append((indexes[row], extents.extent_lengths[row]))
+            for shared_segment, entries in shared.items():
                 offset = 0
-                for entry in sorted(entries, key=lambda item: item.extent_index):
-                    layout[(segment_id, entry.extent_index)] = offset
-                    offset += entry.extent_length
+                for index, length in sorted(entries, key=itemgetter(0)):
+                    layout[(shared_segment, index)] = offset
+                    offset += length
                     offset = (offset + EXTENT_ALIGNMENT - 1) & ~(EXTENT_ALIGNMENT - 1)
             self._segment_layout = layout
-        return self._segment_layout.get((extent.segment_id, extent.extent_index), 0)
+        return self._segment_layout.get((segment_id, extent_index), 0)
 
     def read_segment(self, segment_id: int) -> bytes:
         """Return the (cached) decompressed plaintext of segment ``segment_id``."""
@@ -444,19 +447,31 @@ class TIBX:
 
 
 class TibxVolume:
-    """One backed-up volume (a data_map volume stream) inside a TIBX archive."""
+    """One backed-up volume (a data_map volume stream) inside a TIBX archive.
 
-    def __init__(self, tibx: TIBX, volume_id: int, extents: list[Extent]):
+    Its extents are the rows ``start`` up to ``stop`` of the archive's extent table.
+    """
+
+    def __init__(self, tibx: TIBX, volume_id: int, table: ExtentTable, start: int = 0, stop: int | None = None):
         self.tibx = tibx
         self.volume_id = volume_id
-        self.extents = extents
-        # Interval i runs from _starts[i] up to _stops[i] and reads from extent _covering[i]
-        self._starts, self._stops, self._covering = resolve_extents(extents)
-        self._span = max((extent.source_offset + extent.extent_length for extent in extents), default=0)
+        self._table = table
+        self._first = start
+        self._last = len(table) if stop is None else stop
+        # Interval i runs from _starts[i] up to _stops[i] and reads from row _first + _covering[i]
+        self._starts, self._stops, self._covering = resolve_extents(table, self._first, self._last)
+        lengths = table.extent_lengths[self._first : self._last]
+        self._span = max(map(add, table.source_offsets[self._first : self._last], lengths), default=0)
+        self._newest_slice = max(table.slice_ids[self._first : self._last], default=0)
         self._size: int | None = None
 
     def __repr__(self) -> str:
         return f"<TibxVolume volume_id={self.volume_id:#x} size={self.size}>"
+
+    @property
+    def extents(self) -> ExtentTable:
+        """The data_map extents of this volume, in offset order."""
+        return self._table[self._first : self._last]
 
     @property
     def span(self) -> int:
@@ -493,13 +508,15 @@ class TibxVolume:
         cursor = offset
         end = offset + length
         starts, stops, covering = self._starts, self._stops, self._covering
+        table, first = self._table, self._first
         index = bisect_right(starts, offset) - 1
         if index < 0 or stops[index] <= offset:
             index += 1
         while index < len(starts) and starts[index] < end:
-            start, stop, extent = starts[index], stops[index], covering[index]
+            start, stop, row = starts[index], stops[index], first + covering[index]
             index += 1
-            if extent.segment_id == 0:
+            segment_id = table.segment_ids[row]
+            if segment_id == 0:
                 # Discard marker: a newer slice recorded this range as unallocated
                 # (e.g. a file deleted between incrementals) -- it reads as zeros
                 # and must keep masking the older data underneath
@@ -507,8 +524,9 @@ class TibxVolume:
             begin, finish = max(start, offset), min(stop, end)
             if begin > cursor:
                 parts.append(bytes(begin - cursor))  # a sparse hole or a discarded range
-            segment = self.tibx.read_segment(extent.segment_id)
-            segment_offset = self.tibx.extent_base(extent) + (begin - extent.source_offset)
+            segment = self.tibx.read_segment(segment_id)
+            segment_offset = self.tibx._extent_base(segment_id, table.extent_indexes[row])
+            segment_offset += begin - table.source_offsets[row]
             chunk = memoryview(segment)[segment_offset : segment_offset + (finish - begin)]
             parts.append(chunk)
             if len(chunk) < finish - begin:
@@ -520,15 +538,16 @@ class TibxVolume:
         return b"".join(parts)
 
 
-def resolve_extents(extents: list[Extent]) -> tuple[list[int], list[int], list[Extent]]:
+def resolve_extents(extents: ExtentTable, start: int = 0, stop: int | None = None) -> tuple[array, array, array]:
     """Flatten possibly-overlapping extents into a recency-resolved interval list.
 
-    The covering extent of every byte is the one with the highest ``(slice_id, extent_id,
-    segment_id)`` -- the slice id (the backup in the chain that wrote the extent) is the
-    primary recency signal, because a differential backup can reuse or even lower extent
-    and segment ids of the base it supersedes. Resolving per byte rather than per start
-    offset matters: a newer *shorter* extent must not mask the tail of an older *longer*
-    one at the same offset.
+    Resolves the rows ``start`` up to ``stop`` of ``extents``, one volume's, which are in
+    offset order like the data_map. The covering extent of every byte is the one with the
+    highest ``(slice_id, extent_id, segment_id)`` -- the slice id (the backup in the chain
+    that wrote the extent) is the primary recency signal, because a differential backup can
+    reuse or even lower extent and segment ids of the base it supersedes. Resolving per
+    byte rather than per start offset matters: a newer *shorter* extent must not mask the
+    tail of an older *longer* one at the same offset.
 
     Extents that do not overlap at all, as in a full backup, are each an interval of their
     own. Otherwise a sweep in offset order keeps the extents that cover the current offset
@@ -536,49 +555,58 @@ def resolve_extents(extents: list[Extent]) -> tuple[list[int], list[int], list[E
     starts.
 
     Returns ``(starts, stops, covering)``: non-overlapping intervals in offset order as
-    parallel lists, interval ``i`` running from ``starts[i]`` up to ``stops[i]`` and read
-    from extent ``covering[i]``. Parallel lists rather than a tuple per interval, because
-    for a full backup they are the sorted lists already at hand: a tuple each made a
-    million more objects for the cyclic GC to traverse on a large archive.
+    arrays, interval ``i`` running from ``starts[i]`` up to ``stops[i]`` and read from row
+    ``start + covering[i]`` of ``extents``.
     """
-    # An empty extent covers nothing
-    ordered = sorted(
-        (extent for extent in extents if extent.extent_length > 0), key=lambda extent: extent.source_offset
-    )
-    starts = [extent.source_offset for extent in ordered]
-    ends = [extent.source_offset + extent.extent_length for extent in ordered]
-    if all(end <= start for end, start in zip(ends, starts[1:], strict=False)):
-        return starts, ends, ordered
+    stop = len(extents) if stop is None else stop
+    offsets = extents.source_offsets[start:stop]
+    lengths = extents.extent_lengths[start:stop]
+    if 0 in lengths:
+        # An empty extent covers nothing
+        keep = list(map(bool, lengths))
+        rows = array("I", compress(range(len(lengths)), keep))
+        offsets = array("Q", compress(offsets, keep))
+        lengths = array("Q", compress(lengths, keep))
+    else:
+        rows = array("I", range(len(lengths)))
+    ends = array("Q", map(add, offsets, lengths))
+    if all(map(le, ends, islice(offsets, 1, None))):
+        return offsets, ends, rows
 
-    count = len(ordered)
+    slice_ids, extent_ids, segment_ids = (
+        column[start:stop] for column in (extents.slice_ids, extents.extent_ids, extents.segment_ids)
+    )
+    count = len(rows)
     covering: list[tuple[int, int, int, int]] = []  # (-slice_id, -extent_id, -segment_id, index)
-    interval_starts: list[int] = []
-    interval_stops: list[int] = []
-    interval_covering: list[Extent] = []
+    interval_starts = array("Q")
+    interval_stops = array("Q")
+    interval_covering = array("I")
     index = position = 0
+    previous = -1
     while index < count or covering:
         if not covering:
-            position = starts[index]  # skip the hole up to the next extent
-        while index < count and starts[index] <= position:
-            extent = ordered[index]
-            heapq.heappush(covering, (-extent.slice_id, -extent.extent_id, -extent.segment_id, index))
+            position = offsets[index]  # skip the hole up to the next extent
+        while index < count and offsets[index] <= position:
+            row = rows[index]
+            heapq.heappush(covering, (-slice_ids[row], -extent_ids[row], -segment_ids[row], index))
             index += 1
         while covering and ends[covering[0][3]] <= position:
             heapq.heappop(covering)
         if not covering:
             continue
-        winner = ordered[covering[0][3]]
-        stop = ends[covering[0][3]]
-        if index < count and starts[index] < stop:
-            stop = starts[index]
-        if interval_covering and interval_covering[-1] is winner and interval_stops[-1] == position:
+        winner = covering[0][3]
+        until = ends[winner]
+        if index < count and offsets[index] < until:
+            until = offsets[index]
+        if previous == winner and interval_stops[-1] == position:
             # Still the same extent: only a less recent one started underneath it
-            interval_stops[-1] = stop
+            interval_stops[-1] = until
         else:
             interval_starts.append(position)
-            interval_stops.append(stop)
-            interval_covering.append(winner)
-        position = stop
+            interval_stops.append(until)
+            interval_covering.append(rows[winner])
+            previous = winner
+        position = until
     return interval_starts, interval_stops, interval_covering
 
 

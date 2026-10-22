@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from dissect.archive.tibx.map import Extent, load_extents, load_segment_index
+from dissect.archive.tibx.map import Extent, ExtentTable, load_extents, load_segment_index
 from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX, resolve_extents
 from tests._synth import (
     PAGE,
@@ -202,6 +202,86 @@ def test_record_layouts_match_c_tibx() -> None:
     assert locator == (42, 0x01020304, c_tibx.segment_map_value(raw).page_offset)
 
 
+def test_extent_table() -> None:
+    extents = [
+        Extent(11, 0x2000, 0x1000, 2, 3, 103, 0xFFFF),
+        Extent(10, 0x1000, 0x1000, 1, 2, 102, 0xFFFF),
+        Extent(10, 0x0000, 0x1000, 1, 1, 101, 0xFFFF),
+    ]
+    table = ExtentTable.from_extents(extents)
+
+    assert len(table) == 3
+    assert list(table) == sorted(extents)
+    assert table[0] == extents[2]
+    assert table[-1] == extents[0]
+    assert list(table[1:]) == [extents[1], extents[0]]
+    assert list(table.volume_ranges()) == [(10, 0, 2), (11, 2, 3)]
+    assert list(table.select([True, False, True])) == [extents[2], extents[0]]
+    assert len(ExtentTable()) == 0
+    assert list(ExtentTable().volume_ranges()) == []
+
+    # Columns, not an object per extent for the GC to traverse
+    many = [Extent(10, index * 0x1000, 0x1000, 1, index, index + 100, 0xFFFF) for index in range(1000)]
+    gc.collect()
+    tracked = len(gc.get_objects())
+    table = ExtentTable.from_extents(many)
+    gc.collect()
+    assert len(gc.get_objects()) - tracked < 10
+    assert list(table) == many
+
+
+@pytest.mark.parametrize("mode", ["own-keys", "shared-keys", "tombstones"])
+@pytest.mark.parametrize("seed", range(10))
+def test_load_extents_matches_keep_first_reference(seed: int, mode: str) -> None:
+    # The mem-tree and two ctrees, newest first, their keys interleaving in offset order as in
+    # real archives. Runs that share keys (rewrites, tombstones) must merge keep-first
+    rng = random.Random(seed)
+    runs = []
+    records = {}
+    for number in range(3):
+        cells = []
+        for _ in range(rng.randrange(1, 30)):
+            volume_id = rng.choice((10, 11))
+            offset = rng.randrange(0, 24) * 0x1000
+            # Own keys: each run another slice, so runs only share volume offsets, not keys
+            key = (volume_id, offset, 0x1000, number + 1 if mode == "own-keys" else 1, 1)
+            if any(key == cell_key for cell_key, _ in cells):
+                continue
+            if mode == "tombstones" and rng.random() < 0.2:
+                cells.append((key, None))
+            else:
+                cells.append((key, rng.randrange(1, 1000)))
+        cells.sort()
+        runs.append(cells)
+        for key, segment_id in cells:
+            records.setdefault(key, segment_id)
+
+    def to_cells(cells: list) -> list[Cell]:
+        return [
+            Cell(
+                data_map_key(*key),
+                b"" if segment_id is None else data_map_value(segment_id),
+                alive=segment_id is not None,
+            )
+            for key, segment_id in cells
+        ]
+
+    dm_sb = lsb(31, 10, memtree_cells=to_cells(runs[0]), ctrees=[(PAGE, len(runs[1])), (2 * PAGE, len(runs[2]))])
+    leaves = b"".join(lsm_page(0x03, b"LEAF", to_cells(cells), key_length=31, compact=True) for cells in runs[1:])
+    tibx = _open(arch_header_page({1: dm_sb}) + leaves)
+
+    expected = [
+        Extent(volume_id, offset, length, slice_id, extent_id, segment_id, 0xFFFF)
+        for (volume_id, offset, length, slice_id, extent_id), segment_id in sorted(records.items())
+        if segment_id is not None
+    ]
+    loaded = load_extents(tibx.store, tibx.header)
+    assert sorted(loaded) == expected
+    assert [(extent.volume_id, extent.source_offset) for extent in loaded] == sorted(
+        (extent.volume_id, extent.source_offset) for extent in expected
+    )
+
+
 def test_segment_index_merges_runs() -> None:
     # A newer run (the mem-tree) holding a higher segment id than the older ctree comes
     # out of the tree walk unsorted; the index must still look every id up
@@ -277,7 +357,7 @@ def test_segment_index_matches_keep_first_reference(seed: int, overlapping: bool
 
 
 def test_resolve_extents_empty() -> None:
-    assert resolve_extents([]) == ([], [], [])
+    assert tuple(map(list, resolve_extents(ExtentTable()))) == ([], [], [])
 
 
 def _resolve_by_boundary(extents: list[Extent]) -> list[tuple[int, int, Extent]]:
@@ -311,25 +391,30 @@ def test_resolve_extents_matches_reference(seed: int, overlapping: bool) -> None
         if not overlapping:
             offset += length + rng.randrange(0, 3) * 0x1000
     rng.shuffle(extents)
+    # Another volume's extents around them: only the rows given are resolved
+    table = ExtentTable.from_extents(
+        [*extents, Extent(9, 0, 0x1000, 9, 1, 1, 0xFFFF), Extent(11, 0, 0x1000, 9, 1, 1, 0xFFFF)]
+    )
 
-    starts, stops, covering = resolve_extents(extents)
-    assert list(zip(starts, stops, covering, strict=True)) == _resolve_by_boundary(extents)
+    starts, stops, covering = resolve_extents(table, 1, len(table) - 1)
+    resolved = [(start, stop, table[1 + row]) for start, stop, row in zip(starts, stops, covering, strict=True)]
+    assert resolved == _resolve_by_boundary(extents)
 
 
 def test_resolve_extents_full_backup_creates_no_object_per_interval() -> None:
-    # Extents that do not overlap are their own intervals: the result reuses them rather than
-    # wrapping each in a new tuple for the GC to traverse
+    # Extents that do not overlap are their own intervals: plain arrays, no object per interval
+    # for the GC to traverse
     extents = [Extent(10, index * 0x1000, 0x1000, 1, index, index + 100, 0xFFFF) for index in range(1000)]
-    shuffled = extents[::-1]
+    table = ExtentTable.from_extents(extents[::-1])
     gc.collect()
     tracked = len(gc.get_objects())
 
-    starts, stops, covering = resolve_extents(shuffled)
+    starts, stops, covering = resolve_extents(table)
 
     assert len(gc.get_objects()) - tracked < 10
-    assert all(found is extent for found, extent in zip(covering, extents, strict=True))
-    assert starts == [extent.source_offset for extent in extents]
-    assert stops == [extent.end_offset for extent in extents]
+    assert list(covering) == list(range(1000))
+    assert list(starts) == [extent.source_offset for extent in extents]
+    assert list(stops) == [extent.end_offset for extent in extents]
 
 
 def test_multi_extent_shared_segment() -> None:
@@ -363,7 +448,7 @@ def test_discard_extent_masks_older_data() -> None:
     discard = Extent(
         volume_id=10, source_offset=0x1000, extent_length=0x1000, slice_id=3, extent_id=2, segment_id=0, extent_index=0
     )
-    tibx._extents = [*tibx.extents, discard]
+    tibx._extents = ExtentTable.from_extents([*tibx.extents, discard])
     tibx._volumes = None
 
     volume = tibx.streams()[0]
@@ -375,7 +460,7 @@ def test_discard_extent_masks_older_data() -> None:
 def test_segment_shorter_than_its_extent_reads_zeros() -> None:
     # Damaged archive: the data_map maps more bytes than the segment holds
     tibx = _open(build_lsm_archive([ExtentSpec(10, 0, b"A" * 0x1000)]))
-    tibx._extents = [tibx.extents[0]._replace(extent_length=0x3000)]
+    tibx._extents = ExtentTable.from_extents([tibx.extents[0]._replace(extent_length=0x3000)])
     volume = tibx.streams()[0]
 
     assert volume.read(0, 0x3000) == b"A" * 0x1000 + b"\x00" * 0x2000

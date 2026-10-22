@@ -17,10 +17,11 @@ from __future__ import annotations
 
 import struct
 from array import array
-from bisect import bisect_left
-from collections.abc import Mapping
-from itertools import pairwise
-from typing import TYPE_CHECKING, NamedTuple
+from bisect import bisect_left, bisect_right
+from collections.abc import Mapping, Sequence
+from itertools import compress, islice, pairwise, repeat
+from operator import eq, itemgetter, le, lshift, or_
+from typing import TYPE_CHECKING, NamedTuple, overload
 
 from dissect.archive.tibx.c_tibx import (
     LSM_CELL_GROUP_HEADER_SIZE,
@@ -48,8 +49,10 @@ if TYPE_CHECKING:
 # them in step). The 24-bit extent_length is split into its high byte and low 16 bits, and
 # the segment_map page_count, the record's one little-endian field, is left as bytes.
 _DATA_MAP_KEY = struct.Struct(">QQBHIQ")
-_DATA_MAP_KEY_FIELDS = 6
 _DATA_MAP_RECORD = struct.Struct(">QQBHIQQH")
+# Array typecodes for the fields of _DATA_MAP_RECORD, and for those of Extent
+_DATA_MAP_TYPECODES = "QQBHIQQH"
+_EXTENT_TYPECODES = "QQQIQQH"
 _SEGMENT_MAP_KEY = struct.Struct(">Q")
 _SEGMENT_MAP_RECORD = struct.Struct(">Q4sI24x")
 
@@ -73,6 +76,95 @@ class Extent(NamedTuple):
     def end_offset(self) -> int:
         """Exclusive end offset of this extent within its volume."""
         return self.source_offset + self.extent_length
+
+
+class ExtentTable(Sequence[Extent]):
+    """Extents as columns: an array for each field of :class:`Extent`, a row per extent.
+
+    Loaded from the data_map, the rows are in ``(volume_id, source_offset)`` order. A real
+    archive holds a million extents and more. As :class:`Extent` tuples they took some 250
+    bytes each, and the cyclic GC went through all of them in every full collection: up to
+    a third of the time to load the index. These arrays hold the same in under 50 bytes an
+    extent, as seven objects for the GC however many extents there are; an :class:`Extent`
+    is only built for whoever asks for one.
+    """
+
+    __slots__ = (
+        "extent_ids",
+        "extent_indexes",
+        "extent_lengths",
+        "segment_ids",
+        "slice_ids",
+        "source_offsets",
+        "volume_ids",
+    )
+
+    def __init__(self, columns: Sequence[array] | None = None):
+        if columns is None:
+            columns = [array(typecode) for typecode in _EXTENT_TYPECODES]
+        (
+            self.volume_ids,
+            self.source_offsets,
+            self.extent_lengths,
+            self.slice_ids,
+            self.extent_ids,
+            self.segment_ids,
+            self.extent_indexes,
+        ) = columns
+
+    @classmethod
+    def from_extents(cls, extents: Iterable[Extent]) -> ExtentTable:
+        """A table of ``extents`` in ``(volume_id, source_offset)`` order, as the data_map holds them."""
+        table = cls()
+        for extent in sorted(extents, key=lambda extent: (extent.volume_id, extent.source_offset)):
+            for column, value in zip(table.columns, extent, strict=True):
+                column.append(value)
+        return table
+
+    @property
+    def columns(self) -> tuple[array, ...]:
+        """The arrays, in the order of the fields of :class:`Extent`."""
+        return (
+            self.volume_ids,
+            self.source_offsets,
+            self.extent_lengths,
+            self.slice_ids,
+            self.extent_ids,
+            self.segment_ids,
+            self.extent_indexes,
+        )
+
+    def __len__(self) -> int:
+        return len(self.volume_ids)
+
+    @overload
+    def __getitem__(self, index: int) -> Extent: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> ExtentTable: ...
+
+    def __getitem__(self, index: int | slice) -> Extent | ExtentTable:
+        if isinstance(index, slice):
+            return ExtentTable([column[index] for column in self.columns])
+        return Extent(*(column[index] for column in self.columns))
+
+    def __iter__(self) -> Iterator[Extent]:
+        return map(Extent, *self.columns)
+
+    def select(self, keep: Iterable[bool]) -> ExtentTable:
+        """The rows for which ``keep`` is true, in their order."""
+        keep = list(keep)
+        return ExtentTable([array(column.typecode, compress(column, keep)) for column in self.columns])
+
+    def volume_ranges(self) -> Iterator[tuple[int, int, int]]:
+        """``(volume_id, start, stop)`` for each volume: rows ``start`` up to ``stop`` hold its extents."""
+        volume_ids = self.volume_ids
+        start = 0
+        while start < len(volume_ids):
+            volume_id = volume_ids[start]
+            stop = bisect_right(volume_ids, volume_id, start)
+            yield volume_id, start, stop
+            start = stop
 
 
 class SegmentLocator(NamedTuple):
@@ -101,11 +193,12 @@ def decode_segment_locator(raw_key: bytes, raw_value: bytes) -> SegmentLocator:
     return SegmentLocator(segment_id, int.from_bytes(page_count, "little"), page_offset)
 
 
-def _iter_compact_records(raw: bytes, count: int, key: struct.Struct, record: struct.Struct) -> Iterator[Record]:
-    """Decode a compact cell stream of fixed-size records in bulk.
+def _iter_compact_groups(raw: bytes, count: int, key: struct.Struct, record: struct.Struct) -> Iterator[bytes | Record]:
+    """Decode a compact cell stream of fixed-size records, a group of cells at a time.
 
-    The same layout :func:`dissect.archive.tibx.lsm.decode_cells_compact` decodes, but a
-    group whose cells are all alive -- nearly all of them -- is unpacked in one call.
+    The same layout :func:`dissect.archive.tibx.lsm.decode_cells_compact` decodes. A group
+    whose cells are all alive -- nearly all of them -- comes out as the bytes of its
+    records, for the caller to unpack in bulk; the cells of any other group as Records.
     """
     pos = 0
     decoded = 0
@@ -123,8 +216,7 @@ def _iter_compact_records(raw: bytes, count: int, key: struct.Struct, record: st
                 end = pos + group * record.size
                 if end > len(raw):
                     raise CorruptArchiveError(f"compact cells: short group at {pos}")
-                for fields in record.iter_unpack(raw[pos:end]):
-                    yield True, fields
+                yield raw[pos:end]
                 pos = end
             else:
                 for index in range(group):
@@ -139,15 +231,19 @@ def _iter_compact_records(raw: bytes, count: int, key: struct.Struct, record: st
         raise CorruptArchiveError(f"compact cells: truncated stream at {pos}") from e
 
 
-def _record_runs(
+def _run_items(
     store: PageStore, sb: LsmSuperBlock, key: struct.Struct, record: struct.Struct
-) -> list[Iterable[Record]]:
-    """The runs of a fixed-layout LSM tree as records, newest first: mem-tree, then ctrees."""
+) -> list[Iterable[bytes | Record]]:
+    """The runs of a fixed-layout LSM tree, newest first: mem-tree, then ctrees.
+
+    Each run comes as the items of :func:`_iter_compact_groups`: the bytes of a group of
+    live records, or a Record.
+    """
     if sb.key_length != key.size or sb.value_length != record.size - key.size:
         # Not the layout this tree is known by: there is nothing to decode it as
         return []
 
-    runs: list[Iterable[Record]] = []
+    runs: list[Iterable[bytes | Record]] = []
     memtree = [
         (cell.alive, record.unpack(cell.key + cell.value) if cell.alive else key.unpack(cell.key))
         for cell in iter_memtree_cells(sb)
@@ -155,54 +251,162 @@ def _record_runs(
     ]
     if memtree:
         runs.append(memtree)
-    runs.extend(_leaf_records(leaves, key, record) for leaves in iter_tree_leaf_streams(store, sb))
+    runs.extend(_leaf_groups(leaves, key, record) for leaves in iter_tree_leaf_streams(store, sb))
     return runs
 
 
-def _leaf_records(leaves: Iterable[tuple[bytes, int]], key: struct.Struct, record: struct.Struct) -> Iterator[Record]:
+def _leaf_groups(
+    leaves: Iterable[tuple[bytes, int]], key: struct.Struct, record: struct.Struct
+) -> Iterator[bytes | Record]:
     for raw, count in leaves:
-        yield from _iter_compact_records(raw, count, key, record)
+        yield from _iter_compact_groups(raw, count, key, record)
 
 
-def _keep_first(runs: list[Iterable[Record]], key_fields: int) -> Iterator[Record]:
-    """Merge LSM runs (newest first) with keep-first semantics, tombstones included.
+def _record_runs(
+    store: PageStore, sb: LsmSuperBlock, key: struct.Struct, record: struct.Struct
+) -> list[Iterable[Record]]:
+    """The runs of a fixed-layout LSM tree as records, newest first: mem-tree, then ctrees."""
+    return [_records(items, record) for items in _run_items(store, sb, key, record)]
 
-    Keys are unique within a run, so only the keys of the runs before the last one need
-    remembering: an archive written by a single full backup has one run and no set at all,
-    and otherwise the set holds the (small) newer runs rather than the big base.
+
+def _records(items: Iterable[bytes | Record], record: struct.Struct) -> Iterator[Record]:
+    for item in items:
+        if type(item) is bytes:
+            for fields in record.iter_unpack(item):
+                yield True, fields
+        else:
+            yield item
+
+
+def _decode_extent_run(items: Iterable[bytes | Record]) -> tuple[list[array], list[tuple]]:
+    """One data_map run as the columns of an ExtentTable, in its key order, and the keys of its tombstones."""
+    fields = [array(typecode) for typecode in _DATA_MAP_TYPECODES]
+    deleted = []
+    for item in items:
+        if type(item) is bytes:
+            for column, values in zip(fields, zip(*_DATA_MAP_RECORD.iter_unpack(item), strict=True), strict=True):
+                column.extend(values)
+        else:
+            alive, values = item
+            if alive:
+                for column, value in zip(fields, values, strict=True):
+                    column.append(value)
+            else:
+                volume_id, source_offset, length_high, length_low, slice_id, extent_id = values
+                deleted.append((volume_id, source_offset, length_high << 16 | length_low, slice_id, extent_id))
+    volume_ids, source_offsets, length_high, length_low, slice_ids, extent_ids, segment_ids, extent_indexes = fields
+    extent_lengths = array("Q", map(or_, map(lshift, length_high, repeat(16)), length_low))
+    return [volume_ids, source_offsets, extent_lengths, slice_ids, extent_ids, segment_ids, extent_indexes], deleted
+
+
+def _keep_first(columns: list[array], bounds: list[int], deleted: list[list[tuple]]) -> list[array]:
+    """Merge data_map runs with LSM keep-first semantics.
+
+    ``columns`` holds the runs one after the other, newest first, run ``i`` ending at row
+    ``bounds[i]`` with the tombstones ``deleted[i]``. The newest record for a key wins, and
+    a tombstone keeps masking the older records of its key (seen in the wild after a
+    "single version scheme" cleanup deletes a backup version). Keys are unique within a
+    run, so only the keys of the runs before the last one need remembering.
     """
+    merged = [array(typecode) for typecode in _EXTENT_TYPECODES]
     seen: set[tuple] = set()
-    for index, run in enumerate(runs):
-        last = index == len(runs) - 1
-        if last and not seen:
-            yield from run
-            return
-        for alive, fields in run:
-            identity = fields[:key_fields]
-            if identity in seen:
-                # LSM keep-first: the newest record for this key already decided its fate --
-                # in particular a tombstone must keep masking an older alive record (seen in
-                # the wild after a "single version scheme" cleanup deletes a backup version)
-                continue
-            if not last:
-                seen.add(identity)
-            yield alive, fields
+    start = 0
+    for number, (stop, run_deleted) in enumerate(zip(bounds, deleted, strict=True)):
+        run = [column[start:stop] for column in columns]
+        # The key of a record: everything up to the segment it points at
+        identities = list(zip(*run[:5], strict=True))
+        for identity, row in zip(identities, zip(*run, strict=True), strict=True):
+            if identity not in seen:
+                for column, value in zip(merged, row, strict=True):
+                    column.append(value)
+        if number < len(bounds) - 1:
+            seen.update(identities)
+            seen.update(run_deleted)
+        start = stop
+    return merged
 
 
-def load_extents(store: PageStore, header: ArchiveHeader) -> list[Extent]:
+def _offset_order(columns: list[array]) -> tuple[list[int] | None, list[int]]:
+    """The rows of ``columns`` in ``(volume_id, source_offset)`` order, rows with equal ones in their current order.
+
+    Returns ``(order, ties)``: ``order`` is ``None`` if the rows are in that order already,
+    and ``ties`` lists the positions in the order whose row has the same volume and offset
+    as the row before.
+    """
+    volume_ids, source_offsets = columns[0], columns[1]
+    positions = list(map(or_, map(lshift, volume_ids, repeat(64)), source_offsets))
+    if all(map(le, positions, islice(positions, 1, None))):
+        order = None
+    else:
+        order = sorted(range(len(positions)), key=positions.__getitem__)
+        positions = [positions[row] for row in order]
+    ties = list(compress(range(1, len(positions)), map(eq, islice(positions, 1, None), positions)))
+    return order, ties
+
+
+def _shares_a_key(columns: list[array], order: list[int] | None, ties: list[int]) -> bool:
+    """Whether two rows among ``ties`` (from :func:`_offset_order`) have the same data_map key."""
+    keys: set[tuple] = set()
+    previous = -2
+    for position in ties:
+        if position != previous + 1:
+            # A new group of rows at one volume offset, starting at the row before
+            keys = {tuple(column[order[position - 1] if order else position - 1] for column in columns[:5])}
+        key = tuple(column[order[position] if order else position] for column in columns[:5])
+        if key in keys:
+            return True
+        keys.add(key)
+        previous = position
+    return False
+
+
+def _gather(columns: list[array], order: list[int]) -> None:
+    """Put the rows of ``columns`` in ``order``, a column at a time to keep a single copy at hand."""
+    take = itemgetter(*order) if len(order) > 1 else lambda column: [column[row] for row in order]
+    for number, column in enumerate(columns):
+        columns[number] = array(column.typecode, take(column))
+
+
+def load_extents(store: PageStore, header: ArchiveHeader) -> ExtentTable:
     """Walk the data_map tree of ``header`` and return all extents.
 
-    Sorted by ``(volume_id, source_offset)``. Tombstones and malformed records are
-    skipped. Returns an empty list if the header has no data_map.
+    In ``(volume_id, source_offset)`` order. Tombstones and malformed records are skipped.
+    Returns an empty table if the header has no data_map.
+
+    The runs of the tree (the mem-tree, then the ctrees, newest first) are merged with LSM
+    keep-first semantics. Real archives have one to four runs without a single key in more
+    than one of them, nor a tombstone, so the runs are only put in order: then no record
+    can shadow another.
     """
     sb = header.tree(TLV_DATA_MAP)
     if sb is None:
-        return []
-    runs = _record_runs(store, sb, _DATA_MAP_KEY, _DATA_MAP_RECORD)
-    extents = [_extent(fields) for alive, fields in _keep_first(runs, _DATA_MAP_KEY_FIELDS) if alive]
-    # A single run comes out of the tree in key order, which this sort then only confirms
-    extents.sort(key=lambda extent: (extent.volume_id, extent.source_offset))
-    return extents
+        return ExtentTable()
+    # The runs one after the other, newest first, each run decoded and then let go of
+    columns = [array(typecode) for typecode in _EXTENT_TYPECODES]
+    bounds: list[int] = []
+    deleted: list[list[tuple]] = []
+    for items in _run_items(store, sb, _DATA_MAP_KEY, _DATA_MAP_RECORD):
+        run_columns, run_deleted = _decode_extent_run(items)
+        if len(run_columns[0]) or run_deleted:
+            if bounds:
+                for column, part in zip(columns, run_columns, strict=True):
+                    column.extend(part)
+            else:
+                columns = run_columns
+            bounds.append(len(columns[0]))
+            deleted.append(run_deleted)
+        del run_columns
+
+    # The tombstones of the oldest run mask nothing
+    if len(bounds) > 1 and any(deleted[:-1]):
+        columns = _keep_first(columns, bounds, deleted)
+    order, ties = _offset_order(columns)
+    if len(bounds) > 1 and ties and _shares_a_key(columns, order, ties):
+        columns = _keep_first(columns, bounds, deleted)
+        order, _ = _offset_order(columns)
+    if order is not None:
+        _gather(columns, order)
+    return ExtentTable(columns)
 
 
 class SegmentIndex(Mapping[int, SegmentLocator]):
