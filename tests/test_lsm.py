@@ -5,6 +5,7 @@ import struct
 
 import pytest
 
+from dissect.archive.tibx import lsm
 from dissect.archive.tibx.c_tibx import ENVELOPE_SIZE, LSM_CELL_STREAM_OFFSET, c_tibx
 from dissect.archive.tibx.exception import CorruptArchiveError
 from dissect.archive.tibx.lsm import (
@@ -17,7 +18,17 @@ from dissect.archive.tibx.lsm import (
     walk_tree,
 )
 from dissect.archive.tibx.page import PageStore
-from tests._synth import PAGE, Cell, arch_header_page, arch_page, blank_page, compact_cells, lsb, lsm_page
+from tests._synth import (
+    PAGE,
+    Cell,
+    CountingIO,
+    arch_header_page,
+    arch_page,
+    blank_page,
+    compact_cells,
+    lsb,
+    lsm_page,
+)
 
 
 def test_compact_cells_roundtrip_with_tombstone() -> None:
@@ -146,6 +157,56 @@ def test_walk_tree_past_8192_pages() -> None:
     keys = [cell.key for cell in walk_tree(store, 1, key_length=8, value_length=4)]
     assert len(pages) > 8192
     assert keys == [struct.pack(">Q", leaf) for leaf in range(leaf_count)]
+
+
+def _tree_in_walk_order(leaves_per_ldir: int, ldir_count: int) -> tuple[list[bytes], list[bytes]]:
+    """A root LDIR at page 1 over ``ldir_count`` LDIRs, then their LEAFs, as a tree written in one go."""
+    first_leaf = 2 + ldir_count
+    root = [Cell(struct.pack(">Q", i * leaves_per_ldir), struct.pack(">Q", (2 + i) * PAGE)) for i in range(ldir_count)]
+    pages = [_unchecked_lsm_page(0x04, b"LDIR", root, key_length=8, compact=False)]
+    for i in range(ldir_count):
+        children = [
+            Cell(struct.pack(">Q", leaf), struct.pack(">Q", (first_leaf + leaf) * PAGE))
+            for leaf in range(i * leaves_per_ldir, (i + 1) * leaves_per_ldir)
+        ]
+        pages.append(_unchecked_lsm_page(0x04, b"LDIR", children, key_length=8, compact=False))
+    keys = [struct.pack(">Q", leaf) for leaf in range(leaves_per_ldir * ldir_count)]
+    pages.extend(_unchecked_lsm_page(0x03, b"LEAF", [Cell(key, b"v" * 4)], key_length=8, compact=True) for key in keys)
+    return pages, keys
+
+
+@pytest.mark.parametrize(
+    ("read_ahead", "reads"),
+    [
+        # The root, the three LDIRs together, then the 50 LEAFs of each LDIR together
+        (256, 1 + 1 + 3),
+        # At most 16 pages a read: each run of 50 LEAFs takes 4 reads
+        (16, 1 + 1 + 3 * 4),
+    ],
+)
+def test_walk_tree_reads_consecutive_pages_together(
+    monkeypatch: pytest.MonkeyPatch, read_ahead: int, reads: int
+) -> None:
+    monkeypatch.setattr(lsm, "WALK_READ_AHEAD_PAGES", read_ahead)
+    pages, keys = _tree_in_walk_order(leaves_per_ldir=50, ldir_count=3)
+    fh = CountingIO(arch_page(1000, 2000, b"\xab" * 16) + b"".join(pages))
+    store = PageStore(fh)
+    fh.reads = 0
+
+    assert [cell.key for cell in walk_tree(store, 1, key_length=8, value_length=4)] == keys
+    assert fh.reads == reads
+
+
+def test_walk_tree_reads_ahead_only_within_the_archive() -> None:
+    # A last LEAF pointer past the end of the archive is skipped as before, and the
+    # read-ahead before it stops at the last page
+    pages, keys = _tree_in_walk_order(leaves_per_ldir=4, ldir_count=1)
+    ldir = [Cell(key, struct.pack(">Q", (3 + leaf) * PAGE)) for leaf, key in enumerate(keys)]
+    ldir.append(Cell(struct.pack(">Q", 99), struct.pack(">Q", (3 + len(keys)) * PAGE)))
+    pages[1] = _unchecked_lsm_page(0x04, b"LDIR", ldir, key_length=8, compact=False)
+    store = PageStore(io.BytesIO(arch_page(1000, 2000, b"\xab" * 16) + b"".join(pages)))
+
+    assert [cell.key for cell in walk_tree(store, 1, key_length=8, value_length=4)] == keys
 
 
 def test_walk_tree_rejects_cycles() -> None:

@@ -44,6 +44,9 @@ if TYPE_CHECKING:
 
     from dissect.archive.tibx.page import PageStore, SuperBlock
 
+# Pages a tree walk reads in one I/O when it visits them one after the other (1 MiB)
+WALK_READ_AHEAD_PAGES = 256
+
 
 class CTreeRef(NamedTuple):
     """One on-disk ctree (frozen LSM run) slot from an L-SB. ``offset`` is None if empty."""
@@ -352,6 +355,11 @@ def walk_leaf_streams(store: PageStore, root_page: int, key_length: int) -> Iter
     budget does not: the segment_map of a ~200 GB archive already runs to ~8,000 pages,
     and a budget silently drops whatever lies past it.
 
+    A tree is written in one go, so the pages the walk visits next mostly follow on from
+    each other in the archive. Those are read together, up to
+    :data:`WALK_READ_AHEAD_PAGES` at a time: page by page, the index of a 480 GB volume
+    took 20,000 reads, each a round trip over SMB.
+
     Raises:
         CorruptArchiveError: If a page is reached twice, which no valid tree does.
     """
@@ -359,6 +367,8 @@ def walk_leaf_streams(store: PageStore, root_page: int, key_length: int) -> Iter
     # An explicit stack rather than recursive generators: a record passed through one
     # ``yield from`` per tree level, which cost more than decoding it
     stack = [root_page]
+    # Pages read along with an earlier one, until the walk gets to them
+    ahead: dict[int, bytes] = {}
     while stack:
         page_index = stack.pop()
         if not 0 <= page_index < store.page_count:
@@ -366,7 +376,15 @@ def walk_leaf_streams(store: PageStore, root_page: int, key_length: int) -> Iter
         if page_index in visited:
             raise CorruptArchiveError(f"LSM tree revisits page {page_index}")
         visited.add(page_index)
-        page = store.page(page_index)
+        page = ahead.pop(page_index, None)
+        if page is None:
+            # The top of the stack is what the walk visits next
+            count = 1
+            limit = min(WALK_READ_AHEAD_PAGES, store.page_count - page_index)
+            while count < limit and count <= len(stack) and stack[-count] == page_index + count:
+                count += 1
+            page, *following = store.read_run(page_index, count)
+            ahead.update(zip(range(page_index + 1, page_index + count), following, strict=True))
         page_type = c_tibx.page_header(page).type
         if page_type == c_tibx.PageType.LDIR:
             header, raw = _decode_page_stream(page[ENVELOPE_SIZE:])
