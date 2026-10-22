@@ -594,6 +594,23 @@ def test_allocation_bitmap_is_not_a_volume() -> None:
     assert [v.volume_id for v in tibx.volumes()] == [4]
 
 
+def test_sector_aligned_allocation_bitmap_is_not_a_volume() -> None:
+    # The bitmap of a 100 GiB volume with 4 KiB clusters is 3,276,800 bytes, a whole number
+    # of sectors (seen in a real archive). It starts with set bits, as no partition does.
+    bitmap = b"\xff" * 0x3000 + b"\x0f" + b"\x00" * 0xFFF
+    archive = build_lsm_archive(
+        [
+            ExtentSpec(4, 0, _ntfs_boot(0x18000) + b"\x00" * 512),
+            ExtentSpec(9, 0, bitmap),
+            ExtentSpec(9, 3_276_800 - 512, b"\x00" * 512),
+        ]
+    )
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert [v.volume_id for v in tibx.volumes()] == [4]
+    assert {stream.volume_id: stream.span for stream in tibx.streams()}[9] == 3_276_800
+
+
 @pytest.mark.parametrize(
     "mbr", [_mbr((0x80, 0x07, 2048, 0x18000)), _mbr((0x00, 0xEE, 1, 0xFFFFFFFF))], ids=["mbr", "gpt"]
 )

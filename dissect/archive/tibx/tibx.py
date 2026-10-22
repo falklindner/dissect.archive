@@ -373,8 +373,11 @@ class TIBX:
         holds a bit per cluster, so it reaches :data:`MIN_VOLUME_SIZE` for any volume over
         32 GiB, and the bootstrap region before a disk's first partition is a whole 1 MiB
         on a disk partitioned the Windows way. But a partition is imaged in whole sectors,
-        so its span is sector-aligned where a bitmap's is not, and the bootstrap region
-        starts with the disk's partition table.
+        so its span is sector-aligned where a bitmap's mostly is not, and the bootstrap
+        region starts with the disk's partition table. A bitmap that is a whole number of
+        sectors after all, like that of a 100 GiB volume with 4 KiB clusters, starts with
+        a sector of set bits: the clusters at the start of a volume are always in use.
+        A partition, formatted or not, does not start like that.
 
         The size tests run on :attr:`TibxVolume.span`, which comes from the data_map and
         needs no read. That matters for an encrypted archive that has not been unlocked:
@@ -391,7 +394,9 @@ class TIBX:
             return True
         if stream.span < MIN_VOLUME_SIZE or stream.span % SECTOR_SIZE:
             return False
-        return head is None or not _is_partition_table(head, stream.span)
+        if head is None:
+            return True
+        return head[:SECTOR_SIZE] != b"\xff" * SECTOR_SIZE and not _is_partition_table(head, stream.span)
 
     def extent_base(self, extent: Extent) -> int:
         """The within-segment byte offset where ``extent``'s data starts.
