@@ -6,6 +6,7 @@ import sys
 import pytest
 
 from dissect.archive.tibx import codec
+from dissect.archive.tibx.c_tibx import LZ4_BLOCK_HEADER_SIZE, c_tibx
 from dissect.archive.tibx.codec import (
     decompress_cell_stream,
     decompress_linked_lz4,
@@ -126,6 +127,12 @@ def test_linked_lz4_chain() -> None:
     chunks = [PLAIN[:1000], PLAIN[500:1800], PLAIN[200:1500]]
     body = _linked_chain(chunks)
     assert decompress_linked_lz4(body, sum(map(len, chunks))) == b"".join(chunks)
+
+
+def test_lz4_block_header_struct_matches_c_tibx() -> None:
+    header = c_tibx.lz4_block_header(compressed_size=0x01020304, uncompressed_size=0x05060708).dumps()
+    assert codec._LZ4_BLOCK_HEADER.size == LZ4_BLOCK_HEADER_SIZE == len(header)
+    assert codec._LZ4_BLOCK_HEADER.unpack(header) == (0x01020304, 0x05060708)
 
 
 def test_linked_lz4_chain_longer_than_a_dictionary() -> None:

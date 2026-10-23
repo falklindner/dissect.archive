@@ -34,7 +34,7 @@ else:
 from dissect.util.compression import lz4 as util_lz4
 from dissect.util.exceptions import CorruptDataError
 
-from dissect.archive.tibx.c_tibx import LZ4_BLOCK_HEADER_SIZE, c_tibx
+from dissect.archive.tibx.c_tibx import LZ4_BLOCK_HEADER_SIZE
 from dissect.archive.tibx.exception import CorruptArchiveError
 
 # Generous ceiling for a single decompressed unit; real segments are a few MiB
@@ -71,6 +71,11 @@ except Exception:
 
 # LZ4 back-references reach at most this far, so a longer dictionary is never read
 LZ4_MAX_DISTANCE = 0xFFFF
+
+# c_tibx.lz4_block_header as a precompiled struct (a test keeps the two in step): an index
+# page chains six to eight blocks, and cstruct's ~3 us a header was a quarter of the time
+# spent decoding the index's LZ4 with dissect.util's native module
+_LZ4_BLOCK_HEADER = struct.Struct(">II")
 
 
 def decompress_zstd(data: bytes, max_output: int) -> bytes:
@@ -183,8 +188,7 @@ def decompress_linked_lz4(body: bytes, max_output: int, *, strict: bool = True) 
     pos = 0
     body_len = len(body)
     while pos + LZ4_BLOCK_HEADER_SIZE <= body_len and len(out) < max_output:
-        header = c_tibx.lz4_block_header(body[pos : pos + LZ4_BLOCK_HEADER_SIZE])
-        compressed, uncompressed = header.compressed_size, header.uncompressed_size
+        compressed, uncompressed = _LZ4_BLOCK_HEADER.unpack_from(body, pos)
         pos += LZ4_BLOCK_HEADER_SIZE
         if compressed == 0 or compressed > body_len - pos:
             break
