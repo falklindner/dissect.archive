@@ -611,6 +611,42 @@ def test_sector_aligned_allocation_bitmap_is_not_a_volume() -> None:
     assert {stream.volume_id: stream.span for stream in tibx.streams()}[9] == 3_276_800
 
 
+def test_allocation_bitmap_is_told_by_its_span() -> None:
+    # Seen in a real archive: the bitmap of a volume of 41,943,039 clusters of 4 KiB is
+    # 5,242,880 bytes, a whole number of sectors, and has clear bits in its first sector
+    volume_span = 41_943_039 * 0x1000
+    bitmap = b"\xff" * 16 + b"\x7f" + b"\xff" * 0x1EF
+    archive = build_lsm_archive(
+        [
+            ExtentSpec(6, 0, _ntfs_boot(volume_span // 512) + b"\x00" * 512),
+            ExtentSpec(6, volume_span - 512, b"\x00" * 512),
+            ExtentSpec(8, 0, bitmap),
+            ExtentSpec(8, 5_242_880 - 512, b"\x00" * 512),
+        ]
+    )
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert [v.volume_id for v in tibx.volumes()] == [6]
+    assert {stream.volume_id: stream.span for stream in tibx.streams()}[8] == 5_242_880
+
+
+def test_filesystem_with_the_span_of_a_bitmap_is_a_volume() -> None:
+    # A recognised filesystem is a volume whatever its span: this one happens to have the
+    # span of the other's bitmap for 4 KiB clusters
+    volume_span = 41_943_039 * 0x1000
+    archive = build_lsm_archive(
+        [
+            ExtentSpec(6, 0, _ntfs_boot(volume_span // 512) + b"\x00" * 512),
+            ExtentSpec(6, volume_span - 512, b"\x00" * 512),
+            ExtentSpec(8, 0, _ntfs_boot(5_242_880 // 512) + b"\x00" * 512),
+            ExtentSpec(8, 5_242_880 - 512, b"\x00" * 512),
+        ]
+    )
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert sorted(v.volume_id for v in tibx.volumes()) == [6, 8]
+
+
 @pytest.mark.parametrize(
     "mbr", [_mbr((0x80, 0x07, 2048, 0x18000)), _mbr((0x00, 0xEE, 1, 0xFFFFFFFF))], ids=["mbr", "gpt"]
 )
