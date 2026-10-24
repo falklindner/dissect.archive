@@ -26,11 +26,6 @@ import io
 import struct
 import sys
 
-if sys.version_info >= (3, 14):
-    from compression import zstd  # novermin
-else:
-    from backports import zstd
-
 from dissect.util.compression import lz4 as util_lz4
 from dissect.util.exceptions import CorruptDataError
 
@@ -79,7 +74,17 @@ _LZ4_BLOCK_HEADER = struct.Struct(">II")
 
 
 def decompress_zstd(data: bytes, max_output: int) -> bytes:
-    """Decompress one zstd frame, ignoring trailing padding, bounded by ``max_output``."""
+    """Decompress one zstd frame, ignoring trailing padding, bounded by ``max_output``.
+
+    zstd is imported here, as :mod:`dissect.archive.tibx.crypto` imports pycryptodome: below
+    Python 3.14 it comes from ``backports.zstd``, which only the ``full`` extra installs, and
+    opening an archive and listing what it holds needs no zstd.
+    """
+    if sys.version_info >= (3, 14):
+        from compression import zstd  # novermin
+    else:
+        from backports import zstd
+
     try:
         decompressor = zstd.ZstdDecompressor()
         out = decompressor.decompress(data, max_output + 1)

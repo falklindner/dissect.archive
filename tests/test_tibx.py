@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import importlib
 import io
 import random
 import struct
+import sys
 import weakref
 from itertools import pairwise
 from typing import TYPE_CHECKING
@@ -14,6 +16,7 @@ import pytest
 from dissect.archive.tibx.map import Extent, ExtentTable, load_extents, load_segment_index
 from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX, resolve_extents
 from tests._synth import (
+    COMP_NONE,
     PAGE,
     Cell,
     CountingIO,
@@ -700,3 +703,20 @@ def test_close_releases_the_index() -> None:
         assert not tibx._segment_cache
     finally:
         gc.enable()
+
+
+def test_open_without_zstd(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Below Python 3.14 zstd comes from backports.zstd, which only the full extra installs.
+    # Opening an archive and reading what is not zstd-compressed must not need it.
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"A" * 0x1000)], compression=COMP_NONE)
+    zstd_archive = build_lsm_archive([ExtentSpec(10, 0, b"A" * 0x1000)])
+
+    for name in ("backports", "backports.zstd", "compression", "compression.zstd"):
+        monkeypatch.setitem(sys.modules, name, None)
+    for name in [name for name in sys.modules if name.startswith("dissect.archive.tibx")]:
+        monkeypatch.delitem(sys.modules, name)
+    tibx_module = importlib.import_module("dissect.archive.tibx")
+
+    assert tibx_module.TIBX(io.BytesIO(archive)).streams()[0].read(0, 4) == b"AAAA"
+    with pytest.raises(ImportError):
+        tibx_module.TIBX(io.BytesIO(zstd_archive)).streams()[0].read(0, 4)
