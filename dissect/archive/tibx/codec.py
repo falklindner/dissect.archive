@@ -6,13 +6,6 @@
   back-reference previously decompressed output as its LZ4 dictionary
   (``LZ4_decompress_safe_continue`` semantics).
 
-Blocks that need no dictionary -- the first of every chain, and whole LZ4 segments -- go
-through ``dissect.util``'s decoder, and so do the rest where ``dissect.util`` takes a
-dictionary (fox-it/dissect.util#141). Older versions expose no dictionary parameter on
-either backend, so the in-tree decoder below (adapted from
-``dissect.util.compression.lz4_python``, with a dictionary seed added) stays as the
-fallback for them.
-
 A ``.tibx`` is untrusted input: every decode is bounded by the caller-supplied output
 size so malformed on-disk sizes can't drive unbounded allocations.
 
@@ -22,11 +15,10 @@ The linked-LZ4 chain framing is ported from the MIT-licensed ``acronis-tibx``. S
 
 from __future__ import annotations
 
-import io
 import struct
 import sys
 
-from dissect.util.compression import lz4 as util_lz4
+from dissect.util.compression import lz4
 from dissect.util.exceptions import CorruptDataError
 
 from dissect.archive.tibx.c_tibx import LZ4_BLOCK_HEADER_SIZE
@@ -34,35 +26,6 @@ from dissect.archive.tibx.exception import CorruptArchiveError
 
 # Generous ceiling for a single decompressed unit; real segments are a few MiB
 MAX_DECOMPRESSED = 2 << 30
-
-# Optional C-accelerated LZ4 block decoder -- the only one of the three that takes a
-# dictionary, so it is tried first. ``lz4`` is not a hard dependency; without it,
-# dictionary blocks fall through to the in-tree decoder. A capability probe confirms it
-# produces byte-identical output including the growing-dictionary
-# (``LZ4_decompress_safe_continue``) semantics the linked-LZ4 chains rely on.
-try:
-    import lz4.block as _lz4_block
-
-    _probe = _lz4_block.compress(b"tibx-lz4-capability-probe", store_size=False)
-    if (
-        _lz4_block.decompress(_probe, uncompressed_size=25) != b"tibx-lz4-capability-probe"
-        or _lz4_block.decompress(_probe, uncompressed_size=25, dict=b"") != b"tibx-lz4-capability-probe"
-    ):
-        _lz4_block = None
-except Exception:
-    _lz4_block = None
-
-# Whether dissect.util's LZ4 takes a dictionary (fox-it/dissect.util#141), natively when it is
-# built with Rust. Probed rather than pinned to a version until that is released: a linked-LZ4
-# chain is ~8 dictionary blocks per LSM page, and the in-tree fallback copies byte by byte.
-try:
-    # A 4-byte match at distance 1 that only the dictionary can serve, then the 12 literals a
-    # valid block ends with
-    _UTIL_LZ4_DICTIONARY = (
-        util_lz4.decompress(b"\x00\x01\x00\xc0" + b"B" * 12, 16, dictionary=b"A") == b"AAAA" + b"B" * 12
-    )
-except Exception:
-    _UTIL_LZ4_DICTIONARY = False
 
 # LZ4 back-references reach at most this far, so a longer dictionary is never read
 LZ4_MAX_DISTANCE = 0xFFFF
@@ -96,90 +59,15 @@ def decompress_zstd(data: bytes, max_output: int) -> bytes:
 
 
 def lz4_block_decompress(src: bytes, uncompressed_size: int, dictionary: bytes = b"") -> bytes:
-    """Raw LZ4 block decode with dictionary support.
-
-    Three decoders, fastest first:
-
-    1. the C ``lz4`` library, which takes a dictionary, so it serves every block
-    2. ``dissect.util`` (Rust-backed when built) for blocks that need no dictionary -- the
-       first block of every chain, and whole LZ4 segments -- and for the dictionary blocks
-       too where it takes a dictionary
-    3. the decoder below, adapted from ``dissect.util.compression.lz4_python.decompress``
-       with a ``dictionary`` seed: output starts as the dictionary so matches may reach back
-       into it, and the seed is stripped from the returned data
-
-    All three are byte-identical on the real-sample corpus.
-    """
-    if _lz4_block is not None and uncompressed_size > 0:
-        try:
-            return _lz4_block.decompress(src, uncompressed_size=uncompressed_size, dict=dictionary)
-        except Exception as e:
-            # Malformed on-disk block on untrusted input -- normalise to our error type
-            raise CorruptArchiveError(f"LZ4: {e}")
-
-    if (not dictionary or _UTIL_LZ4_DICTIONARY) and uncompressed_size > 0:
-        try:
-            if dictionary:
-                return util_lz4.decompress(src, uncompressed_size=uncompressed_size, dictionary=dictionary)
-            return util_lz4.decompress(src, uncompressed_size=uncompressed_size)
-        except (CorruptDataError, ValueError) as e:
-            # The two backends disagree on type: the Rust one raises ValueError, the
-            # pure-Python one CorruptDataError, which is not a ValueError.
-            raise CorruptArchiveError(f"LZ4: {e}")
-
-    reader = io.BytesIO(src)
-    dst = bytearray(dictionary)
-    base = len(dictionary)
-    min_match_len = 4
-
-    def _get_length(token_len: int) -> int:
-        length = token_len
-        if token_len == 0xF:
-            while True:
-                byte = reader.read(1)
-                if not byte:
-                    raise CorruptArchiveError("LZ4: EOF while reading length")
-                length += byte[0]
-                if byte[0] != 0xFF:
-                    break
-        return length
-
-    while True:
-        read_buf = reader.read(1)
-        if not read_buf:
-            raise CorruptArchiveError("LZ4: EOF at reading literal-len")
-        token = read_buf[0]
-
-        literal_len = _get_length((token >> 4) & 0xF)
-        if len(dst) - base + literal_len > uncompressed_size > 0:
-            raise CorruptArchiveError("LZ4: decompressed size exceeds uncompressed_size")
-
-        read_buf = reader.read(literal_len)
-        if len(read_buf) != literal_len:
-            raise CorruptArchiveError("LZ4: not enough literal data")
-        dst.extend(read_buf)
-        if len(dst) - base >= uncompressed_size > 0:
-            break
-
-        read_buf = reader.read(2)
-        if len(read_buf) == 0:
-            if token & 0xF != 0:
-                raise CorruptArchiveError("LZ4: EOF, but match-len > 0")
-            break
-        if len(read_buf) != 2:
-            raise CorruptArchiveError("LZ4: premature EOF")
-
-        offset = struct.unpack("<H", read_buf)[0]
-        if offset == 0 or offset > len(dst):
-            raise CorruptArchiveError(f"LZ4: invalid match offset {offset} (output length {len(dst)})")
-        match_len = _get_length(token & 0xF) + min_match_len
-
-        # LZ4 allows overlapping matches: copy byte-wise from len(dst) - offset
-        start = len(dst) - offset
-        for index in range(match_len):
-            dst.append(dst[start + index])
-
-    return bytes(dst[base:])
+    """Decompress one raw LZ4 block whose matches may reach back into ``dictionary``."""
+    if uncompressed_size <= 0:
+        # Every TIBX LZ4 block records its size; without one the output would be unbounded
+        raise CorruptArchiveError(f"LZ4: invalid uncompressed size {uncompressed_size}")
+    try:
+        return lz4.decompress(src, uncompressed_size, dictionary=dictionary)
+    except (CorruptDataError, ValueError) as e:
+        # The Rust backend raises ValueError, the pure-Python one CorruptDataError, which is not a ValueError
+        raise CorruptArchiveError(f"LZ4: {e}")
 
 
 def decompress_linked_lz4(body: bytes, max_output: int, *, strict: bool = True) -> bytes:
