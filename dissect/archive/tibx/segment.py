@@ -161,7 +161,7 @@ def read_plaintext(store: PageStore, page_index: int, data_key: DataKey | None =
     segment over SMB. The header stays authoritative for where the segment ends.
 
     Raises:
-        InvalidPasswordError: If the segment is encrypted but no data key was provided.
+        ~dissect.archive.tibx.exception.InvalidPasswordError: If the segment is encrypted but no data key was provided.
     """
     # The count comes from the archive, so it only ever sizes the read
     prefetch = max(1, min(page_count, MAX_PREFETCH_PAGES, store.page_count - page_index))

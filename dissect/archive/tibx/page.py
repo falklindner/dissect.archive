@@ -124,7 +124,7 @@ class PageStore:
         fh: A file-like object of the (stitched, in case of split archives) page store.
 
     Raises:
-        InvalidArchiveError: If page 0 is not an ARCH superblock.
+        ~dissect.archive.tibx.exception.InvalidArchiveError: If page 0 is not an ARCH superblock.
     """
 
     def __init__(self, fh: BinaryIO):
@@ -157,7 +157,7 @@ class PageStore:
         """Read the page at ``index``.
 
         Raises:
-            CorruptArchiveError: If the page does not exist or is truncated.
+            ~dissect.archive.tibx.exception.CorruptArchiveError: If the page does not exist or is truncated.
         """
         if not 0 <= index < self.page_count:
             raise CorruptArchiveError(f"page {index} is out of bounds (archive has {self.page_count} pages)")
@@ -175,7 +175,8 @@ class PageStore:
         :meth:`live_root`.
 
         Raises:
-            CorruptArchiveError: If the run extends past the end of the archive or is truncated.
+            ~dissect.archive.tibx.exception.CorruptArchiveError: If the run extends past the end of the archive or is
+                truncated.
         """
         if count <= 0:
             return []
@@ -212,7 +213,7 @@ class PageStore:
         :data:`SCAN_CHUNK_MAX_PAGES`.
 
         Raises:
-            CorruptArchiveError: If no CRC-valid ARCH superblock exists.
+            ~dissect.archive.tibx.exception.CorruptArchiveError: If no CRC-valid ARCH superblock exists.
         """
         end = self.page_count
         count = SCAN_CHUNK_MIN_PAGES

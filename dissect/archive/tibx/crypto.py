@@ -126,7 +126,7 @@ def _keymap_blob(header: ArchiveHeader) -> bytes | None:
     """The decompressed keymap (TLV[7]) mem-tree region, or ``None`` if there is no keymap.
 
     Raises:
-        InvalidPasswordError: If the region is implausibly large for a keymap.
+        ~dissect.archive.tibx.exception.InvalidPasswordError: If the region is implausibly large for a keymap.
     """
     keymap = header.tree(TLV_KEYMAP)
     if keymap is None:
@@ -203,7 +203,7 @@ def unwrap_data_key(header: ArchiveHeader, password: str | bytes) -> DataKey:
     """Recover the archive's data key from ``password`` via the keymap tree.
 
     Raises:
-        InvalidPasswordError: If no wrapped key unwraps with this password.
+        ~dissect.archive.tibx.exception.InvalidPasswordError: If no wrapped key unwraps with this password.
     """
     if isinstance(password, str):
         password = password.encode("utf-8")
@@ -229,8 +229,8 @@ def decrypt_segment(payload: bytes, data_key: DataKey) -> bytes:
     to the segment's declared length; GCM plaintext is already exact.
 
     Raises:
-        CorruptArchiveError: If the payload is too short for its framing, or a GCM tag does
-            not authenticate.
+        ~dissect.archive.tibx.exception.CorruptArchiveError: If the payload is too short for its framing, or a GCM
+            tag does not authenticate.
     """
     from Crypto.Cipher import AES
 

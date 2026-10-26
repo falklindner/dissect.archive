@@ -4,6 +4,7 @@ import gc
 import hashlib
 import importlib
 import io
+import platform
 import random
 import struct
 import sys
@@ -689,6 +690,7 @@ def test_small_recognised_filesystem_is_a_volume() -> None:
     assert [v.volume_id for v in tibx.volumes()] == [4]
 
 
+@pytest.mark.skipif(platform.python_implementation() == "PyPy", reason="PyPy frees objects only when its GC runs")
 def test_close_releases_the_index() -> None:
     # Volumes refer back to their archive. close() drops the archive's side of that cycle,
     # so the index is freed by reference counting rather than whenever the cyclic GC runs.

@@ -361,7 +361,7 @@ def walk_leaf_streams(store: PageStore, root_page: int, key_length: int) -> Iter
     took 20,000 reads, each a round trip over SMB.
 
     Raises:
-        CorruptArchiveError: If a page is reached twice, which no valid tree does.
+        ~dissect.archive.tibx.exception.CorruptArchiveError: If a page is reached twice, which no valid tree does.
     """
     visited: set[int] = set()
     # An explicit stack rather than recursive generators: a record passed through one
@@ -404,7 +404,7 @@ def walk_tree(store: PageStore, root_page: int, key_length: int, value_length: i
     """Yield every cell of every LEAF reachable from ``root_page``, depth-first.
 
     Raises:
-        CorruptArchiveError: If a page is reached twice, which no valid tree does.
+        ~dissect.archive.tibx.exception.CorruptArchiveError: If a page is reached twice, which no valid tree does.
     """
     for raw, count in walk_leaf_streams(store, root_page, key_length):
         # Compact mode applies to LEAF pages of fixed-key trees only

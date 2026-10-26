@@ -239,8 +239,8 @@ class TIBX:
         """Derive the data key from ``password`` to read encrypted segments.
 
         Raises:
-            InvalidPasswordError: If the password is wrong.
-            UnsupportedFormatError: If the archive is encrypted but wrapped to a
+            ~dissect.archive.tibx.exception.InvalidPasswordError: If the password is wrong.
+            ~dissect.archive.tibx.exception.UnsupportedFormatError: If the archive is encrypted but wrapped to a
                 certificate, which no password can open.
         """
         from dissect.archive.tibx.crypto import unwrap_data_key
@@ -287,7 +287,7 @@ class TIBX:
                 integer index into :meth:`recovery_points`.
 
         Raises:
-            InvalidArchiveError: If an integer index is out of range.
+            ~dissect.archive.tibx.exception.InvalidArchiveError: If an integer index is out of range.
         """
         if recovery_point == "latest":
             self._slice_limit = None
