@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from dissect.archive.tibx.map import Extent, ExtentTable, load_extents, load_segment_index
-from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX, resolve_extents
+from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX, find_split_parts, resolve_extents
 from tests._synth import (
     COMP_NONE,
     PAGE,
@@ -35,6 +35,7 @@ from tests._synth import (
     segment_map_value,
     segment_pages,
     sparse_extents,
+    write_split_parts,
 )
 
 if TYPE_CHECKING:
@@ -720,5 +721,84 @@ def test_open_without_zstd(monkeypatch: pytest.MonkeyPatch) -> None:
     tibx_module = importlib.import_module("dissect.archive.tibx")
 
     assert tibx_module.TIBX(io.BytesIO(archive)).streams()[0].read(0, 4) == b"AAAA"
-    with pytest.raises(ImportError):
-        tibx_module.TIBX(io.BytesIO(zstd_archive)).streams()[0].read(0, 4)
+    # Reading zstd fails with the parser's own error, which listing volumes tolerates
+    zstd_tibx = tibx_module.TIBX(io.BytesIO(zstd_archive))
+    with pytest.raises(tibx_module.UnsupportedFormatError, match="zstd"):
+        zstd_tibx.streams()[0].read(0, 4)
+    zstd_tibx.volumes()
+
+
+def test_shared_segment_extent_recorded_twice() -> None:
+    # An incremental backup records unchanged extents again under its own slice, pointing
+    # at the same segment and extent index. Counting such an extent once per row moved
+    # every later extent of the segment.
+    tibx = _open(
+        build_lsm_archive(
+            [
+                ExtentSpec(10, 0, b"A" * 20, segment_group=1),
+                ExtentSpec(10, 0x1000, b"B" * 20, segment_group=1),
+            ]
+        )
+    )
+    extents = list(tibx.extents)
+    first = extents[0]
+    again = first._replace(slice_id=first.slice_id + 1, extent_id=first.extent_id + 10)
+    tibx._all_extents = ExtentTable.from_extents([first, again, *extents[1:]])
+    tibx._reset_view_caches()
+
+    assert tibx.streams()[0].read(0x1000, 4) == b"BBBB"
+
+
+def test_volume_reads_after_selecting_an_older_recovery_point() -> None:
+    # A volume opened at the latest point keeps reading the extents it was opened with.
+    # Those of a segment shared by several extents must not lose their place in it.
+    tibx = _open(
+        build_lsm_archive(
+            [
+                ExtentSpec(10, 0, b"base" * 16, slice_id=2),
+                ExtentSpec(10, 0x1000, b"A" * 20, slice_id=3, segment_group=1),
+                ExtentSpec(10, 0x2000, b"B" * 20, slice_id=3, segment_group=1),
+            ],
+            slices=[2, 3],
+        )
+    )
+    volume = tibx.streams()[0]
+    tibx.use_recovery_point(0)
+
+    assert volume.read(0x2000, 4) == b"BBBB"
+    assert tibx.streams()[0].read(0x2000, 4) == bytes(4)
+
+
+def test_selecting_a_recovery_point_keeps_the_segment_cache() -> None:
+    # Neither a segment's plaintext nor its location depends on the selected point
+    tibx = _open(build_lsm_archive([ExtentSpec(10, 0, b"A" * 0x1000)], slices=[2]))
+    tibx.streams()[0].read(0, 4)
+    segment_index = tibx._segment_index
+    tibx.use_recovery_point(0)
+
+    assert tibx._segment_cache
+    assert tibx._segment_index is segment_index
+    assert tibx.streams()[0].read(0, 4) == b"AAAA"
+
+
+@pytest.mark.parametrize("name", ["Backup [PC1]", "Backup*"])
+def test_find_split_parts_with_glob_characters(tmp_path: Path, name: str) -> None:
+    parts = write_split_parts(b"x" * 300, tmp_path, name, (100, 200))
+
+    assert find_split_parts(parts[0]) == parts
+    assert find_split_parts(parts[2]) == parts
+
+
+def test_find_split_parts_upper_case_extension(tmp_path: Path) -> None:
+    parts = write_split_parts(b"x" * 300, tmp_path, "Backup", (100, 200))
+    parts = [part.rename(part.with_suffix(".TIBX")) for part in parts]
+
+    assert find_split_parts(parts[0]) == parts
+
+
+def test_find_split_parts_orders_numerically_and_ignores_other_stems(tmp_path: Path) -> None:
+    parts = write_split_parts(b"x" * 300, tmp_path, "Backup", (100, 200))
+    (tmp_path / "Backup2.tibx").write_bytes(b"")
+    (tmp_path / "Backup2-0001.tibx").write_bytes(b"")
+
+    assert find_split_parts(parts[1]) == parts

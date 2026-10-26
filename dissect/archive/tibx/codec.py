@@ -22,7 +22,7 @@ from dissect.util.compression import lz4
 from dissect.util.exceptions import CorruptDataError
 
 from dissect.archive.tibx.c_tibx import LZ4_BLOCK_HEADER_SIZE
-from dissect.archive.tibx.exception import CorruptArchiveError
+from dissect.archive.tibx.exception import CorruptArchiveError, UnsupportedFormatError
 
 # Generous ceiling for a single decompressed unit; real segments are a few MiB
 MAX_DECOMPRESSED = 2 << 30
@@ -43,10 +43,17 @@ def decompress_zstd(data: bytes, max_output: int) -> bytes:
     Python 3.14 it comes from ``backports.zstd``, which only the ``full`` extra installs, and
     opening an archive and listing what it holds needs no zstd.
     """
-    if sys.version_info >= (3, 14):
-        from compression import zstd  # novermin
-    else:
-        from backports import zstd
+    try:
+        if sys.version_info >= (3, 14):
+            from compression import zstd  # novermin
+        else:
+            from backports import zstd
+    except ImportError:
+        # An Error, so that what tolerates an unreadable segment (TIBX.volumes()) does here too.
+        # Python 3.14 itself may be built without zstd.
+        raise UnsupportedFormatError(
+            "reading zstd-compressed TIBX segments needs zstd support: install dissect.archive[full]"
+        )
 
     try:
         decompressor = zstd.ZstdDecompressor()

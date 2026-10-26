@@ -175,16 +175,24 @@ def read_plaintext(store: PageStore, page_index: int, data_key: DataKey | None =
         plaintext = decrypt_segment(read_compressed(store, segment, pages[1:]), data_key)
         if segment.compression in COMP_ZSTD:
             # zstd frame parsing ignores any trailing CBC/PKCS#7 padding
-            return decompress_zstd(plaintext, segment.length)
-        # Stored or LZ4: CBC leaves PKCS#7 padding to strip, GCM is already exact -- and
-        # unpadding it there would eat real bytes whenever the payload happens to end in
-        # a valid padding pattern.
-        payload = plaintext if data_key.gcm else _pkcs7_unpad(plaintext)
-        if segment.compression == COMP_LZ4 and len(payload) != segment.length:
-            return lz4_block_decompress(payload, segment.length)
-        if segment.compression in (COMP_NONE, COMP_LZ4) or segment.compression in COMP_STORED_VARIANTS:
-            return payload[: segment.length]
-        raise UnsupportedFormatError(
-            f"encrypted segment at page {page_index} uses compression {segment.compression:#06x}"
-        )
+            out = decompress_zstd(plaintext, segment.length)
+        else:
+            # Stored or LZ4: CBC leaves PKCS#7 padding to strip, GCM is already exact -- and
+            # unpadding it there would eat real bytes whenever the payload happens to end in
+            # a valid padding pattern.
+            payload = plaintext if data_key.gcm else _pkcs7_unpad(plaintext)
+            if segment.compression == COMP_LZ4 and len(payload) != segment.length:
+                out = lz4_block_decompress(payload, segment.length)
+            elif segment.compression in (COMP_NONE, COMP_LZ4) or segment.compression in COMP_STORED_VARIANTS:
+                out = payload[: segment.length]
+            else:
+                raise UnsupportedFormatError(
+                    f"encrypted segment at page {page_index} uses compression {segment.compression:#06x}"
+                )
+        # As for a plaintext segment: a short result is damage, not data to zero-fill
+        if len(out) != segment.length:
+            raise CorruptArchiveError(
+                f"encrypted segment at page {page_index} decoded {len(out)} bytes, expected {segment.length}"
+            )
+        return out
     return decompress(read_compressed(store, segment, pages[1:]), segment)
