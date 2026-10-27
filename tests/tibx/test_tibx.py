@@ -781,7 +781,15 @@ def test_selecting_a_recovery_point_keeps_the_segment_cache() -> None:
     assert tibx.streams()[0].read(0, 4) == b"AAAA"
 
 
-@pytest.mark.parametrize("name", ["Backup [PC1]", "Backup*"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Backup [PC1]",
+        pytest.param(
+            "Backup*", marks=pytest.mark.skipif(sys.platform == "win32", reason="Windows file names cannot contain *")
+        ),
+    ],
+)
 def test_find_split_parts_with_glob_characters(tmp_path: Path, name: str) -> None:
     parts = write_split_parts(b"x" * 300, tmp_path, name, (100, 200))
 
