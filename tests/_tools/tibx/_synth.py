@@ -10,8 +10,8 @@ Every TIBX record is built from the same :mod:`c_tibx` structure the parser read
 with, so a builder cannot drift from the parser's idea of the layout. Only the foreign
 filesystem images (FAT, exFAT) are assembled by hand.
 
-The fixtures are derived from those of the MIT-licensed ``acronis-tibx`` (see
-``THIRD_PARTY_NOTICES.md``) and extended here with the LSM layer. They are cross-checked
+The fixtures are derived from those of ``acronis-tibx`` (MIT License, Copyright (c) 2026
+mniedermaier) and extended here with the LSM layer. They are cross-checked
 against archives produced by Acronis Cyber Protect / True Image 2026 -- a synthetic page
 store is only useful for as long as a real parser would accept it.
 """

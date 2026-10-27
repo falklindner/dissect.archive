@@ -9,8 +9,9 @@ The data_map's lexicographic key order equals ``(volume_id, source_offset)`` ord
 sorted extents are binary-searchable. Overlapping extents (incremental/differential
 backups, dedup) are resolved downstream by :mod:`dissect.archive.tibx.tibx`.
 
-Ported from the MIT-licensed ``acronis-tib-reader``, with the mem-tree merge from
-``acronis-tibx``. See ``THIRD_PARTY_NOTICES.md``.
+Ported from ``acronis-tib-reader`` (MIT License, Copyright (c) 2026 the tibread
+contributors, https://github.com/TreadingTheTiber/acronis-tib-reader), with the mem-tree
+merge from ``acronis-tibx`` (MIT License, Copyright (c) 2026 mniedermaier).
 """
 
 from __future__ import annotations

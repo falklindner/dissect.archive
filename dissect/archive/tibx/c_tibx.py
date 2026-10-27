@@ -17,8 +17,8 @@ volume, and the MBR partition table it reads to tell a disk's bootstrap region f
 Those formats are not TIBX's and are little-endian, so they get their own instance.
 
 The format is not documented by Acronis. These definitions encode the format findings of
-the MIT-licensed ``acronis-tibx`` (see ``THIRD_PARTY_NOTICES.md``) and were confirmed
-against archives written by Acronis Cyber Protect / True Image 2026; fields still marked
+``acronis-tibx`` (MIT License, Copyright (c) 2026 mniedermaier) and were confirmed against
+archives written by Acronis Cyber Protect / True Image 2026; fields still marked
 ``_reserved`` or ``_pad`` are ones whose meaning is not yet established.
 """
 

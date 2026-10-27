@@ -22,8 +22,9 @@ to a block boundary; GCM leaves it exactly as long as the plaintext, so a GCM se
 Either way the plaintext is a zstd frame (or stored bytes when the segment's compression
 is NONE).
 
-Ported from the MIT-licensed ``acronis-tib-reader`` and ``acronis-tibx``. See
-``THIRD_PARTY_NOTICES.md``.
+Ported from ``acronis-tib-reader`` (MIT License, Copyright (c) 2026 the tibread
+contributors, https://github.com/TreadingTheTiber/acronis-tib-reader) and ``acronis-tibx``
+(MIT License, Copyright (c) 2026 mniedermaier).
 """
 
 from __future__ import annotations

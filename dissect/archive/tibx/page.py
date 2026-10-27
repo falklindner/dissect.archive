@@ -5,8 +5,8 @@ carrying its own copy-on-write LSM trees, so each ARCH page is a complete point-
 snapshot (a recovery point). The highest-offset ARCH page whose CRC validates is the live
 root; a torn final commit (power loss) is skipped in favor of the newest complete root.
 
-Ported from the page store of the MIT-licensed ``acronis-tibx``. See
-``THIRD_PARTY_NOTICES.md``.
+Ported from the page store of ``acronis-tibx`` (MIT License, Copyright (c) 2026
+mniedermaier).
 """
 
 from __future__ import annotations

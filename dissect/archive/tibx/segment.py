@@ -5,8 +5,9 @@ A segment is a 0x2C-byte header (``SG`` plaintext / ``SE`` encrypted, at page of
 page (4052 bytes) spill onto continuation DATA pages, each contributing its 4088-byte
 body.
 
-Ported from the MIT-licensed ``acronis-tib-reader``, with the ``comp=0x0001`` variant
-from ``acronis-tibx``. See ``THIRD_PARTY_NOTICES.md``.
+Ported from ``acronis-tib-reader`` (MIT License, Copyright (c) 2026 the tibread
+contributors, https://github.com/TreadingTheTiber/acronis-tib-reader), with the
+``comp=0x0001`` variant from ``acronis-tibx`` (MIT License, Copyright (c) 2026 mniedermaier).
 """
 
 from __future__ import annotations

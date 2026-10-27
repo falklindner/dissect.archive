@@ -9,8 +9,8 @@
 A ``.tibx`` is untrusted input: every decode is bounded by the caller-supplied output
 size so malformed on-disk sizes can't drive unbounded allocations.
 
-The linked-LZ4 chain framing is ported from the MIT-licensed ``acronis-tibx``. See
-``THIRD_PARTY_NOTICES.md``.
+The linked-LZ4 chain framing is ported from ``acronis-tibx`` (MIT License, Copyright (c)
+2026 mniedermaier).
 """
 
 from __future__ import annotations
