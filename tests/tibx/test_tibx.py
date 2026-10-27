@@ -16,7 +16,7 @@ import pytest
 
 from dissect.archive.tibx.map import Extent, ExtentTable, load_extents, load_segment_index
 from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX, resolve_extents
-from tests._synth import (
+from tests._tools.tibx._synth import (
     COMP_NONE,
     PAGE,
     Cell,

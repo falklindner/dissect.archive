@@ -7,7 +7,7 @@ import pytest
 
 from dissect.archive.tibx.exception import InvalidArchiveError
 from dissect.archive.tibx.tibx import TIBX
-from tests._synth import ExtentSpec, build_lsm_archive
+from tests._tools.tibx._synth import ExtentSpec, build_lsm_archive
 
 # A chain lives in one archive: each backup writes its extents under its own slice id, and
 # the slices tree (TLV[5]) records the backups. Slice ids are not contiguous in the wild --

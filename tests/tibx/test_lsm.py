@@ -18,7 +18,7 @@ from dissect.archive.tibx.lsm import (
     walk_tree,
 )
 from dissect.archive.tibx.page import PageStore
-from tests._synth import (
+from tests._tools.tibx._synth import (
     PAGE,
     Cell,
     CountingIO,

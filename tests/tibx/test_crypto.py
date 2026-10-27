@@ -20,7 +20,7 @@ from dissect.archive.tibx.exception import (
 from dissect.archive.tibx.lsm import read_archive_header
 from dissect.archive.tibx.page import PageStore
 from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX
-from tests._synth import COMP_NONE, ExtentSpec, build_lsm_archive
+from tests._tools.tibx._synth import COMP_NONE, ExtentSpec, build_lsm_archive
 
 if TYPE_CHECKING:
     from dissect.archive.tibx.lsm import ArchiveHeader
@@ -73,7 +73,7 @@ def test_gcm_data_key_unwrapped(alg: int, key_length: int) -> None:
 
 def _rebuild_with_keymap(base: bytes, keymap_blob: bytes) -> bytes:
     """``base`` with its TLV[7] keymap mem-tree replaced by ``keymap_blob``."""
-    from tests._synth import Cell, arch_header_page, lsb
+    from tests._tools.tibx._synth import Cell, arch_header_page, lsb
 
     header = _header(base)
     keymap = lsb(0, 0, memtree_cells=[Cell(b"", b"")], memtree_blob=keymap_blob, memtree_encoding=0)
@@ -180,7 +180,7 @@ def test_gcm_stored_payload_ending_in_padding_bytes_is_not_unpadded() -> None:
 
 def _with_encr_alg(archive: bytes, alg: int) -> bytes:
     """``archive`` with ``arch_superblock.encr_alg`` on page 0 set to ``alg``."""
-    from tests._synth import PAGE, finalize
+    from tests._tools.tibx._synth import PAGE, finalize
 
     page = bytearray(archive[:PAGE])
     superblock = c_tibx.arch_superblock(bytes(page))
