@@ -5,9 +5,19 @@ import uuid
 
 import pytest
 
+from dissect.archive.tibx.c_tibx import c_tibx
 from dissect.archive.tibx.exception import InvalidArchiveError
 from dissect.archive.tibx.tibx import TIBX
-from tests._tools.tibx._synth import ExtentSpec, build_lsm_archive
+from tests._tools.tibx._synth import (
+    PAGE,
+    SLICE_VALUE_LENGTH,
+    Cell,
+    ExtentSpec,
+    build_lsm_archive,
+    lsb,
+    lsm_page,
+    slice_record,
+)
 
 # A chain lives in one archive: each backup writes its extents under its own slice id, and
 # the slices tree (TLV[5]) records the backups. Slice ids are not contiguous in the wild --
@@ -102,3 +112,30 @@ def test_archive_without_slices_reports_no_recovery_points() -> None:
     assert tibx.recovery_points() == []
     with pytest.raises(InvalidArchiveError, match="records no backups"):
         tibx.use_recovery_point(0)
+
+
+def test_recovery_points_from_memtree_and_ctrees() -> None:
+    # As the slices tree grows its records move from the mem-tree into on-disk ctrees, like
+    # those of every LSM tree. Across them the newest record of a slice wins.
+    extents = [ExtentSpec(10, 0, b"x" * 64, slice_id=slice_id) for slice_id in SLICES]
+
+    def cell(slice_id: int, marker: int) -> Cell:
+        key = c_tibx.slice_key(slice_id=slice_id).dumps()
+        return Cell(key, slice_record(bytes([marker]) * 16, 1000 * slice_id, 1000 * slice_id + 10))
+
+    leaf_page = len(build_lsm_archive(extents)) // PAGE
+    slices = lsb(
+        4,
+        SLICE_VALUE_LENGTH,
+        memtree_cells=[cell(3, 0x33)],  # newer than the ctree's record of slice 3
+        ctrees=[(leaf_page * PAGE, 3)],
+    )
+    leaf = lsm_page(c_tibx.PageType.LEAF, b"LEAF", [cell(2, 2), cell(3, 3), cell(5, 5)], key_length=4, compact=True)
+    tibx = TIBX(io.BytesIO(build_lsm_archive(extents, extra_slots={5: slices}) + leaf))
+
+    points = tibx.recovery_points()
+    assert [point.slice_id for point in points] == SLICES
+    assert [point.guid.bytes_le[0] for point in points] == [2, 0x33, 5]
+
+    tibx.use_recovery_point(2)
+    assert tibx.extents

@@ -45,7 +45,7 @@ from dissect.archive.tibx.exception import (
     InvalidArchiveError,
     UnsupportedFormatError,
 )
-from dissect.archive.tibx.lsm import iter_memtree_cells, read_archive_header
+from dissect.archive.tibx.lsm import iter_tree_cells, read_archive_header
 from dissect.archive.tibx.map import load_extents, load_segment_index
 from dissect.archive.tibx.page import PageStore
 from dissect.archive.tibx.segment import read_plaintext
@@ -139,14 +139,24 @@ class TIBX:
         self._reset_snapshot_caches()
 
     def _reset_snapshot_caches(self) -> None:
-        # Everything derived from the currently-selected commit root (not the data key)
-        self._extents: ExtentTable | None = None
+        # Everything derived from the live commit root (not the data key)
+        self._all_extents: ExtentTable | None = None
         self._segment_index = None
-        self._segment_cache: OrderedDict[int, bytes] = OrderedDict()
-        self._segment_cache_bytes = 0
         self._segment_layout: dict[tuple[int, int], int] | None = None
+        self._clear_segment_cache()
+        self._reset_view_caches()
+
+    def _reset_view_caches(self) -> None:
+        # Everything that depends on the selected recovery point. A segment's plaintext,
+        # its location and the layout of the extents it holds do not: a segment is written
+        # by one backup, and later backups only reference it again.
+        self._extents: ExtentTable | None = None
         self._streams: list[TibxVolume] | None = None
         self._volumes: list[TibxVolume] | None = None
+
+    def _clear_segment_cache(self) -> None:
+        self._segment_cache: OrderedDict[int, bytes] = OrderedDict()
+        self._segment_cache_bytes = 0
 
     @classmethod
     def open(cls, path: str | Path) -> TIBX:
@@ -252,7 +262,7 @@ class TIBX:
             )
 
         self._data_key = unwrap_data_key(self.header, password)
-        self._segment_cache.clear()
+        self._clear_segment_cache()
 
     def recovery_points(self) -> list[RecoveryPoint]:
         """The backups in this archive, oldest first.
@@ -267,16 +277,26 @@ class TIBX:
         so counting roots reports recovery points that were never taken.
         """
         if self._recovery_points is None:
-            points: list[RecoveryPoint] = []
+            records: dict[int, c_tibx.slice_record] = {}
             slices = self.header.tree(TLV_SLICES)
             if slices is not None and slices.has_records:
-                for cell in iter_memtree_cells(slices):
+                seen: set[bytes] = set()
+                # Like every LSM tree, the slices tree moves from its mem-tree into on-disk
+                # ctrees as it grows; across those runs the newest record of a key wins
+                for cell in iter_tree_cells(self.store, slices):
+                    if cell.key in seen:
+                        continue
+                    seen.add(cell.key)
                     # The tree opens with an empty placeholder record; a real backup has a value.
-                    if len(cell.value) < len(c_tibx.slice_record) or len(cell.key) < len(c_tibx.slice_key):
+                    if not cell.alive or len(cell.value) < len(c_tibx.slice_record):
+                        continue
+                    if len(cell.key) < len(c_tibx.slice_key):
                         continue
                     key = c_tibx.slice_key(cell.key)
-                    points.append(RecoveryPoint(len(points), key.slice_id, c_tibx.slice_record(cell.value)))
-            self._recovery_points = points
+                    records[key.slice_id] = c_tibx.slice_record(cell.value)
+            self._recovery_points = [
+                RecoveryPoint(index, slice_id, records[slice_id]) for index, slice_id in enumerate(sorted(records))
+            ]
         return self._recovery_points
 
     def use_recovery_point(self, recovery_point: int | str = "latest") -> None:
@@ -309,7 +329,7 @@ class TIBX:
             # slice_id as the primary recency signal -- so dropping everything newer than
             # the chosen slice is exactly the archive as it stood after that backup.
             self._slice_limit = chosen.slice_id
-        self._reset_snapshot_caches()
+        self._reset_view_caches()
 
     def disks(self) -> list:
         """Whole-disk views of this archive.
@@ -325,11 +345,17 @@ class TIBX:
     def extents(self) -> ExtentTable:
         """The data_map extents in view: all of them, or those up to the selected slice."""
         if self._extents is None:
-            extents = load_extents(self.store, self.header)
+            extents = self._unfiltered_extents()
             if self._slice_limit is not None:
                 extents = extents.select(map(le, extents.slice_ids, repeat(self._slice_limit)))
             self._extents = extents
         return self._extents
+
+    def _unfiltered_extents(self) -> ExtentTable:
+        """Every data_map extent, whatever recovery point is selected."""
+        if self._all_extents is None:
+            self._all_extents = load_extents(self.store, self.header)
+        return self._all_extents
 
     def streams(self) -> list[TibxVolume]:
         """Every data_map stream, backed-up volumes and Acronis's own metadata alike.
@@ -419,15 +445,19 @@ class TIBX:
         if extent_index == EXTENT_INDEX_WHOLE_SEGMENT:
             return 0
         if self._segment_layout is None:
+            # From every extent, not just those of the selected recovery point: a volume
+            # opened before use_recovery_point() still reads through this layout
             layout: dict[tuple[int, int], int] = {}
-            shared: dict[int, list[tuple[int, int]]] = defaultdict(list)
-            extents = self.extents
+            shared: dict[int, dict[int, int]] = defaultdict(dict)
+            extents = self._unfiltered_extents()
             indexes = extents.extent_indexes
             for row in compress(range(len(indexes)), map(ne, indexes, repeat(EXTENT_INDEX_WHOLE_SEGMENT))):
-                shared[extents.segment_ids[row]].append((indexes[row], extents.extent_lengths[row]))
+                # An incremental backup records the unchanged extents again under its own
+                # slice, so one extent of a segment can appear in several rows: count it once
+                shared[extents.segment_ids[row]].setdefault(indexes[row], extents.extent_lengths[row])
             for shared_segment, entries in shared.items():
                 offset = 0
-                for index, length in sorted(entries, key=itemgetter(0)):
+                for index, length in sorted(entries.items(), key=itemgetter(0)):
                     layout[(shared_segment, index)] = offset
                     offset += length
                     offset = (offset + EXTENT_ALIGNMENT - 1) & ~(EXTENT_ALIGNMENT - 1)
@@ -478,7 +508,9 @@ class TibxVolume:
         self._size: int | None = None
 
     def __repr__(self) -> str:
-        return f"<TibxVolume volume_id={self.volume_id:#x} size={self.size}>"
+        # The span, not the size: that would read the boot sector, which needs the password
+        # on an encrypted archive
+        return f"<TibxVolume volume_id={self.volume_id:#x} span={self.span}>"
 
     @property
     def extents(self) -> ExtentTable:
@@ -631,10 +663,21 @@ def find_split_parts(path: Path) -> list[Path]:
     """
     match = SPLIT_PART_RE.match(path.name)
     stem = match.group("stem") if match else (path.stem if path.suffix.lower() == ".tibx" else path.name)
-    parts = sorted(path.parent.glob(f"{stem}-[0-9][0-9][0-9][0-9].tibx"), key=lambda part: part.name)
-    main = path.parent / f"{stem}.tibx"
-    if parts and main.exists():
-        return [main, *parts]
+    # Matched by hand rather than globbed: a stem like "Backup [PC1]" is no glob pattern,
+    # and the extension may be upper case on a case-sensitive filesystem
+    main = None
+    parts = []
+    try:
+        candidates = list(path.parent.iterdir())
+    except OSError:
+        return [path]
+    for candidate in candidates:
+        if candidate.suffix.lower() == ".tibx" and candidate.name == stem + candidate.suffix:
+            main = candidate
+        elif (part := SPLIT_PART_RE.match(candidate.name)) and part.group("stem") == stem:
+            parts.append((int(part.group("num")), candidate))
+    if parts and main is not None:
+        return [main, *(part for _, part in sorted(parts))]
     return [path]
 
 

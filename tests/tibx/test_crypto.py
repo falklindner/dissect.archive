@@ -253,3 +253,42 @@ def test_locked_large_stream_is_a_volume_without_the_password() -> None:
     tibx = TIBX(io.BytesIO(archive))
 
     assert [v.volume_id for v in tibx.volumes()] == [10]
+
+
+def test_locked_volume_repr() -> None:
+    # repr() must not need the password: it is what logging and the REPL show
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD)
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert "span=64" in repr(tibx.streams())
+
+
+def test_unlock_resets_segment_cache_budget() -> None:
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 0x1000)], password=PASSWORD)
+    tibx = TIBX(io.BytesIO(archive))
+    tibx.unlock(PASSWORD)
+    tibx.streams()[0].read(0, 16)
+    assert tibx._segment_cache_bytes
+
+    tibx.unlock(PASSWORD)
+    assert not tibx._segment_cache
+    assert tibx._segment_cache_bytes == 0
+
+
+@pytest.mark.parametrize("alg", [3, 7])
+def test_encrypted_segment_shorter_than_its_length(alg: int) -> None:
+    # As for a plaintext segment, a segment that decodes short is corrupt: zero-filling the
+    # rest would pass damage off as volume data
+    from tests._tools.tibx._synth import PAGE, SEGMENT_HEADER_OFFSET, finalize
+
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], compression=COMP_NONE, password=PASSWORD, alg=alg)
+    page = bytearray(archive[PAGE : 2 * PAGE])  # the segment follows the ARCH page
+    header = c_tibx.segment_header(bytes(page[SEGMENT_HEADER_OFFSET:]))
+    header.length += 16
+    page[SEGMENT_HEADER_OFFSET : SEGMENT_HEADER_OFFSET + len(c_tibx.segment_header)] = header.dumps()
+    archive = archive[:PAGE] + finalize(page) + archive[2 * PAGE :]
+
+    tibx = TIBX(io.BytesIO(archive))
+    tibx.unlock(PASSWORD)
+    with pytest.raises(CorruptArchiveError, match="decoded 64 bytes, expected 80"):
+        tibx.streams()[0].read(0, 16)
