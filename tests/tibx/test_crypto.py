@@ -20,7 +20,7 @@ from dissect.archive.tibx.exception import (
 from dissect.archive.tibx.lsm import read_archive_header
 from dissect.archive.tibx.page import PageStore
 from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX
-from tests._tools.tibx._synth import COMP_NONE, ExtentSpec, build_lsm_archive
+from tests._tools.tibx._synth import ExtentSpec, build_lsm_archive
 
 if TYPE_CHECKING:
     from dissect.archive.tibx.lsm import ArchiveHeader
@@ -149,9 +149,13 @@ def test_decrypt_segment_padding_stripped_by_caller() -> None:
     assert out.startswith(plaintext)
 
 
-@pytest.mark.parametrize("compression", [0x0300, COMP_NONE], ids=["zstd", "stored"])
+@pytest.mark.parametrize(
+    "compression",
+    [c_tibx.ComprAlg.ZSTD, c_tibx.ComprAlg.LZ4, c_tibx.ComprAlg.ZLIB, c_tibx.ComprAlg.NONE],
+    ids=["zstd", "lz4", "zlib", "stored"],
+)
 @pytest.mark.parametrize("alg", [3, 7], ids=["cbc", "gcm"])
-def test_encrypted_archive_end_to_end(compression: int, alg: int) -> None:
+def test_encrypted_archive_end_to_end(compression: c_tibx.ComprAlg, alg: int) -> None:
     content = b"secret volume payload, needs a password" * 200
     archive = build_lsm_archive([ExtentSpec(10, 0, content)], compression=compression, password=PASSWORD, alg=alg)
     tibx = TIBX(io.BytesIO(archive))
@@ -171,7 +175,9 @@ def test_gcm_stored_payload_ending_in_padding_bytes_is_not_unpadded() -> None:
     # a stored run of disk sectors can look like -- so unpadding would eat four real bytes.
     content = b"stored sectors that end like PKCS#7 padding." + bytes([4, 4, 4, 4])
     assert len(content) % 16 == 0
-    archive = build_lsm_archive([ExtentSpec(10, 0, content)], compression=COMP_NONE, password=PASSWORD, alg=7)
+    archive = build_lsm_archive(
+        [ExtentSpec(10, 0, content)], compression=c_tibx.ComprAlg.NONE, password=PASSWORD, alg=7
+    )
 
     tibx = TIBX(io.BytesIO(archive))
     tibx.unlock(PASSWORD)
@@ -281,7 +287,9 @@ def test_encrypted_segment_shorter_than_its_length(alg: int) -> None:
     # rest would pass damage off as volume data
     from tests._tools.tibx._synth import PAGE, SEGMENT_HEADER_OFFSET, finalize
 
-    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], compression=COMP_NONE, password=PASSWORD, alg=alg)
+    archive = build_lsm_archive(
+        [ExtentSpec(10, 0, b"x" * 64)], compression=c_tibx.ComprAlg.NONE, password=PASSWORD, alg=alg
+    )
     page = bytearray(archive[PAGE : 2 * PAGE])  # the segment follows the ARCH page
     header = c_tibx.segment_header(bytes(page[SEGMENT_HEADER_OFFSET:]))
     header.length += 16

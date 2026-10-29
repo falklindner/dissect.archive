@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import struct
 import sys
+import zlib
 
 import pytest
 
@@ -10,6 +11,7 @@ from dissect.archive.tibx.c_tibx import LZ4_BLOCK_HEADER_SIZE, c_tibx
 from dissect.archive.tibx.codec import (
     decompress_cell_stream,
     decompress_linked_lz4,
+    decompress_zlib,
     decompress_zstd,
     lz4_block_decompress,
 )
@@ -64,6 +66,21 @@ def test_zstd_bound_enforced() -> None:
 def test_zstd_garbage_rejected() -> None:
     with pytest.raises(CorruptArchiveError):
         decompress_zstd(b"\x00" * 64, 1024)
+
+
+def test_zlib_roundtrip() -> None:
+    assert decompress_zlib(zlib.compress(PLAIN), len(PLAIN)) == PLAIN
+
+
+def test_zlib_bound_enforced() -> None:
+    stream = zlib.compress(PLAIN)
+    with pytest.raises(CorruptArchiveError):
+        decompress_zlib(stream, len(PLAIN) - 1)
+
+
+def test_zlib_garbage_rejected() -> None:
+    with pytest.raises(CorruptArchiveError):
+        decompress_zlib(b"\x00" * 64, 1024)
 
 
 def test_lz4_block_with_dictionary() -> None:

@@ -14,10 +14,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from dissect.archive.tibx.c_tibx import c_tibx
 from dissect.archive.tibx.map import Extent, ExtentTable, load_extents, load_segment_index
 from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX, find_split_parts, resolve_extents
 from tests._tools.tibx._synth import (
-    COMP_NONE,
     PAGE,
     Cell,
     CountingIO,
@@ -525,14 +525,6 @@ def test_version_set_file_table(tmp_path: Path, use_ctree: bool) -> None:
         assert result["holes"] == 7  # the compacted logical range of the base file
 
 
-@pytest.mark.parametrize("compression", [0x0002, 0x0003], ids=["variant2", "variant3"])
-def test_comp_stored_variants(compression: int) -> None:
-    # Metadata-stream variants observed in real archives, only ever stored verbatim
-    data = b"metadata stream content" * 5
-    tibx = _open(build_lsm_archive([ExtentSpec(10, 0, data)], compression=compression))
-    assert tibx.streams()[0].read(0, len(data)) == data
-
-
 def _ntfs_boot(total_sectors: int, sector_size: int = 512) -> bytes:
     """A boot sector just complete enough for _boot_sector_size to size the volume."""
     boot = bytearray(512)
@@ -711,7 +703,7 @@ def test_close_releases_the_index() -> None:
 def test_open_without_zstd(monkeypatch: pytest.MonkeyPatch) -> None:
     # Below Python 3.14 zstd comes from backports.zstd, which only the full extra installs.
     # Opening an archive and reading what is not zstd-compressed must not need it.
-    archive = build_lsm_archive([ExtentSpec(10, 0, b"A" * 0x1000)], compression=COMP_NONE)
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"A" * 0x1000)], compression=c_tibx.ComprAlg.NONE)
     zstd_archive = build_lsm_archive([ExtentSpec(10, 0, b"A" * 0x1000)])
 
     for name in ("backports", "backports.zstd", "compression", "compression.zstd"):

@@ -50,10 +50,17 @@ enum EncrAlg : uint8 {
 };
 
 enum ComprLvl : uint8 {
-  NONE   = 0,  // "none"
-  LOW    = 1,  // "low"
-  NORMAL = 2,  // "normal"
-  HIGH   = 3   // "high"
+    NONE   = 0,  // "none"
+    LOW    = 1,  // "low"
+    NORMAL = 2,  // "normal"
+    HIGH   = 3   // "high"
+};
+
+enum ComprAlg : uint8 {
+    NONE   = 0,
+    LZ4    = 1,
+    ZLIB   = 2,
+    ZSTD   = 3
 };
 
 struct page_header {
@@ -98,7 +105,8 @@ struct segment_header {
     uint32      length;                 /* uncompressed payload size */
     uint32      zlength;                /* compressed payload size */
     uint32      key_id;                 /* encryption key id, 0 = plaintext */
-    uint16      compression;            /* see COMP_* */
+    ComprAlg    compression;            /* compression codec */
+    uint8       _kind;                  /* unknown, observed 0x00, 0x01, 0x02, 0x03 */
     uint16      cache;                  /* cache hint flags */
 };
 
@@ -325,15 +333,6 @@ SEGMENT_FIRST_PAGE_PAYLOAD = PAGE_SIZE - SEGMENT_PAYLOAD_OFFSET
 
 SEGMENT_CBC_HEADER_SIZE = len(c_tibx.segment_cbc_header)
 SEGMENT_GCM_HEADER_SIZE = len(c_tibx.segment_gcm_header)
-
-# segment_header.compression variants
-COMP_NONE = 0x0000
-COMP_LZ4 = 0x0001
-# Observed in True Image 2026 metadata streams (2 in partition backups, 3 in device
-# metadata of USB sources), only ever stored (zlength == length); compressed forms of
-# these variants have not been seen in the wild
-COMP_STORED_VARIANTS = frozenset({0x0002, 0x0003})
-COMP_ZSTD = frozenset({0x0300, 0x0301, 0x0302, 0x0303})
 
 # Extents sharing a segment (extent_index != 0xFFFF) are concatenated in index order,
 # each aligned up to this boundary (empirical: exact fit on all observed segments)

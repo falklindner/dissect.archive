@@ -5,14 +5,25 @@ import random
 
 import pytest
 
-from dissect.archive.tibx.exception import CorruptArchiveError, InvalidPasswordError
+from dissect.archive.tibx.c_tibx import SEGMENT_HEADER_OFFSET, c_tibx
+from dissect.archive.tibx.exception import CorruptArchiveError, InvalidPasswordError, UnsupportedFormatError
 from dissect.archive.tibx.page import PageStore
 from dissect.archive.tibx.segment import Segment, read_plaintext
-from tests._tools.tibx._synth import COMP_NONE, PAGE, CountingIO, arch_page, segment_pages
+from tests._tools.tibx._synth import PAGE, CountingIO, arch_page, finalize, segment_pages
 
 
 def _store(*pages: bytes) -> PageStore:
     return PageStore(io.BytesIO(arch_page(1000, 2000, b"\xab" * 16) + b"".join(pages)))
+
+
+def _with_header(page: bytes, **fields: int) -> bytes:
+    """``page`` with the given segment header fields replaced."""
+    pg = bytearray(page)
+    header = c_tibx.segment_header(bytes(pg[SEGMENT_HEADER_OFFSET:]))
+    for name, value in fields.items():
+        setattr(header, name, value)
+    pg[SEGMENT_HEADER_OFFSET : SEGMENT_HEADER_OFFSET + len(c_tibx.segment_header)] = header.dumps()
+    return finalize(pg)
 
 
 def test_single_page_segment() -> None:
@@ -57,8 +68,39 @@ def test_segment_page_count_only_sizes_the_read(page_count: int) -> None:
 
 def test_stored_segment() -> None:
     payload = b"\x01\x02\x03\x04" * 100
-    store = _store(*segment_pages(payload, compression=COMP_NONE))
+    store = _store(*segment_pages(payload, compression=c_tibx.ComprAlg.NONE))
     assert read_plaintext(store, 1) == payload
+
+
+@pytest.mark.parametrize(
+    "compression",
+    [c_tibx.ComprAlg.NONE, c_tibx.ComprAlg.LZ4, c_tibx.ComprAlg.ZLIB, c_tibx.ComprAlg.ZSTD],
+    ids=["stored", "lz4", "zlib", "zstd"],
+)
+@pytest.mark.parametrize("kind", [0, 1, 2, 3])
+def test_segment_codec(compression: c_tibx.ComprAlg, kind: int) -> None:
+    # Only the codec byte decides the decoding: real archives carry kinds 0-3 with any codec
+    payload = random.Random(0).randbytes(PAGE) + b"\x00" * PAGE
+    pages = segment_pages(payload, compression=compression, kind=kind)
+    segment = Segment(pages[0], 1)
+    assert segment.compression == compression
+    assert segment.kind == kind
+    assert read_plaintext(_store(*pages), 1) == payload
+
+
+def test_stored_segment_length_mismatch() -> None:
+    # Stored is stored whatever the kind: a payload shorter than the length is damage
+    pages = segment_pages(b"x" * 100, compression=c_tibx.ComprAlg.NONE, kind=1)
+    store = _store(_with_header(pages[0], length=200))
+    with pytest.raises(CorruptArchiveError, match="zlength 100 != length 200"):
+        read_plaintext(store, 1)
+
+
+def test_unknown_codec_rejected() -> None:
+    pages = segment_pages(b"x" * 100, compression=c_tibx.ComprAlg.NONE)
+    store = _store(_with_header(pages[0], compression=c_tibx.ComprAlg(4)))
+    with pytest.raises(UnsupportedFormatError, match="unknown compression 0x04"):
+        read_plaintext(store, 1)
 
 
 def test_segment_header_fields() -> None:
@@ -68,7 +110,9 @@ def test_segment_header_fields() -> None:
     assert segment.length == 100
     assert segment.key_id == 0
     assert not segment.encrypted
-    assert segment.compression == 0x0300
+    assert segment.compression == c_tibx.ComprAlg.ZSTD
+    assert segment.kind == 0
+    assert pages[0][SEGMENT_HEADER_OFFSET + 16 : SEGMENT_HEADER_OFFSET + 18] == b"\x03\x00"
 
 
 def test_non_segment_page_rejected() -> None:

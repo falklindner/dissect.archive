@@ -19,8 +19,8 @@ the prefix that variant calls for, a :class:`c_tibx.segment_cbc_header` or a
 to a block boundary; GCM leaves it exactly as long as the plaintext, so a GCM segment's
 ``zlength`` is its ``length`` plus that prefix.
 
-Either way the plaintext is a zstd frame (or stored bytes when the segment's compression
-is NONE).
+Either way the plaintext is what the segment's codec wrote: a zstd frame, an LZ4 block, a
+zlib stream, or the stored bytes when the codec is NONE.
 
 Ported from ``acronis-tib-reader`` (MIT License, Copyright (c) 2026 the tibread
 contributors, https://github.com/TreadingTheTiber/acronis-tib-reader) and ``acronis-tibx``

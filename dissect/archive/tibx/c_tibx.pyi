@@ -29,6 +29,12 @@ class _c_tibx(__cs__.cstruct):
         NORMAL = ...
         HIGH = ...
 
+    class ComprAlg(__cs__.Enum):
+        NONE = ...
+        LZ4 = ...
+        ZLIB = ...
+        ZSTD = ...
+
     class page_header(__cs__.Structure):
         marker: _c_tibx.uint8
         type: _c_tibx.PageType
@@ -98,7 +104,8 @@ class _c_tibx(__cs__.cstruct):
         length: _c_tibx.uint32
         zlength: _c_tibx.uint32
         key_id: _c_tibx.uint32
-        compression: _c_tibx.uint16
+        compression: _c_tibx.ComprAlg
+        _kind: _c_tibx.uint8
         cache: _c_tibx.uint16
         @overload
         def __init__(
@@ -108,7 +115,8 @@ class _c_tibx(__cs__.cstruct):
             length: _c_tibx.uint32 | None = ...,
             zlength: _c_tibx.uint32 | None = ...,
             key_id: _c_tibx.uint32 | None = ...,
-            compression: _c_tibx.uint16 | None = ...,
+            compression: _c_tibx.ComprAlg | None = ...,
+            _kind: _c_tibx.uint8 | None = ...,
             cache: _c_tibx.uint16 | None = ...,
         ): ...
         @overload
@@ -517,11 +525,6 @@ SEGMENT_FIRST_PAGE_PAYLOAD: int
 
 SEGMENT_CBC_HEADER_SIZE: int
 SEGMENT_GCM_HEADER_SIZE: int
-
-COMP_NONE: Literal[0x0000]
-COMP_LZ4: Literal[0x0001]
-COMP_STORED_VARIANTS: frozenset[int]
-COMP_ZSTD: frozenset[int]
 
 EXTENT_ALIGNMENT: Literal[16]
 

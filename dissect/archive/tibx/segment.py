@@ -6,8 +6,7 @@ page (4052 bytes) spill onto continuation DATA pages, each contributing its 4088
 body.
 
 Ported from ``acronis-tib-reader`` (MIT License, Copyright (c) 2026 the tibread
-contributors, https://github.com/TreadingTheTiber/acronis-tib-reader), with the
-``comp=0x0001`` variant from ``acronis-tibx`` (MIT License, Copyright (c) 2026 mniedermaier).
+contributors, https://github.com/TreadingTheTiber/acronis-tib-reader).
 """
 
 from __future__ import annotations
@@ -15,10 +14,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from dissect.archive.tibx.c_tibx import (
-    COMP_LZ4,
-    COMP_NONE,
-    COMP_STORED_VARIANTS,
-    COMP_ZSTD,
     ENVELOPE_SIZE,
     PAGE_BODY_SIZE,
     SEGMENT_FIRST_PAGE_PAYLOAD,
@@ -28,7 +23,7 @@ from dissect.archive.tibx.c_tibx import (
     SEGMENT_PAYLOAD_OFFSET,
     c_tibx,
 )
-from dissect.archive.tibx.codec import decompress_zstd, lz4_block_decompress
+from dissect.archive.tibx.codec import decompress_zlib, decompress_zstd, lz4_block_decompress
 from dissect.archive.tibx.exception import (
     CorruptArchiveError,
     InvalidPasswordError,
@@ -61,11 +56,13 @@ class Segment:
         self.zlength = self.header.zlength
         self.key_id = self.header.key_id
         self.compression = self.header.compression
+        self.kind = self.header._kind
 
     def __repr__(self) -> str:
         return (
             f"<Segment page={self.page_index} length={self.length} zlength={self.zlength} "
-            f"compression={self.compression:#06x}{' encrypted' if self.encrypted else ''}>"
+            f"compression={int(self.compression):#04x} kind={self.kind:#04x}"
+            f"{' encrypted' if self.encrypted else ''}>"
         )
 
 
@@ -115,40 +112,34 @@ def read_compressed(store: PageStore, segment: Segment, continuation: list[bytes
 
 
 def decompress(raw: bytes, segment: Segment) -> bytes:
-    """Decompress a segment's raw payload to exactly ``segment.length`` plaintext bytes."""
-    if segment.compression == COMP_NONE:
+    """Decompress a segment's raw payload to exactly ``segment.length`` plaintext bytes.
+
+    Dispatches only on the codec byte; ``segment.kind`` plays no part in decoding.
+    """
+    alg = segment.compression
+
+    if alg == c_tibx.ComprAlg.NONE:
         if len(raw) != segment.length:
             raise CorruptArchiveError(
                 f"stored segment at page {segment.page_index} has zlength {len(raw)} != length {segment.length}"
             )
         return raw
 
-    if segment.compression == COMP_LZ4 or segment.compression in COMP_STORED_VARIANTS:
-        # Stored verbatim when there was no compression gain; the metadata variants
-        # have only ever been observed stored
-        if segment.zlength == segment.length:
-            return raw
-        if segment.compression in COMP_STORED_VARIANTS:
+    match alg:
+        case c_tibx.ComprAlg.LZ4:
+            out = lz4_block_decompress(raw, segment.length)
+        case c_tibx.ComprAlg.ZLIB:
+            out = decompress_zlib(raw, segment.length)
+        case c_tibx.ComprAlg.ZSTD:
+            out = decompress_zstd(raw, segment.length)
+        case _:
             raise UnsupportedFormatError(
-                f"segment at page {segment.page_index} uses compression variant "
-                f"{segment.compression:#06x} in compressed form, which has not been observed before"
+                f"segment at page {segment.page_index} uses unknown compression {int(alg):#04x} (kind {segment.kind})"
             )
-        out = lz4_block_decompress(raw, segment.length)
-        if len(out) != segment.length:
-            raise CorruptArchiveError(
-                f"LZ4 segment at page {segment.page_index} decoded {len(out)} bytes, expected {segment.length}"
-            )
-        return out
 
-    if segment.compression not in COMP_ZSTD:
-        raise UnsupportedFormatError(
-            f"segment at page {segment.page_index} uses unknown compression {segment.compression:#06x}"
-        )
-
-    out = decompress_zstd(raw, segment.length)
     if len(out) != segment.length:
         raise CorruptArchiveError(
-            f"zstd segment at page {segment.page_index} decoded {len(out)} bytes, expected {segment.length}"
+            f"{alg.name} segment at page {segment.page_index} decoded {len(out)} bytes, expected {segment.length}"
         )
     return out
 
@@ -174,22 +165,18 @@ def read_plaintext(store: PageStore, page_index: int, data_key: DataKey | None =
         from dissect.archive.tibx.crypto import decrypt_segment
 
         plaintext = decrypt_segment(read_compressed(store, segment, pages[1:]), data_key)
-        if segment.compression in COMP_ZSTD:
+        if segment.compression == c_tibx.ComprAlg.ZSTD:
             # zstd frame parsing ignores any trailing CBC/PKCS#7 padding
             out = decompress_zstd(plaintext, segment.length)
         else:
-            # Stored or LZ4: CBC leaves PKCS#7 padding to strip, GCM is already exact -- and
-            # unpadding it there would eat real bytes whenever the payload happens to end in
-            # a valid padding pattern.
+            # Stored, LZ4 or zlib: CBC leaves PKCS#7 padding to strip, GCM is already exact --
+            # and unpadding it there would eat real bytes whenever the payload happens to end
+            # in a valid padding pattern.
             payload = plaintext if data_key.gcm else _pkcs7_unpad(plaintext)
-            if segment.compression == COMP_LZ4 and len(payload) != segment.length:
-                out = lz4_block_decompress(payload, segment.length)
-            elif segment.compression in (COMP_NONE, COMP_LZ4) or segment.compression in COMP_STORED_VARIANTS:
+            if segment.compression == c_tibx.ComprAlg.NONE:
                 out = payload[: segment.length]
             else:
-                raise UnsupportedFormatError(
-                    f"encrypted segment at page {page_index} uses compression {segment.compression:#06x}"
-                )
+                out = decompress(payload, segment)
         # As for a plaintext segment: a short result is damage, not data to zero-fill
         if len(out) != segment.length:
             raise CorruptArchiveError(

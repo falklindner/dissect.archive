@@ -21,6 +21,7 @@ from __future__ import annotations
 import io
 import struct
 import sys
+import zlib
 from typing import TYPE_CHECKING, NamedTuple
 
 from dissect.archive.tibx.c_tibx import (
@@ -51,10 +52,6 @@ PAGE = 0x1000
 BODY = PAGE - ENVELOPE_SIZE
 
 SEG_PAYLOAD = b"hello synthetic volume" * 8
-
-COMP_NONE = 0x0000
-COMP_STORED_VARIANTS = (0x0002, 0x0003)
-COMP_ZSTD = 0x0300
 
 FORMAT_PASSWORD = 0x01
 
@@ -98,8 +95,20 @@ def data_page(payload: bytes) -> bytes:
     return pages[0]
 
 
+def lz4_literals(data: bytes) -> bytes:
+    """An LZ4 block holding ``data`` as literals only, the simplest valid encoding."""
+    if len(data) < 15:
+        return bytes([len(data) << 4]) + data
+    rest = len(data) - 15
+    return b"\xf0" + b"\xff" * (rest // 255) + bytes([rest % 255]) + data
+
+
 def segment_pages(
-    payload: bytes, compression: int = COMP_ZSTD, data_key: bytes | None = None, alg: int = 3
+    payload: bytes,
+    compression: c_tibx.ComprAlg = c_tibx.ComprAlg.ZSTD,
+    data_key: bytes | None = None,
+    alg: int = 3,
+    kind: int = 0,
 ) -> list[bytes]:
     """Build the DATA page(s) of one segment: header page + continuation pages.
 
@@ -108,12 +117,16 @@ def segment_pages(
     random IV and PKCS#7-pads, a GCM id (5-7) prepends the IV and the tag and leaves the
     ciphertext exactly as long as the plaintext.
     """
-    if compression == COMP_ZSTD:
+    if compression == c_tibx.ComprAlg.ZSTD:
         blob = zstd.compress(payload)
-    elif compression == COMP_NONE or compression in COMP_STORED_VARIANTS:
-        blob = payload  # all stored verbatim (the variants are only ever observed stored)
+    elif compression == c_tibx.ComprAlg.LZ4:
+        blob = lz4_literals(payload)
+    elif compression == c_tibx.ComprAlg.ZLIB:
+        blob = zlib.compress(payload)
+    elif compression == c_tibx.ComprAlg.NONE:
+        blob = payload
     else:
-        raise ValueError(f"unsupported synthetic compression {compression:#06x}")
+        raise ValueError(f"unsupported synthetic compression {compression:#04x}")
 
     if data_key is not None:
         from Crypto.Cipher import AES
@@ -132,7 +145,13 @@ def segment_pages(
 
     first = blank_page(c_tibx.PageType.DATA)
     header = c_tibx.segment_header(
-        magic=magic, version=version, length=len(payload), zlength=len(blob), key_id=key_id, compression=compression
+        magic=magic,
+        version=version,
+        length=len(payload),
+        zlength=len(blob),
+        key_id=key_id,
+        compression=compression,
+        _kind=kind,
     )
     first[SEGMENT_HEADER_OFFSET : SEGMENT_HEADER_OFFSET + len(c_tibx.segment_header)] = header.dumps()
     first_take = min(len(blob), PAGE - SEGMENT_PAYLOAD_OFFSET)
@@ -546,7 +565,7 @@ def build_lsm_archive(
     extents: list[ExtentSpec],
     *,
     use_ctree: bool = False,
-    compression: int = COMP_ZSTD,
+    compression: c_tibx.ComprAlg = c_tibx.ComprAlg.ZSTD,
     uuid: bytes = b"\xab" * 16,
     password: bytes | None = None,
     alg: int = 3,
@@ -633,7 +652,7 @@ def _segments_and_maps(
     extents: list[ExtentSpec],
     *,
     start_page: int,
-    compression: int,
+    compression: c_tibx.ComprAlg,
     data_key: bytes | None,
     alg: int = 3,
 ) -> tuple[list[bytes], list[Cell], list[Cell], int]:

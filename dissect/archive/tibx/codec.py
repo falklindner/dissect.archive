@@ -1,6 +1,6 @@
 """Decompression codecs used by TIBX.
 
-- Data segments: a single zstd frame (or LZ4 / stored, per the segment header).
+- Data segments: a single zstd frame, or LZ4, zlib or stored, per the segment header.
 - LSM cell streams and mem-tree blobs: **linked-LZ4** -- a chain of blocks
   ``[compressed BE u32][uncompressed BE u32][payload]`` where each block may
   back-reference previously decompressed output as its LZ4 dictionary
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import struct
 import sys
+import zlib
 
 from dissect.util.compression import lz4
 from dissect.util.exceptions import CorruptDataError
@@ -62,6 +63,18 @@ def decompress_zstd(data: bytes, max_output: int) -> bytes:
         raise CorruptArchiveError(f"zstd: {e}")
     if len(out) > max_output:
         raise CorruptArchiveError(f"zstd output exceeds {max_output}-byte cap (malformed frame?)")
+    return out
+
+
+def decompress_zlib(data: bytes, max_output: int) -> bytes:
+    """Decompress one zlib stream, bounded by ``max_output``."""
+    try:
+        decompressor = zlib.decompressobj()
+        out = decompressor.decompress(data, max_output + 1)
+    except zlib.error as e:
+        raise CorruptArchiveError(f"zlib: {e}")
+    if len(out) > max_output:
+        raise CorruptArchiveError(f"zlib output exceeds {max_output}-byte cap (malformed stream?)")
     return out
 
 
