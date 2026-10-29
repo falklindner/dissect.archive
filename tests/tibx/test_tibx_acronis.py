@@ -10,11 +10,17 @@ import hashlib
 
 import pytest
 
+from dissect.archive.tibx.c_tibx import c_tibx
 from dissect.archive.tibx.exception import InvalidPasswordError
+from dissect.archive.tibx.map import load_segment_index
+from dissect.archive.tibx.segment import Segment
 from dissect.archive.tibx.tibx import TIBX
 from tests.conftest import absolute_path
 
 PASSWORD = "dissect"
+
+# Incompressible segments are stored at every compression level
+STORED_AND_ZSTD = {c_tibx.ComprAlg.NONE, c_tibx.ComprAlg.ZSTD}
 
 
 def _open(name: str) -> TIBX:
@@ -59,6 +65,37 @@ def test_acronis_archive(name: str, backups: list[str], volumes: int) -> None:
 def test_acronis_volume_content(name: str, digest: str) -> None:
     with _open(name) as tibx:
         assert _sha256(tibx, 0x4) == digest
+
+
+@pytest.mark.parametrize(
+    ("name", "level", "codecs"),
+    [
+        ("t1_simple_ntfs", c_tibx.ComprLvl.HIGH, STORED_AND_ZSTD),
+        ("t1_empty_ntfs", c_tibx.ComprLvl.NORMAL, STORED_AND_ZSTD),
+        ("t1_stored", c_tibx.ComprLvl.NONE, {c_tibx.ComprAlg.NONE}),
+        ("t1_enc_aes", c_tibx.ComprLvl.NORMAL, STORED_AND_ZSTD),
+        ("t1_disk_mbr", c_tibx.ComprLvl.NORMAL, STORED_AND_ZSTD),
+        ("t1_disk_gpt", c_tibx.ComprLvl.NORMAL, STORED_AND_ZSTD),
+        ("t1_multivol", c_tibx.ComprLvl.NORMAL, STORED_AND_ZSTD),
+        ("t1_chain_inc", c_tibx.ComprLvl.NORMAL, STORED_AND_ZSTD),
+        ("t1_chain_diff", c_tibx.ComprLvl.NORMAL, STORED_AND_ZSTD),
+    ],
+)
+def test_acronis_segments(name: str, level: c_tibx.ComprLvl, codecs: set[c_tibx.ComprAlg]) -> None:
+    # Every segment decodes to the length its header records
+    with _open(name) as tibx:
+        if tibx.encrypted:
+            tibx.unlock(PASSWORD)
+        assert tibx.root.compr_lvl == level
+
+        index = load_segment_index(tibx.store, tibx.header)
+        seen = set()
+        for segment_id in index:
+            page_index = index[segment_id].page_offset
+            segment = Segment(tibx.store.read_run(page_index, 1)[0], page_index)
+            assert len(tibx.read_segment(segment_id)) == segment.length
+            seen.add(segment.compression)
+        assert seen == codecs
 
 
 def test_acronis_encrypted() -> None:
