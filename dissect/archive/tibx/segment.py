@@ -56,12 +56,12 @@ class Segment:
         self.zlength = self.header.zlength
         self.key_id = self.header.key_id
         self.compression = self.header.compression
-        self.kind = self.header._kind
+        self.cache = self.header.cache
 
     def __repr__(self) -> str:
         return (
             f"<Segment page={self.page_index} length={self.length} zlength={self.zlength} "
-            f"compression={int(self.compression):#04x} kind={self.kind:#04x}"
+            f"compression={int(self.compression):#04x} cache={self.cache:#04x}"
             f"{' encrypted' if self.encrypted else ''}>"
         )
 
@@ -114,7 +114,7 @@ def read_compressed(store: PageStore, segment: Segment, continuation: list[bytes
 def decompress(raw: bytes, segment: Segment) -> bytes:
     """Decompress a segment's raw payload to exactly ``segment.length`` plaintext bytes.
 
-    Dispatches only on the codec byte; ``segment.kind`` plays no part in decoding.
+    Dispatches only on the codec byte; ``segment.cache`` plays no part in decoding.
     """
     alg = segment.compression
 
@@ -134,7 +134,8 @@ def decompress(raw: bytes, segment: Segment) -> bytes:
             out = decompress_zstd(raw, segment.length)
         case _:
             raise UnsupportedFormatError(
-                f"segment at page {segment.page_index} uses unknown compression {int(alg):#04x} (kind {segment.kind})"
+                f"segment at page {segment.page_index} uses unknown compression {int(alg):#04x} "
+                f"(cache {segment.cache:#04x})"
             )
 
     if len(out) != segment.length:

@@ -77,20 +77,20 @@ def test_stored_segment() -> None:
     [c_tibx.ComprAlg.NONE, c_tibx.ComprAlg.LZ4, c_tibx.ComprAlg.ZLIB, c_tibx.ComprAlg.ZSTD],
     ids=["stored", "lz4", "zlib", "zstd"],
 )
-@pytest.mark.parametrize("kind", [0, 1, 2, 3])
-def test_segment_codec(compression: c_tibx.ComprAlg, kind: int) -> None:
-    # Only the codec byte decides the decoding: real archives carry kinds 0-3 with any codec
+@pytest.mark.parametrize("cache", [0, 1, 2, 3])
+def test_segment_codec(compression: c_tibx.ComprAlg, cache: int) -> None:
+    # Only the codec byte decides the decoding: real archives carry cache 0-3 with any codec
     payload = random.Random(0).randbytes(PAGE) + b"\x00" * PAGE
-    pages = segment_pages(payload, compression=compression, kind=kind)
+    pages = segment_pages(payload, compression=compression, cache=cache)
     segment = Segment(pages[0], 1)
     assert segment.compression == compression
-    assert segment.kind == kind
+    assert segment.cache == cache
     assert read_plaintext(_store(*pages), 1) == payload
 
 
 def test_stored_segment_length_mismatch() -> None:
-    # Stored is stored whatever the kind: a payload shorter than the length is damage
-    pages = segment_pages(b"x" * 100, compression=c_tibx.ComprAlg.NONE, kind=1)
+    # Stored is stored whatever the cache hint: a payload shorter than the length is damage
+    pages = segment_pages(b"x" * 100, compression=c_tibx.ComprAlg.NONE, cache=1)
     store = _store(_with_header(pages[0], length=200))
     with pytest.raises(CorruptArchiveError, match="zlength 100 != length 200"):
         read_plaintext(store, 1)
@@ -111,7 +111,7 @@ def test_segment_header_fields() -> None:
     assert segment.key_id == 0
     assert not segment.encrypted
     assert segment.compression == c_tibx.ComprAlg.ZSTD
-    assert segment.kind == 0
+    assert segment.cache == 0
     assert pages[0][SEGMENT_HEADER_OFFSET + 16 : SEGMENT_HEADER_OFFSET + 18] == b"\x03\x00"
 
 

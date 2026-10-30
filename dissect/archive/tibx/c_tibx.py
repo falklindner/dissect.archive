@@ -106,8 +106,7 @@ struct segment_header {
     uint32      zlength;                /* compressed payload size */
     uint32      key_id;                 /* encryption key id, 0 = plaintext */
     ComprAlg    compression;            /* compression codec */
-    uint8       _kind;                  /* unknown, observed 0x00, 0x01, 0x02, 0x03 */
-    uint16      cache;                  /* cache hint flags */
+    uint8       cache;                  /* cache hint flags */
 };
 
 /* Prefix of an encrypted ("SE") segment payload, ahead of the ciphertext. Which one

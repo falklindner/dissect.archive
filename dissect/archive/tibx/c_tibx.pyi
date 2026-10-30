@@ -105,8 +105,7 @@ class _c_tibx(__cs__.cstruct):
         zlength: _c_tibx.uint32
         key_id: _c_tibx.uint32
         compression: _c_tibx.ComprAlg
-        _kind: _c_tibx.uint8
-        cache: _c_tibx.uint16
+        cache: _c_tibx.uint8
         @overload
         def __init__(
             self,
@@ -116,8 +115,7 @@ class _c_tibx(__cs__.cstruct):
             zlength: _c_tibx.uint32 | None = ...,
             key_id: _c_tibx.uint32 | None = ...,
             compression: _c_tibx.ComprAlg | None = ...,
-            _kind: _c_tibx.uint8 | None = ...,
-            cache: _c_tibx.uint16 | None = ...,
+            cache: _c_tibx.uint8 | None = ...,
         ): ...
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...

@@ -108,7 +108,7 @@ def segment_pages(
     compression: c_tibx.ComprAlg = c_tibx.ComprAlg.ZSTD,
     data_key: bytes | None = None,
     alg: int = 3,
-    kind: int = 0,
+    cache: int = 0,
 ) -> list[bytes]:
     """Build the DATA page(s) of one segment: header page + continuation pages.
 
@@ -151,7 +151,7 @@ def segment_pages(
         zlength=len(blob),
         key_id=key_id,
         compression=compression,
-        _kind=kind,
+        cache=cache,
     )
     first[SEGMENT_HEADER_OFFSET : SEGMENT_HEADER_OFFSET + len(c_tibx.segment_header)] = header.dumps()
     first_take = min(len(blob), PAGE - SEGMENT_PAYLOAD_OFFSET)
