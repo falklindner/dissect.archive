@@ -70,6 +70,38 @@ struct page_header {
     uint32      crc32c;                 /* CRC-32C of the page, checksum bytes zeroed */
 };
 
+/* TLV[5] "slices" record: one backup of the archive. Every data_map extent carries this
+ * key's slice id in its own slice_id, to say which backup wrote it. The guid is the one
+ * "acrocmd list backups" prints for the backup, and is stored mixed-endian. */
+struct slice_key {
+    uint32      slice_id;
+};
+
+struct slice_record {
+    char        guid[16];
+    uint64      ctime_ms;               /* backup start, ms since the Unix epoch */
+    uint64      ftime_ms;               /* backup finish, ms since the Unix epoch */
+    uint64      user_size;              /* uncompressed bytes of the backup */
+    uint64      compr_size;             /* compressed bytes of the backup */
+    uint32      last_full_sid;          /* 1 in all samples */
+    uint32      base_full_sid;          /* 0 in all samples, even for a differential backup */
+    uint32      items_added;
+    uint32      items_changed;
+    uint32      items_removed;
+    uint8       flags;                  /* low 7 bits: type (1 full, 6 incremental, 10 differential); bit 7: deleted */
+    uint64      last_segment_id;        /* last segment id of the backup */
+    uint32      features;               /* see `slice_features2str()` */
+    uint64      data_size;              /* data bytes on disk, observed; 0 in True Image 2020 */
+    char        _reserved[43];          /* zero */
+};
+
+/* A slice record as the ARCH header carries it, with extra metadata */
+struct arch_slice {
+    slice_record    slice;
+    uint32          sid;                /* slice id */
+    uint32          encr_key_id;
+};
+
 /* Start of an ARCH header body, i.e. of an ARCH page after its envelope. The TLV
  * directory follows at TLV_DIRECTORY_OFFSET into the body. */
 struct arch_header {
@@ -78,13 +110,54 @@ struct arch_header {
     uint16      header_version;         /* 8 in current archives */
     ComprLvl    compr_lvl;
     EncrAlg     encr_alg;
-    uint8_t     dedup;                  /* 0 = "off", 1 = "on" */
-    uint8_t     hash_alg;
-    uint8_t     chunking_alg;
-    uint8_t     hash_window_width;
+    uint8       dedup;                  /* 0 = "off", 1 = "on" */
+    uint8       hash_alg;
+    uint8       chunking_alg;
+    uint8       hash_window_width;
     uint64      created_ms;             /* creation time, ms since Unix epoch */
     uint64      modified_ms;            /* commit time, ms since Unix epoch */
     char        archive_uuid[16];
+    uint64      archive_size;           /* ar_io_get_archive_size(): file size at this commit */
+    uint64      last_item_id;
+    uint64      last_segment_id;
+    uint32      next_sid;
+    uint32      slice_count;
+    uint32      slices_to_delete;
+    uint32      first_unfinished_sid;   /* observed: the latest backup's sid, even once complete */
+    arch_slice  cur_slice;
+    uint32      cur_extent_count;       /* data_map extents the last backup wrote */
+    arch_slice  last_slice;
+    uint32      ar_flags;               /* set by `ar_flags_set_write_mode()` */
+    uint64      commit_seq;
+    uint64      reuse_seq;
+    uint64      commit_info_seq;
+    uint64      first_ci_offset;
+    uint64      first_hdr_offset;
+    uint64      prev_hdr_offset;        /* the previous commit root, -1 for the first */
+    uint64      ci_offset;              /* offset to the commit info (CI) page for this ARCH */
+    uint64      space_usage_data;       /* data bytes on disk */
+    uint64      unused_space;           /* grows by 0x3000 (three header pages) per commit */
+    uint64      deallocated_space;
+    uint64      split_size;             /* 0xfffffffffffff000 when not split */
+    uint64      compr_size;             /* compressed bytes */
+    uint64      user_size;              /* uncompressed bytes */
+    uint64      features;
+    uint64      features_ro;
+    uint64      features_rw;
+    uint64      full_begin_seg_id;      /* segment id range of the full backup */
+    uint64      full_end_seg_id;
+    uint64      diff_begin_seg_id;
+    uint64      chain_start_pg;         /* first page of a differential chain */
+    uint8       notary_degree;
+    uint8       notary_hash_alg;
+    uint8       notary_flags;
+    uint64      notary_last_item_id;
+    uint64      _unk_223;
+    uint64      _unk_22b;
+    uint32      reuse_delay;
+    uint64      next_reuse_seq;
+    uint64      next_reuse_time;
+    uint64      encr_mtime;
 };
 
 struct arch_superblock {
@@ -206,20 +279,6 @@ struct segment_map_value {
     uint32      page_offset;            /* page index of the segment's header page */
     uint32      slice_id;
     char        hash[20];
-};
-
-/* TLV[5] "slices" record: one backup of the archive. Every data_map extent carries this
- * key's slice id in its own slice_id, to say which backup wrote it. The record is longer
- * than the value struct below; only the leading fields are understood. The guid is the one
- * "acrocmd list backups" prints for the backup, and is stored mixed-endian. */
-struct slice_key {
-    uint32      slice_id;
-};
-
-struct slice_record {
-    char        guid[16];
-    uint64      created_ms;             /* ms since the Unix epoch */
-    uint64      modified_ms;
 };
 
 /* Password-wrapped data key, stored in the keymap tree (TLV[7]) mem-tree. The wrapped

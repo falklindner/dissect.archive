@@ -99,17 +99,17 @@ class RecoveryPoint:
         self._record = record
 
     def __repr__(self) -> str:
-        return f"<RecoveryPoint index={self.index} slice={self.slice_id} guid={self.guid} modified={self.modified}>"
+        return f"<RecoveryPoint index={self.index} slice={self.slice_id} guid={self.guid} finished={self.finished}>"
 
     @property
     def created(self) -> datetime.datetime:
         """When this backup started."""
-        return datetime.datetime.fromtimestamp(self._record.created_ms / 1000, datetime.timezone.utc)
+        return datetime.datetime.fromtimestamp(self._record.ctime_ms / 1000, datetime.timezone.utc)
 
     @property
-    def modified(self) -> datetime.datetime:
+    def finished(self) -> datetime.datetime:
         """When this backup finished."""
-        return datetime.datetime.fromtimestamp(self._record.modified_ms / 1000, datetime.timezone.utc)
+        return datetime.datetime.fromtimestamp(self._record.ftime_ms / 1000, datetime.timezone.utc)
 
 
 class TIBX:

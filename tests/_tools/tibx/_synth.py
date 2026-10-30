@@ -550,15 +550,9 @@ class ExtentSpec(NamedTuple):
     segment_group: int | None = None
 
 
-# TLV[5] slices records are fixed width; only the leading fields are understood, and real
-# archives pad the rest out to this length.
-SLICE_VALUE_LENGTH = 132
-
-
-def slice_record(guid: bytes, created_ms: int, modified_ms: int) -> bytes:
+def slice_record(guid: bytes, created_ms: int, finished_ms: int) -> bytes:
     """One TLV[5] slices record value: a backup's GUID and its start/finish times."""
-    body = c_tibx.slice_record(guid=guid, created_ms=created_ms, modified_ms=modified_ms).dumps()
-    return body + b"\x00" * (SLICE_VALUE_LENGTH - len(body))
+    return c_tibx.slice_record(guid=guid, ctime_ms=created_ms, ftime_ms=finished_ms).dumps()
 
 
 def build_lsm_archive(
@@ -606,7 +600,7 @@ def build_lsm_archive(
         # GUIDs and times are derived from the slice id so a test can predict them.
         slots[5] = lsb(
             4,
-            SLICE_VALUE_LENGTH,
+            len(c_tibx.slice_record),
             memtree_cells=[
                 Cell(
                     c_tibx.slice_key(slice_id=slice_id).dumps(),

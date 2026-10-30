@@ -10,7 +10,6 @@ from dissect.archive.tibx.exception import InvalidArchiveError
 from dissect.archive.tibx.tibx import TIBX
 from tests._tools.tibx._synth import (
     PAGE,
-    SLICE_VALUE_LENGTH,
     Cell,
     ExtentSpec,
     build_lsm_archive,
@@ -37,6 +36,11 @@ def _chain() -> TIBX:
     return TIBX(io.BytesIO(archive))
 
 
+def test_slice_record_size() -> None:
+    # Ensure that the slice_record struct remains correct size
+    assert len(c_tibx.slice_record) == 0x84
+
+
 def test_recovery_points_are_backups_not_commit_roots() -> None:
     # Acronis writes a varying number of ARCH commit roots per backup, so counting roots
     # invents recovery points that were never taken. The slices tree is the archive's own
@@ -54,7 +58,7 @@ def test_recovery_point_carries_guid_and_times() -> None:
 
     assert point.guid == uuid.UUID(bytes_le=bytes([3]) * 16)
     assert point.created.timestamp() == pytest.approx(3.0)
-    assert point.modified.timestamp() == pytest.approx(3.01)
+    assert point.finished.timestamp() == pytest.approx(3.01)
 
 
 def test_latest_is_default() -> None:
@@ -126,7 +130,7 @@ def test_recovery_points_from_memtree_and_ctrees() -> None:
     leaf_page = len(build_lsm_archive(extents)) // PAGE
     slices = lsb(
         4,
-        SLICE_VALUE_LENGTH,
+        len(c_tibx.slice_record),
         memtree_cells=[cell(3, 0x33)],  # newer than the ctree's record of slice 3
         ctrees=[(leaf_page * PAGE, 3)],
     )

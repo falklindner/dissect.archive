@@ -51,6 +51,65 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
+    class slice_key(__cs__.Structure):
+        slice_id: _c_tibx.uint32
+        @overload
+        def __init__(self, slice_id: _c_tibx.uint32 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class slice_record(__cs__.Structure):
+        guid: __cs__.CharArray
+        ctime_ms: _c_tibx.uint64
+        ftime_ms: _c_tibx.uint64
+        user_size: _c_tibx.uint64
+        compr_size: _c_tibx.uint64
+        last_full_sid: _c_tibx.uint32
+        base_full_sid: _c_tibx.uint32
+        items_added: _c_tibx.uint32
+        items_changed: _c_tibx.uint32
+        items_removed: _c_tibx.uint32
+        flags: _c_tibx.uint8
+        last_segment_id: _c_tibx.uint64
+        features: _c_tibx.uint32
+        data_size: _c_tibx.uint64
+        _reserved: __cs__.CharArray
+        @overload
+        def __init__(
+            self,
+            guid: __cs__.CharArray | None = ...,
+            ctime_ms: _c_tibx.uint64 | None = ...,
+            ftime_ms: _c_tibx.uint64 | None = ...,
+            user_size: _c_tibx.uint64 | None = ...,
+            compr_size: _c_tibx.uint64 | None = ...,
+            last_full_sid: _c_tibx.uint32 | None = ...,
+            base_full_sid: _c_tibx.uint32 | None = ...,
+            items_added: _c_tibx.uint32 | None = ...,
+            items_changed: _c_tibx.uint32 | None = ...,
+            items_removed: _c_tibx.uint32 | None = ...,
+            flags: _c_tibx.uint8 | None = ...,
+            last_segment_id: _c_tibx.uint64 | None = ...,
+            features: _c_tibx.uint32 | None = ...,
+            data_size: _c_tibx.uint64 | None = ...,
+            _reserved: __cs__.CharArray | None = ...,
+        ): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class arch_slice(__cs__.Structure):
+        slice: _c_tibx.slice_record
+        sid: _c_tibx.uint32
+        encr_key_id: _c_tibx.uint32
+        @overload
+        def __init__(
+            self,
+            slice: _c_tibx.slice_record | None = ...,
+            sid: _c_tibx.uint32 | None = ...,
+            encr_key_id: _c_tibx.uint32 | None = ...,
+        ): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
     class arch_header(__cs__.Structure):
         magic: __cs__.CharArray
         header_size: _c_tibx.uint32
@@ -64,6 +123,47 @@ class _c_tibx(__cs__.cstruct):
         created_ms: _c_tibx.uint64
         modified_ms: _c_tibx.uint64
         archive_uuid: __cs__.CharArray
+        archive_size: _c_tibx.uint64
+        last_item_id: _c_tibx.uint64
+        last_segment_id: _c_tibx.uint64
+        next_sid: _c_tibx.uint32
+        slice_count: _c_tibx.uint32
+        slices_to_delete: _c_tibx.uint32
+        first_unfinished_sid: _c_tibx.uint32
+        cur_slice: _c_tibx.arch_slice
+        cur_extent_count: _c_tibx.uint32
+        last_slice: _c_tibx.arch_slice
+        ar_flags: _c_tibx.uint32
+        commit_seq: _c_tibx.uint64
+        reuse_seq: _c_tibx.uint64
+        commit_info_seq: _c_tibx.uint64
+        first_ci_offset: _c_tibx.uint64
+        first_hdr_offset: _c_tibx.uint64
+        prev_hdr_offset: _c_tibx.uint64
+        ci_offset: _c_tibx.uint64
+        space_usage_data: _c_tibx.uint64
+        unused_space: _c_tibx.uint64
+        deallocated_space: _c_tibx.uint64
+        split_size: _c_tibx.uint64
+        compr_size: _c_tibx.uint64
+        user_size: _c_tibx.uint64
+        features: _c_tibx.uint64
+        features_ro: _c_tibx.uint64
+        features_rw: _c_tibx.uint64
+        full_begin_seg_id: _c_tibx.uint64
+        full_end_seg_id: _c_tibx.uint64
+        diff_begin_seg_id: _c_tibx.uint64
+        chain_start_pg: _c_tibx.uint64
+        notary_degree: _c_tibx.uint8
+        notary_hash_alg: _c_tibx.uint8
+        notary_flags: _c_tibx.uint8
+        notary_last_item_id: _c_tibx.uint64
+        _unk_223: _c_tibx.uint64
+        _unk_22b: _c_tibx.uint64
+        reuse_delay: _c_tibx.uint32
+        next_reuse_seq: _c_tibx.uint64
+        next_reuse_time: _c_tibx.uint64
+        encr_mtime: _c_tibx.uint64
         @overload
         def __init__(
             self,
@@ -79,6 +179,47 @@ class _c_tibx(__cs__.cstruct):
             created_ms: _c_tibx.uint64 | None = ...,
             modified_ms: _c_tibx.uint64 | None = ...,
             archive_uuid: __cs__.CharArray | None = ...,
+            archive_size: _c_tibx.uint64 | None = ...,
+            last_item_id: _c_tibx.uint64 | None = ...,
+            last_segment_id: _c_tibx.uint64 | None = ...,
+            next_sid: _c_tibx.uint32 | None = ...,
+            slice_count: _c_tibx.uint32 | None = ...,
+            slices_to_delete: _c_tibx.uint32 | None = ...,
+            first_unfinished_sid: _c_tibx.uint32 | None = ...,
+            cur_slice: _c_tibx.arch_slice | None = ...,
+            cur_extent_count: _c_tibx.uint32 | None = ...,
+            last_slice: _c_tibx.arch_slice | None = ...,
+            ar_flags: _c_tibx.uint32 | None = ...,
+            commit_seq: _c_tibx.uint64 | None = ...,
+            reuse_seq: _c_tibx.uint64 | None = ...,
+            commit_info_seq: _c_tibx.uint64 | None = ...,
+            first_ci_offset: _c_tibx.uint64 | None = ...,
+            first_hdr_offset: _c_tibx.uint64 | None = ...,
+            prev_hdr_offset: _c_tibx.uint64 | None = ...,
+            ci_offset: _c_tibx.uint64 | None = ...,
+            space_usage_data: _c_tibx.uint64 | None = ...,
+            unused_space: _c_tibx.uint64 | None = ...,
+            deallocated_space: _c_tibx.uint64 | None = ...,
+            split_size: _c_tibx.uint64 | None = ...,
+            compr_size: _c_tibx.uint64 | None = ...,
+            user_size: _c_tibx.uint64 | None = ...,
+            features: _c_tibx.uint64 | None = ...,
+            features_ro: _c_tibx.uint64 | None = ...,
+            features_rw: _c_tibx.uint64 | None = ...,
+            full_begin_seg_id: _c_tibx.uint64 | None = ...,
+            full_end_seg_id: _c_tibx.uint64 | None = ...,
+            diff_begin_seg_id: _c_tibx.uint64 | None = ...,
+            chain_start_pg: _c_tibx.uint64 | None = ...,
+            notary_degree: _c_tibx.uint8 | None = ...,
+            notary_hash_alg: _c_tibx.uint8 | None = ...,
+            notary_flags: _c_tibx.uint8 | None = ...,
+            notary_last_item_id: _c_tibx.uint64 | None = ...,
+            _unk_223: _c_tibx.uint64 | None = ...,
+            _unk_22b: _c_tibx.uint64 | None = ...,
+            reuse_delay: _c_tibx.uint32 | None = ...,
+            next_reuse_seq: _c_tibx.uint64 | None = ...,
+            next_reuse_time: _c_tibx.uint64 | None = ...,
+            encr_mtime: _c_tibx.uint64 | None = ...,
         ): ...
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
@@ -291,27 +432,6 @@ class _c_tibx(__cs__.cstruct):
             page_offset: _c_tibx.uint32 | None = ...,
             slice_id: _c_tibx.uint32 | None = ...,
             hash: __cs__.CharArray | None = ...,
-        ): ...
-        @overload
-        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
-
-    class slice_key(__cs__.Structure):
-        slice_id: _c_tibx.uint32
-        @overload
-        def __init__(self, slice_id: _c_tibx.uint32 | None = ...): ...
-        @overload
-        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
-
-    class slice_record(__cs__.Structure):
-        guid: __cs__.CharArray
-        created_ms: _c_tibx.uint64
-        modified_ms: _c_tibx.uint64
-        @overload
-        def __init__(
-            self,
-            guid: __cs__.CharArray | None = ...,
-            created_ms: _c_tibx.uint64 | None = ...,
-            modified_ms: _c_tibx.uint64 | None = ...,
         ): ...
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
