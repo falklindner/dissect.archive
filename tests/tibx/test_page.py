@@ -8,7 +8,7 @@ from dissect.util import ts
 from dissect.archive.tibx.c_tibx import PAGE_MARKER, PAGE_SIZE, c_tibx
 from dissect.archive.tibx.exception import CorruptArchiveError, InvalidArchiveError
 from dissect.archive.tibx.page import PageStore, SuperBlock, page_crc32c
-from tests._tools.tibx._synth import SEG_PAYLOAD, CountingIO, arch_page, build_archive, data_page
+from tests._tools.tibx._synth import SEG_PAYLOAD, CountingIO, arch_page, arci_page, build_archive, data_page
 
 
 def test_rejects_non_tibx() -> None:
@@ -23,13 +23,15 @@ def test_rejects_short_file() -> None:
 
 def test_page_access_and_types() -> None:
     store = PageStore(io.BytesIO(build_archive()))
-    assert store.page_count == 2
-    assert store.size == 2 * PAGE_SIZE
+    assert store.page_count == 3
+    assert store.size == 3 * PAGE_SIZE
     assert store.page_type(0) == c_tibx.PageType.ARCH
     assert store.page_type(1) == c_tibx.PageType.DATA
+    assert store.page_type(2) == c_tibx.PageType.ARCI
     assert store.page_type_name(0) == "ARCH"
     assert store.page_type_name(1) == "DATA"
-    assert [i for i, _ in store.pages()] == [0, 1]
+    assert store.page_type_name(2) == "ARCI"
+    assert [i for i, _ in store.pages()] == [0, 1, 2]
     assert store.page(0)[8:12] == b"ARCH"
 
 
@@ -41,8 +43,8 @@ def test_reads_returned_in_parts() -> None:
 
     archive = build_archive()
     store = PageStore(Trickle(archive))
-    assert store.read_run(0, 2) == [archive[:PAGE_SIZE], archive[PAGE_SIZE:]]
-    assert store.page(1) == archive[PAGE_SIZE:]
+    assert store.read_run(0, 2) == [archive[:PAGE_SIZE], archive[PAGE_SIZE : 2 * PAGE_SIZE]]
+    assert store.page(1) == archive[PAGE_SIZE : 2 * PAGE_SIZE]
     assert store.live_root().offset == 0
 
 
@@ -64,8 +66,8 @@ def test_superblock_rejects_non_arch() -> None:
 def test_verify_all_pages_ok() -> None:
     result = PageStore(io.BytesIO(build_archive())).verify()
     assert result["bad"] == 0
-    assert result["ok"] == 2
-    assert result["by_type"] == {"ARCH": 1, "DATA": 1}
+    assert result["ok"] == 3
+    assert result["by_type"] == {"ARCH": 1, "DATA": 1, "ARCI": 1}
 
 
 def test_verify_detects_corruption() -> None:
@@ -98,9 +100,14 @@ def test_live_root_skips_torn_final_commit() -> None:
 
 @pytest.mark.parametrize("trailing", [0, 15, 16, 47, 48, 5000])
 def test_live_root_far_from_eof(trailing: int) -> None:
-    # The newest root can be far from EOF -- 84k pages in one real archive -- and is found
-    # in growing chunks, not a read per page. The counts put the root on chunk boundaries.
-    data = arch_page(1000, 2000, b"\x01" * 16) + arch_page(3000, 5000, b"\x02" * 16)
+    # The newest commit can be far from EOF -- 84k pages in one real archive -- and is found
+    # in growing chunks, not a read per page. The counts put its commit info on chunk
+    # boundaries.
+    data = (
+        arch_page(1000, 2000, b"\x01" * 16)
+        + arch_page(3000, 5000, b"\x02" * 16, ci_offset=2 * PAGE_SIZE)
+        + arci_page(PAGE_SIZE, b"\x02" * 16, commit_seq=1)
+    )
     fh = CountingIO(data + data_page(SEG_PAYLOAD) * trailing)
     store = PageStore(fh)
     fh.reads = 0
@@ -108,7 +115,9 @@ def test_live_root_far_from_eof(trailing: int) -> None:
     root = store.live_root()
     assert root.offset == PAGE_SIZE
     assert root.modified_ms == 5000
-    assert fh.reads <= 10  # one per page before: up to 5001
+    # A read per chunk of the scan, where there was one per page before: up to 5002. Plus
+    # one for CI0 and one for the header of the commit info found
+    assert fh.reads <= 12
 
 
 def test_live_root_all_roots_torn() -> None:

@@ -165,6 +165,45 @@ struct arch_superblock {
     arch_header body;
 };
 
+/* A file of a split archive other than the first: its number -- the -NNNN in its file
+ * name -- and where it starts in the archive as a whole. Index 0 is an unused entry. */
+struct arci_volume {
+    uint32      index;
+    uint64      start_offs;
+};
+
+flag ArciFlags : uint32 {
+    REWRITE     = 0x1,                  /* ar_mode rewrite; append mode if clear */
+    CI0         = 0x2                   /* marks the CI0 page: it names the newest commit */
+};
+
+/* Commit info ("ARCI"), the body of the page written right after each commit's ARCH header.
+ * It points back at that header (arch_offset, arch_size), the header's ci_offset points at
+ * it, and prev_ci_offset chains the commit info pages back to the first one. */
+struct arci_header {
+    char        magic[4];               /* "ARCI" */
+    uint16      version;                /* 8 in current archives */
+    uint16      _pad;
+    ArciFlags   flags;
+    uint32      arch_size;              /* total size of the ARCH superblock, divide by 0x1000 = number of pages */
+    uint64      arch_offset;            /* offset to ARCH page */
+    uint64      commit_seq;             /* commit sequence number */
+    uint64      reuse_seq;
+    uint64      ci_seq;                 /* sequence number of the commit info write, CI0 rewrites included */
+    uint64      first_ci_offset;        /* offset to the first commit info page */
+    uint64      prev_ci_offset;         /* offset to previous commit info page; the newest in a rewritten CI0 */
+    uint64      crc64;                  /* CRC-64 (Redis) of the page's first 512 bytes, both checksums zeroed */
+    uint64      volume_offset;          /* offset of this page within its own file of the archive */
+    arci_volume volumes[4];             /* files of the archive, in no order and possibly repeated; index 0 = unused */
+    uint128     uuid;
+    uint128     session;
+};
+
+struct arci_page {
+    page_header header;
+    arci_header commit_info;
+};
+
 /* One TLV directory entry: the payload follows, and the next entry starts at the next
  * 4-byte boundary after it */
 struct tlv_header {

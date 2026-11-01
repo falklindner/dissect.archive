@@ -232,6 +232,74 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
+    class arci_volume(__cs__.Structure):
+        index: _c_tibx.uint32
+        start_offs: _c_tibx.uint64
+        @overload
+        def __init__(self, index: _c_tibx.uint32 | None = ..., start_offs: _c_tibx.uint64 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class ArciFlags(__cs__.Flag):
+        REWRITE = ...
+        CI0 = ...
+
+    class arci_header(__cs__.Structure):
+        magic: __cs__.CharArray
+        version: _c_tibx.uint16
+        _pad: _c_tibx.uint16
+        flags: _c_tibx.ArciFlags
+        arch_size: _c_tibx.uint32
+        arch_offset: _c_tibx.uint64
+        commit_seq: _c_tibx.uint64
+        reuse_seq: _c_tibx.uint64
+        ci_seq: _c_tibx.uint64
+        first_ci_offset: _c_tibx.uint64
+        prev_ci_offset: _c_tibx.uint64
+        crc64: _c_tibx.uint64
+        volume_offset: _c_tibx.uint64
+        class arci_volume(__cs__.Structure):
+            index: _c_tibx.uint32
+            start_offs: _c_tibx.uint64
+            @overload
+            def __init__(self, index: _c_tibx.uint32 | None = ..., start_offs: _c_tibx.uint64 | None = ...): ...
+            @overload
+            def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+        volumes: __cs__.Array[arci_volume]
+        uuid: _c_tibx.uint128
+        session: _c_tibx.uint128
+        @overload
+        def __init__(
+            self,
+            magic: __cs__.CharArray | None = ...,
+            version: _c_tibx.uint16 | None = ...,
+            _pad: _c_tibx.uint16 | None = ...,
+            flags: _c_tibx.ArciFlags | None = ...,
+            arch_size: _c_tibx.uint32 | None = ...,
+            arch_offset: _c_tibx.uint64 | None = ...,
+            commit_seq: _c_tibx.uint64 | None = ...,
+            reuse_seq: _c_tibx.uint64 | None = ...,
+            ci_seq: _c_tibx.uint64 | None = ...,
+            first_ci_offset: _c_tibx.uint64 | None = ...,
+            prev_ci_offset: _c_tibx.uint64 | None = ...,
+            crc64: _c_tibx.uint64 | None = ...,
+            volume_offset: _c_tibx.uint64 | None = ...,
+            volumes: __cs__.Array[arci_volume] | None = ...,
+            uuid: _c_tibx.uint128 | None = ...,
+            session: _c_tibx.uint128 | None = ...,
+        ): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class arci_page(__cs__.Structure):
+        header: _c_tibx.page_header
+        commit_info: _c_tibx.arci_header
+        @overload
+        def __init__(self, header: _c_tibx.page_header | None = ..., commit_info: _c_tibx.arci_header | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
     class tlv_header(__cs__.Structure):
         length: _c_tibx.uint32
         @overload

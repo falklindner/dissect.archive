@@ -26,7 +26,7 @@ classifiers = [
 ]
 dependencies = [
     "dissect.cstruct>=4,<5",
-    "dissect.util>=3.25.dev10,<4",  # TODO: Update on release!
+    "dissect.util>=3.25.dev18,<4",  # TODO: Update on release!
 ]
 dynamic = ["version"]
 
@@ -44,7 +44,7 @@ full = [
 dev = [
     "dissect.archive[full]",
     "dissect.cstruct>=4.0.dev,<5.0.dev",
-    "dissect.util>=3.25.dev10,<4.0.dev",  # TODO: Update on release!
+    "dissect.util>=3.25.dev18,<4.0.dev",  # TODO: Update on release!
 ]
 
 [dependency-groups]

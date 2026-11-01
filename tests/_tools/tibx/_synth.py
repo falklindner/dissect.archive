@@ -38,7 +38,7 @@ from dissect.archive.tibx.c_tibx import (
     TLV_SLOT_COUNT,
     c_tibx,
 )
-from dissect.archive.tibx.page import page_crc32c
+from dissect.archive.tibx.page import ARCI_CRC64_OFFSET, FIRST_CI_OFFSET, arci_crc64, page_crc32c
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -79,11 +79,38 @@ def finalize(pg: bytearray) -> bytes:
     return bytes(pg)
 
 
-def arch_page(created_ms: int, modified_ms: int, uuid: bytes) -> bytes:
-    """Build a minimal valid ARCH superblock page (no TLV directory)."""
+def arch_page(created_ms: int, modified_ms: int, uuid: bytes, ci_offset: int = 0) -> bytes:
+    """Build a minimal valid ARCH superblock page (no TLV directory).
+
+    ``ci_offset`` is where its commit info is, 0 for a header without one.
+    """
     pg = blank_page(c_tibx.PageType.ARCH)
-    body = c_tibx.arch_header(magic=b"ARCH", created_ms=created_ms, modified_ms=modified_ms, archive_uuid=uuid)
+    body = c_tibx.arch_header(
+        magic=b"ARCH", created_ms=created_ms, modified_ms=modified_ms, archive_uuid=uuid, ci_offset=ci_offset
+    )
     pg[ENVELOPE_SIZE : ENVELOPE_SIZE + len(c_tibx.arch_header)] = body.dumps()
+    return finalize(pg)
+
+
+def arci_page(arch_offset: int, uuid: bytes, commit_seq: int = 0, prev_ci_offset: int = 0) -> bytes:
+    """Build the commit info page of the single-page ARCH header at byte ``arch_offset``.
+
+    Written without CI0.
+    """
+    pg = blank_page(c_tibx.PageType.ARCI)
+    body = c_tibx.arci_header(
+        magic=b"ARCI",
+        version=8,
+        arch_size=PAGE,
+        arch_offset=arch_offset,
+        commit_seq=commit_seq,
+        ci_seq=commit_seq,
+        first_ci_offset=FIRST_CI_OFFSET,
+        prev_ci_offset=prev_ci_offset,
+        uuid=int.from_bytes(uuid, "big"),
+    )
+    pg[ENVELOPE_SIZE : ENVELOPE_SIZE + len(c_tibx.arci_header)] = body.dumps()
+    pg[ARCI_CRC64_OFFSET : ARCI_CRC64_OFFSET + 8] = c_tibx.uint64.dumps(arci_crc64(bytes(pg)))
     return finalize(pg)
 
 
@@ -193,8 +220,8 @@ def wrap_data_key(data_key: bytes, password: bytes, iter_log2: int = 12, alg: in
 
 
 def build_archive(uuid: bytes = b"\xab" * 16) -> bytes:
-    """Build the minimal two-page archive: one ARCH root + one DATA page."""
-    return arch_page(1000, 2000, uuid) + data_page(SEG_PAYLOAD)
+    """Build the minimal three-page archive: one ARCH root, one DATA page and CI0, its commit info."""
+    return arch_page(1000, 2000, uuid, ci_offset=FIRST_CI_OFFSET) + data_page(SEG_PAYLOAD) + arci_page(0, uuid)
 
 
 class CountingIO(io.BytesIO):
@@ -464,6 +491,7 @@ def arch_header_page(
     created_ms: int = 1000,
     modified_ms: int = 2000,
     uuid: bytes = b"\xab" * 16,
+    ci_offset: int = 0,
 ) -> bytes:
     """Build a full ARCH commit-root page with a TLV directory (single page)."""
     directory = tlv_directory(slots)
@@ -479,6 +507,7 @@ def arch_header_page(
         created_ms=created_ms,
         modified_ms=modified_ms,
         archive_uuid=uuid,
+        ci_offset=ci_offset,
     )
     pg[ENVELOPE_SIZE : ENVELOPE_SIZE + len(c_tibx.arch_header)] = body.dumps()
     sequence = ENVELOPE_SIZE + ARCH_COMMIT_SEQUENCE_OFFSET
@@ -615,8 +644,10 @@ def build_lsm_archive(
     if extra_slots:
         slots.update(extra_slots)
 
-    header = arch_header_page(slots, uuid=uuid)
-    return header + b"".join(pages)
+    # The commit info follows the data, at the end of the archive as Acronis leaves it
+    ci_offset = (page_base + 1 + len(pages)) * PAGE
+    header = arch_header_page(slots, uuid=uuid, ci_offset=ci_offset)
+    return header + b"".join(pages) + arci_page(page_base * PAGE, uuid, commit_seq=1, prev_ci_offset=FIRST_CI_OFFSET)
 
 
 def file_table(offsets: list[int]) -> bytes:
