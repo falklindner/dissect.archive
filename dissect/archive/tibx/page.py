@@ -40,6 +40,11 @@ if TYPE_CHECKING:
 ARCH_MAGIC = b"ARCH"
 ARCI_MAGIC = b"ARCI"
 
+# The page types as plain ints, for the page sweeps: looking up c_tibx.PageType and comparing
+# against it costs ~0.3 us per page, 25 ms of a 30 ms sweep over 84k pages
+_ARCH_TYPE = int(c_tibx.PageType.ARCH)
+_ARCI_TYPE = int(c_tibx.PageType.ARCI)
+
 # The first commit info is at page 2 (offset 0x2000), after the first commit's two-page ARCH header
 FIRST_CI_OFFSET = 2 * PAGE_SIZE
 
@@ -55,8 +60,8 @@ SCAN_CHUNK_MAX_PAGES = 1024
 
 # ENVELOPE PARSING -- page envelopes go through :class:`c_tibx.page_header` everywhere
 # except the page sweeps -- :func:`_is_valid_page`, :meth:`PageStore._last_ci`,
-# :meth:`PageStore._scan_commit_roots` and :meth:`PageStore._scan_commit_infos` -- which
-# index the envelope bytes directly.
+# :meth:`PageStore._last_arch`, :meth:`PageStore._scan_commit_roots` and
+# :meth:`PageStore._scan_commit_infos` -- which index the envelope bytes directly.
 #
 # cstruct costs ~3.6 us per envelope against ~0.33 us for the indexing, but that ratio is
 # not the one that matters; measured end to end on a 949 MiB archive (242,977 pages):
@@ -340,7 +345,7 @@ class PageStore:
         """
         for index, page in self._pages_backward():
             # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
-            if page[1] == c_tibx.PageType.ARCI and (ci := _commit_info(page, index * PAGE_SIZE)):
+            if page[1] == _ARCI_TYPE and (ci := _commit_info(page, index * PAGE_SIZE)):
                 return ci
         return None
 
@@ -350,7 +355,8 @@ class PageStore:
         Whether its commit was completed or not: this does not look at commit info at all.
         """
         for index, page in self._pages_backward():
-            if _is_valid_page(page, c_tibx.PageType.ARCH, ARCH_MAGIC):
+            # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
+            if page[1] == _ARCH_TYPE and _is_valid_page(page, _ARCH_TYPE, ARCH_MAGIC):
                 return SuperBlock(page, index * PAGE_SIZE)
         return None
 
@@ -417,7 +423,7 @@ class PageStore:
         roots = []
         for i, page in self.pages():
             # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
-            if page[0] == PAGE_MARKER and page[1] == c_tibx.PageType.ARCH and page[8:12] == ARCH_MAGIC:
+            if page[0] == PAGE_MARKER and page[1] == _ARCH_TYPE and page[8:12] == ARCH_MAGIC:
                 roots.append(SuperBlock(page, i * PAGE_SIZE))
         return roots
 
@@ -456,7 +462,7 @@ class PageStore:
         infos = []
         for i, page in self.pages():
             # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
-            if page[1] == c_tibx.PageType.ARCI and (ci := _commit_info(page, i * PAGE_SIZE)):
+            if page[1] == _ARCI_TYPE and (ci := _commit_info(page, i * PAGE_SIZE)):
                 infos.append(ci)
         return infos
 
