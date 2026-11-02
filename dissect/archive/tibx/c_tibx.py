@@ -243,12 +243,12 @@ struct lz4_block_header {
 /* LSM superblock (L-SB), carried as a TLV payload in the ARCH header body */
 struct lsm_superblock {
     char        magic[4];               /* "L-SB" */
-    uint8       format_version;
-    uint8       ctree_count_minus_2;
-    uint8       ctree_max_minus_2;
-    uint8       _reserved0;
+    uint8       format_version;         /* "ver" */
+    uint8       nr_ctree;               /* ctree slots in use, from the first */
+    uint8       nr_max_ctree;           /* ctree slots: LSB_CTREE_SLOTS */
+    uint8       _padding;
     uint32      seq;                    /* commit sequence */
-    uint32      ctree_size_hint;
+    uint32      max_ext_len;            /* longest extent: 1 MiB in the data_map, 0x3FFFFFFF in the umap, else 0 */
     uint32      key_length;             /* per-record key bytes (0 = variable) */
     uint32      value_length;           /* per-record value bytes */
     /* followed by LSB_CTREE_SLOTS x ctree_ref, then the mem-tree header */
@@ -256,16 +256,16 @@ struct lsm_superblock {
 
 struct ctree_ref {
     uint64      offset;                 /* root page byte offset; 0xFF..FF / 0 = empty */
-    uint64      num_pages;              /* bytes occupied by this ctree */
-    uint32      item_count;             /* number of leaf entries */
-    uint32      _reserved;
-    uint64      max_key_or_size;
+    uint64      tree_sz;                /* bytes the ctree takes */
+    uint32      seq;                    /* the L-SB seq the ctree was written at; its pages carry it too */
+    uint32      _padding;
+    uint64      tree_nr;                /* records in the ctree */
 };
 
 struct lsm_memtree_header {
     uint8       encoding;               /* low 7 bits codec (0 raw, 1 LZ4), bit 7 encrypted */
     uint8       _reserved;
-    uint16      node_count;             /* entries in the residual mem-tree */
+    uint16      node_count;             /* "c0_count": records in the mem tree */
     uint32      extra_len;              /* extra payload bytes after the fixed L-SB */
     uint32      uncompressed_size;      /* size of the decoded cell stream */
 };
@@ -296,7 +296,7 @@ struct lsm_page_header {
     uint16      cell_count;
     uint32      uncompressed_size;      /* size of the decoded cell stream */
     uint32      on_disk_size;           /* size of the stored cell stream */
-    uint32      key_size_param;
+    uint32      seq;                    /* seq of the ctree the page belongs to, checked on reading */
     LsmTag      tag;                    /* 'D' on data_map, 'S' on segment_map pages; 0 where not written */
     char        _reserved[3];
     /* zero pad up to LSM_CELL_STREAM_OFFSET, where the cell stream starts */

@@ -357,11 +357,11 @@ class _c_tibx(__cs__.cstruct):
     class lsm_superblock(__cs__.Structure):
         magic: __cs__.CharArray
         format_version: _c_tibx.uint8
-        ctree_count_minus_2: _c_tibx.uint8
-        ctree_max_minus_2: _c_tibx.uint8
-        _reserved0: _c_tibx.uint8
+        nr_ctree: _c_tibx.uint8
+        nr_max_ctree: _c_tibx.uint8
+        _padding: _c_tibx.uint8
         seq: _c_tibx.uint32
-        ctree_size_hint: _c_tibx.uint32
+        max_ext_len: _c_tibx.uint32
         key_length: _c_tibx.uint32
         value_length: _c_tibx.uint32
         @overload
@@ -369,11 +369,11 @@ class _c_tibx(__cs__.cstruct):
             self,
             magic: __cs__.CharArray | None = ...,
             format_version: _c_tibx.uint8 | None = ...,
-            ctree_count_minus_2: _c_tibx.uint8 | None = ...,
-            ctree_max_minus_2: _c_tibx.uint8 | None = ...,
-            _reserved0: _c_tibx.uint8 | None = ...,
+            nr_ctree: _c_tibx.uint8 | None = ...,
+            nr_max_ctree: _c_tibx.uint8 | None = ...,
+            _padding: _c_tibx.uint8 | None = ...,
             seq: _c_tibx.uint32 | None = ...,
-            ctree_size_hint: _c_tibx.uint32 | None = ...,
+            max_ext_len: _c_tibx.uint32 | None = ...,
             key_length: _c_tibx.uint32 | None = ...,
             value_length: _c_tibx.uint32 | None = ...,
         ): ...
@@ -382,18 +382,18 @@ class _c_tibx(__cs__.cstruct):
 
     class ctree_ref(__cs__.Structure):
         offset: _c_tibx.uint64
-        num_pages: _c_tibx.uint64
-        item_count: _c_tibx.uint32
-        _reserved: _c_tibx.uint32
-        max_key_or_size: _c_tibx.uint64
+        tree_sz: _c_tibx.uint64
+        seq: _c_tibx.uint32
+        _padding: _c_tibx.uint32
+        tree_nr: _c_tibx.uint64
         @overload
         def __init__(
             self,
             offset: _c_tibx.uint64 | None = ...,
-            num_pages: _c_tibx.uint64 | None = ...,
-            item_count: _c_tibx.uint32 | None = ...,
-            _reserved: _c_tibx.uint32 | None = ...,
-            max_key_or_size: _c_tibx.uint64 | None = ...,
+            tree_sz: _c_tibx.uint64 | None = ...,
+            seq: _c_tibx.uint32 | None = ...,
+            _padding: _c_tibx.uint32 | None = ...,
+            tree_nr: _c_tibx.uint64 | None = ...,
         ): ...
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
@@ -439,7 +439,7 @@ class _c_tibx(__cs__.cstruct):
         cell_count: _c_tibx.uint16
         uncompressed_size: _c_tibx.uint32
         on_disk_size: _c_tibx.uint32
-        key_size_param: _c_tibx.uint32
+        seq: _c_tibx.uint32
         tag: _c_tibx.LsmTag
         _reserved: __cs__.CharArray
         @overload
@@ -451,7 +451,7 @@ class _c_tibx(__cs__.cstruct):
             cell_count: _c_tibx.uint16 | None = ...,
             uncompressed_size: _c_tibx.uint32 | None = ...,
             on_disk_size: _c_tibx.uint32 | None = ...,
-            key_size_param: _c_tibx.uint32 | None = ...,
+            seq: _c_tibx.uint32 | None = ...,
             tag: _c_tibx.LsmTag | None = ...,
             _reserved: __cs__.CharArray | None = ...,
         ): ...

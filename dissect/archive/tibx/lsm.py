@@ -21,6 +21,7 @@ from dissect.archive.tibx.c_tibx import (
     ENVELOPE_SIZE,
     LDIR_VALUE_SIZE,
     LSB_CTREE_OFFSET,
+    LSB_CTREE_SLOTS,
     LSB_FIXED_SIZE,
     LSB_MEMTREE_OFFSET,
     LSM_CELL_GROUP_HEADER_SIZE,
@@ -55,8 +56,8 @@ class CTreeRef(NamedTuple):
     """One on-disk ctree (frozen LSM run) slot from an L-SB. ``offset`` is None if empty."""
 
     offset: int | None
-    num_pages: int
-    item_count: int
+    tree_sz: int
+    tree_nr: int
 
     @property
     def root_page(self) -> int | None:
@@ -90,23 +91,14 @@ class LsmSuperBlock:
         self.key_length = self.sb.key_length
         self.value_length = self.sb.value_length
 
-        ctree_count = self.sb.ctree_count_minus_2 + 2
         self.ctrees: list[CTreeRef] = []
-        for index in range(ctree_count):
+        for index in range(min(self.sb.nr_ctree, LSB_CTREE_SLOTS)):
             slot_offset = LSB_CTREE_OFFSET + index * len(c_tibx.ctree_ref)
             if slot_offset + len(c_tibx.ctree_ref) > len(payload):
                 break
             ref = c_tibx.ctree_ref(payload[slot_offset:])
-            empty = ref.offset == CTREE_EMPTY_SENTINEL or (
-                ref.offset == 0 and ref.num_pages == 0 and ref.item_count == 0
-            )
-            self.ctrees.append(
-                CTreeRef(
-                    offset=None if empty else ref.offset,
-                    num_pages=ref.num_pages,
-                    item_count=ref.item_count,
-                )
-            )
+            empty = ref.offset == CTREE_EMPTY_SENTINEL or (ref.offset == 0 and ref.tree_sz == 0 and ref.tree_nr == 0)
+            self.ctrees.append(CTreeRef(offset=None if empty else ref.offset, tree_sz=ref.tree_sz, tree_nr=ref.tree_nr))
 
         # Residual mem-tree: header after the ctree slots, blob after the fixed L-SB record
         self.memtree_encoding = 0
@@ -129,7 +121,7 @@ class LsmSuperBlock:
     def has_records(self) -> bool:
         """Whether this tree holds any records (mem-tree or on-disk ctrees)."""
         return self.memtree_node_count > 0 or any(
-            ctree.offset is not None and ctree.item_count > 0 for ctree in self.ctrees
+            ctree.offset is not None and ctree.tree_nr > 0 for ctree in self.ctrees
         )
 
 

@@ -6,7 +6,7 @@ import struct
 import pytest
 
 from dissect.archive.tibx import lsm
-from dissect.archive.tibx.c_tibx import ENVELOPE_SIZE, LSM_CELL_STREAM_OFFSET, c_tibx
+from dissect.archive.tibx.c_tibx import ENVELOPE_SIZE, LSB_CTREE_OFFSET, LSM_CELL_STREAM_OFFSET, c_tibx
 from dissect.archive.tibx.crypto import DataKey
 from dissect.archive.tibx.exception import CorruptArchiveError, InvalidPasswordError
 from dissect.archive.tibx.lsm import (
@@ -122,6 +122,16 @@ def test_lsb_parse_memtree_and_ctrees() -> None:
     assert not LsmSuperBlock(lsb(8, 4), tlv_index=1).has_records
 
 
+def test_lsb_ignores_slots_past_nr_ctree() -> None:
+    # Acronis reads only nr_ctree slots: a stale ctree past them is not part of the tree
+    payload = bytearray(lsb(8, 4, ctrees=[(3 * PAGE, 5)]))
+    slot = LSB_CTREE_OFFSET + len(c_tibx.ctree_ref)
+    payload[slot : slot + len(c_tibx.ctree_ref)] = c_tibx.ctree_ref(offset=9 * PAGE, tree_sz=PAGE, tree_nr=7).dumps()
+    sb = LsmSuperBlock(bytes(payload), tlv_index=1)
+    assert [ctree.root_page for ctree in sb.ctrees] == [3]
+    assert sb.ctrees[0].tree_nr == 5
+
+
 def test_leaf_page_cells() -> None:
     cells = [Cell(b"k" * 8, b"v" * 4)]
     page = lsm_page(0x03, b"LEAF", cells, key_length=8, compact=True)
@@ -163,7 +173,7 @@ def _unchecked_lsm_page(page_type: int, magic: bytes, cells: list[Cell], key_len
         cell_count=len(cells),
         uncompressed_size=len(stream),
         on_disk_size=len(stream),
-        key_size_param=key_length,
+        seq=1,
     )
     page[ENVELOPE_SIZE : ENVELOPE_SIZE + len(c_tibx.lsm_page_header)] = header.dumps()
     start = ENVELOPE_SIZE + LSM_CELL_STREAM_OFFSET

@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, NamedTuple
 from dissect.archive.tibx.c_tibx import (
     ENVELOPE_SIZE,
     LSB_CTREE_OFFSET,
+    LSB_CTREE_SLOTS,
     LSB_FIXED_SIZE,
     LSB_MEMTREE_OFFSET,
     LSM_CELL_GROUP_MAX,
@@ -445,7 +446,7 @@ def lsb(
 
     ``memtree_cells`` go into the residual mem-tree (raw compact stream unless an
     explicit pre-encoded ``memtree_blob`` + ``memtree_encoding`` is given);
-    ``ctrees`` is a list of ``(root_byte_offset, item_count)`` on-disk run slots.
+    ``ctrees`` is a list of ``(root_byte_offset, tree_nr)`` on-disk run slots.
     """
     memtree_cells = memtree_cells or []
     ctrees = ctrees or []
@@ -456,16 +457,16 @@ def lsb(
     superblock = c_tibx.lsm_superblock(
         magic=b"L-SB",
         format_version=1,
-        ctree_count_minus_2=max(2, len(ctrees)) - 2,
-        ctree_max_minus_2=10 - 2,
+        nr_ctree=len(ctrees),
+        nr_max_ctree=LSB_CTREE_SLOTS,
         seq=seq,
         key_length=key_length,
         value_length=value_length,
     )
     record[: len(c_tibx.lsm_superblock)] = superblock.dumps()
-    for i, (root_offset, item_count) in enumerate(ctrees):
+    for i, (root_offset, tree_nr) in enumerate(ctrees):
         slot = LSB_CTREE_OFFSET + i * len(c_tibx.ctree_ref)
-        ref = c_tibx.ctree_ref(offset=root_offset, num_pages=PAGE, item_count=item_count)
+        ref = c_tibx.ctree_ref(offset=root_offset, tree_sz=PAGE, tree_nr=tree_nr)
         record[slot : slot + len(c_tibx.ctree_ref)] = ref.dumps()
     memtree = c_tibx.lsm_memtree_header(
         encoding=memtree_encoding, node_count=len(memtree_cells), extra_len=len(memtree_blob)
@@ -530,7 +531,7 @@ def lsm_page(page_type: int, magic: bytes, cells: list[Cell], key_length: int, c
         cell_count=len(cells),
         uncompressed_size=len(stream),
         on_disk_size=len(stream),
-        key_size_param=key_length,
+        seq=1,
     )
     pg[ENVELOPE_SIZE : ENVELOPE_SIZE + len(c_tibx.lsm_page_header)] = header.dumps()
     start = ENVELOPE_SIZE + LSM_CELL_STREAM_OFFSET
