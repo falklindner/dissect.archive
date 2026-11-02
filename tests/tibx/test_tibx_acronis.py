@@ -17,8 +17,9 @@ import io
 
 import pytest
 
-from dissect.archive.tibx.c_tibx import PAGE_SIZE, c_tibx
+from dissect.archive.tibx.c_tibx import PAGE_SIZE, TLV_SEGMENT_MAP, c_tibx
 from dissect.archive.tibx.exception import InvalidPasswordError
+from dissect.archive.tibx.lsm import iter_tree_cells
 from dissect.archive.tibx.map import load_segment_index
 from dissect.archive.tibx.page import (
     ARCI_CRC64_OFFSET,
@@ -284,6 +285,19 @@ def test_acronis_sparse_volume(recovery_point: int, digest: str) -> None:
     with _open("ati_2020_disk_lz4_compr") as tibx:
         tibx.use_recovery_point(recovery_point)
         assert _sha256(tibx, 0xE) == digest
+
+
+@pytest.mark.parametrize("name", ["ati_2020_disk_lz4_compr", "ati_2020_disk_enc_lz4_compr"])
+def test_acronis_segment_hash(name: str) -> None:
+    # The segment_map holds the SHA-1 of each decompressed segment. Not in the t1_* samples,
+    # whose metainfo segments were scrubbed after Acronis hashed them.
+    with _open(name) as tibx:
+        if tibx.encrypted:
+            tibx.unlock(PASSWORD)
+        for cell in iter_tree_cells(tibx.store, tibx.header.tree(TLV_SEGMENT_MAP)):
+            segment_id = c_tibx.segment_map_key(cell.key).segment_id
+            digest = hashlib.sha1(tibx.read_segment(segment_id)).digest()
+            assert digest == c_tibx.segment_map_value(cell.value).hash
 
 
 @pytest.mark.parametrize("name", ARCHIVES)

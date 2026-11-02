@@ -56,7 +56,7 @@ class Segment:
         self.zlength = self.header.zlength
         self.key_id = self.header.key_id
         self.compression = self.header.compression
-        self.cache = self.header.cache
+        self.cache = self.header.cache_level
 
     def __repr__(self) -> str:
         return (

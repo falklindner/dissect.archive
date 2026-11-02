@@ -218,7 +218,7 @@ struct segment_header {
     uint32      zlength;                /* compressed payload size */
     uint32      key_id;                 /* encryption key id, 0 = plaintext */
     ComprAlg    compression;            /* compression codec */
-    uint8       cache;                  /* cache hint flags */
+    uint8       cache_level;            /* 0 data, 1 filesystem metadata, 2 Acronis metadata, 3 device */
 };
 
 /* Prefix of an encrypted ("SE") segment payload, ahead of the ciphertext. Which one
@@ -267,7 +267,25 @@ struct lsm_memtree_header {
     uint8       _reserved;
     uint16      node_count;             /* entries in the residual mem-tree */
     uint32      extra_len;              /* extra payload bytes after the fixed L-SB */
-    uint32      pages_total;
+    uint32      uncompressed_size;      /* size of the decoded cell stream */
+};
+
+/* Object tag of an LSM page */
+enum LsmTag : uint8 {
+    CI          = 0x43,                 /* 'C' ci (commit info) */
+    DATA_MAP    = 0x44,                 /* 'D' dmap */
+    HEADER      = 0x48,                 /* 'H' header */
+    LINK_MAP    = 0x4C,                 /* 'L' nlink_map */
+    NAME_MAP    = 0x4E,                 /* 'N' name_map */
+    SEGMENT_MAP = 0x53,                 /* 'S' segment_map */
+    UNUSED_MAP  = 0x55,                 /* 'U' umap */
+    DEDUP_MAP   = 0x64,                 /* 'd' dedup_map */
+    ENCR_MAP    = 0x65,                 /* 'e' keymap */
+    GOLOMB      = 0x67,                 /* 'g' golomb */
+    NOTARY_MAP  = 0x6E,                 /* 'n' notary */
+    OSTOR       = 0x6F,                 /* 'o' ostor */
+    SLICE_MAP   = 0x73,                 /* 's' smap */
+    DATA        = 0xFF                  /* data */
 };
 
 /* Inner header of a LEAF / LDIR page (at the start of the page body) */
@@ -279,7 +297,8 @@ struct lsm_page_header {
     uint32      uncompressed_size;      /* size of the decoded cell stream */
     uint32      on_disk_size;           /* size of the stored cell stream */
     uint32      key_size_param;
-    char        _sequence_id[4];        /* LE u32, unused here */
+    LsmTag      tag;                    /* 'D' on data_map, 'S' on segment_map pages; 0 where not written */
+    char        _reserved[3];
     /* zero pad up to LSM_CELL_STREAM_OFFSET, where the cell stream starts */
 };
 
@@ -314,10 +333,11 @@ struct segment_map_key {
 };
 
 struct segment_map_value {
-    char        page_count[4];          /* little-endian, unlike the rest of the record */
-    uint32      page_offset;            /* page index of the segment's header page */
-    uint32      slice_id;
-    char        hash[20];
+    uint64      page_count : 8;         /* pages the segment takes */
+    uint64      page_offset : 56;       /* page index of the segment's header page */
+    uint32      cache_level : 2;        /* equal to the segment header's cache_level in every sample */
+    uint32      refs : 30;              /* reference count: how many data_map records use the segment */
+    char        hash[20];               /* SHA-1 of the decompressed segment */
 };
 
 /* imap (TLV[0]) record key: one item of one backup, such as a disk, partition or file.

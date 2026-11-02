@@ -178,7 +178,7 @@ def segment_pages(
         zlength=len(blob),
         key_id=key_id,
         compression=compression,
-        cache=cache,
+        cache_level=cache,
     )
     first[SEGMENT_HEADER_OFFSET : SEGMENT_HEADER_OFFSET + len(c_tibx.segment_header)] = header.dumps()
     first_take = min(len(blob), PAGE - SEGMENT_PAYLOAD_OFFSET)
@@ -556,10 +556,8 @@ def segment_map_key(segment_id: int) -> bytes:
     return c_tibx.segment_map_key(segment_id=segment_id).dumps()
 
 
-def segment_map_value(page_count: int, page_offset: int, slice_id: int = 2) -> bytes:
-    return c_tibx.segment_map_value(
-        page_count=page_count.to_bytes(4, "little"), page_offset=page_offset, slice_id=slice_id
-    ).dumps()
+def segment_map_value(page_count: int, page_offset: int, refs: int = 1) -> bytes:
+    return c_tibx.segment_map_value(page_count=page_count, page_offset=page_offset, refs=refs).dumps()
 
 
 class ExtentSpec(NamedTuple):

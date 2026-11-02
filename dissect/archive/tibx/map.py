@@ -48,16 +48,15 @@ if TYPE_CHECKING:
 #
 # The layouts mirror c_tibx.data_map_key/_value and segment_map_key/_value (a test keeps
 # them in step). The 24-bit extent_length is split into its high byte and low 16 bits, and
-# the segment_map page_count, the record's one little-endian field, is left as bytes.
+# of the segment_map's 56-bit page_offset only the low 32 bits are read: its top bits are 0
+# below 2^32 pages, 16 TiB into the archive.
 _DATA_MAP_KEY = struct.Struct(">QQBHIQ")
 _DATA_MAP_RECORD = struct.Struct(">QQBHIQQH")
 # Array typecodes for the fields of _DATA_MAP_RECORD, and for those of Extent
 _DATA_MAP_TYPECODES = "QQBHIQQH"
 _EXTENT_TYPECODES = "QQQIQQH"
 _SEGMENT_MAP_KEY = struct.Struct(">Q")
-_SEGMENT_MAP_RECORD = struct.Struct(">Q4sI24x")
-# The same record with the page_count as a big-endian int, to unpack in bulk and byteswap after
-_SEGMENT_MAP_COLUMNS = struct.Struct(">QII24x")
+_SEGMENT_MAP_RECORD = struct.Struct(">QB3xI24x")
 
 # A record as decoded from a compact cell stream: the key and value fields of a live record,
 # the key fields alone of a tombstone
@@ -192,8 +191,7 @@ def _extent(fields: tuple) -> Extent:
 
 def decode_segment_locator(raw_key: bytes, raw_value: bytes) -> SegmentLocator:
     """Decode one raw segment_map (key, value) record."""
-    segment_id, page_count, page_offset = _SEGMENT_MAP_RECORD.unpack(raw_key + raw_value[:SEGMENT_MAP_VALUE_SIZE])
-    return SegmentLocator(segment_id, int.from_bytes(page_count, "little"), page_offset)
+    return SegmentLocator(*_SEGMENT_MAP_RECORD.unpack(raw_key + raw_value[:SEGMENT_MAP_VALUE_SIZE]))
 
 
 def _iter_compact_groups(raw: bytes, count: int, key: struct.Struct, record: struct.Struct) -> Iterator[bytes | Record]:
@@ -481,10 +479,7 @@ class _SegmentRun(NamedTuple):
 
 
 def _decode_segment_run(items: Iterable[bytes | Record], record: struct.Struct) -> _SegmentRun:
-    """One segment_map run from the items of :func:`_run_items`, unpacked with ``record``.
-
-    ``record`` reads the page_count as a big-endian int, like :data:`_SEGMENT_MAP_COLUMNS`.
-    """
+    """One segment_map run from the items of :func:`_run_items`, unpacked with ``record``."""
     ids, page_counts, page_offsets, deleted = array("Q"), array("I"), array("I"), array("Q")
     for item in items:
         if type(item) is bytes:
@@ -500,8 +495,6 @@ def _decode_segment_run(items: Iterable[bytes | Record], record: struct.Struct) 
                 page_offsets.append(fields[2])
             else:
                 deleted.append(fields[0])
-    # The page_count is the record's one little-endian field
-    page_counts.byteswap()
     if not all(map(lt, ids, islice(ids, 1, None))):
         # Out of id order, as in a damaged tree: the lookups bisect
         order = sorted(range(len(ids)), key=ids.__getitem__)
@@ -522,6 +515,6 @@ def load_segment_index(store: PageStore, header: ArchiveHeader) -> SegmentIndex:
     runs: list[_SegmentRun] = []
     if sb is not None and sb.value_length >= SEGMENT_MAP_VALUE_SIZE:
         # Only the leading fields of the value are known; a longer value just pads further
-        record = struct.Struct(f"{_SEGMENT_MAP_COLUMNS.format}{sb.value_length - SEGMENT_MAP_VALUE_SIZE}x")
+        record = struct.Struct(f"{_SEGMENT_MAP_RECORD.format}{sb.value_length - SEGMENT_MAP_VALUE_SIZE}x")
         runs = [_decode_segment_run(items, record) for items in _run_items(store, sb, _SEGMENT_MAP_KEY, record)]
     return SegmentIndex([run for run in runs if run.ids or run.deleted])

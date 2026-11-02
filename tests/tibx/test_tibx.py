@@ -202,9 +202,10 @@ def test_record_layouts_match_c_tibx() -> None:
     # Plain ints: cstruct's int subclasses are tracked by the GC, at a million records a tree
     assert all(type(field) is int for field in extent)
 
-    raw = segment_map_value(0x01020304, 0x0A0B0C0D, slice_id=7)
+    raw = segment_map_value(0x12, 0x0A0B0C0D, refs=7)
     locator = tibx_map.decode_segment_locator(segment_map_key(42), raw)
-    assert locator == (42, 0x01020304, c_tibx.segment_map_value(raw).page_offset)
+    value = c_tibx.segment_map_value(raw)
+    assert locator == (42, value.page_count, value.page_offset) == (42, 0x12, 0x0A0B0C0D)
 
 
 def test_extent_table() -> None:

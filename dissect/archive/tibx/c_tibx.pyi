@@ -314,7 +314,7 @@ class _c_tibx(__cs__.cstruct):
         zlength: _c_tibx.uint32
         key_id: _c_tibx.uint32
         compression: _c_tibx.ComprAlg
-        cache: _c_tibx.uint8
+        cache_level: _c_tibx.uint8
         @overload
         def __init__(
             self,
@@ -324,7 +324,7 @@ class _c_tibx(__cs__.cstruct):
             zlength: _c_tibx.uint32 | None = ...,
             key_id: _c_tibx.uint32 | None = ...,
             compression: _c_tibx.ComprAlg | None = ...,
-            cache: _c_tibx.uint8 | None = ...,
+            cache_level: _c_tibx.uint8 | None = ...,
         ): ...
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
@@ -403,7 +403,7 @@ class _c_tibx(__cs__.cstruct):
         _reserved: _c_tibx.uint8
         node_count: _c_tibx.uint16
         extra_len: _c_tibx.uint32
-        pages_total: _c_tibx.uint32
+        uncompressed_size: _c_tibx.uint32
         @overload
         def __init__(
             self,
@@ -411,10 +411,26 @@ class _c_tibx(__cs__.cstruct):
             _reserved: _c_tibx.uint8 | None = ...,
             node_count: _c_tibx.uint16 | None = ...,
             extra_len: _c_tibx.uint32 | None = ...,
-            pages_total: _c_tibx.uint32 | None = ...,
+            uncompressed_size: _c_tibx.uint32 | None = ...,
         ): ...
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class LsmTag(__cs__.Enum):
+        CI = ...
+        DATA_MAP = ...
+        HEADER = ...
+        LINK_MAP = ...
+        NAME_MAP = ...
+        SEGMENT_MAP = ...
+        UNUSED_MAP = ...
+        DEDUP_MAP = ...
+        ENCR_MAP = ...
+        GOLOMB = ...
+        NOTARY_MAP = ...
+        OSTOR = ...
+        SLICE_MAP = ...
+        DATA = ...
 
     class lsm_page_header(__cs__.Structure):
         magic: __cs__.CharArray
@@ -424,7 +440,8 @@ class _c_tibx(__cs__.cstruct):
         uncompressed_size: _c_tibx.uint32
         on_disk_size: _c_tibx.uint32
         key_size_param: _c_tibx.uint32
-        _sequence_id: __cs__.CharArray
+        tag: _c_tibx.LsmTag
+        _reserved: __cs__.CharArray
         @overload
         def __init__(
             self,
@@ -435,7 +452,8 @@ class _c_tibx(__cs__.cstruct):
             uncompressed_size: _c_tibx.uint32 | None = ...,
             on_disk_size: _c_tibx.uint32 | None = ...,
             key_size_param: _c_tibx.uint32 | None = ...,
-            _sequence_id: __cs__.CharArray | None = ...,
+            tag: _c_tibx.LsmTag | None = ...,
+            _reserved: __cs__.CharArray | None = ...,
         ): ...
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
@@ -489,16 +507,18 @@ class _c_tibx(__cs__.cstruct):
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
     class segment_map_value(__cs__.Structure):
-        page_count: __cs__.CharArray
-        page_offset: _c_tibx.uint32
-        slice_id: _c_tibx.uint32
+        page_count: _c_tibx.uint64
+        page_offset: _c_tibx.uint64
+        cache_level: _c_tibx.uint32
+        refs: _c_tibx.uint32
         hash: __cs__.CharArray
         @overload
         def __init__(
             self,
-            page_count: __cs__.CharArray | None = ...,
-            page_offset: _c_tibx.uint32 | None = ...,
-            slice_id: _c_tibx.uint32 | None = ...,
+            page_count: _c_tibx.uint64 | None = ...,
+            page_offset: _c_tibx.uint64 | None = ...,
+            cache_level: _c_tibx.uint32 | None = ...,
+            refs: _c_tibx.uint32 | None = ...,
             hash: __cs__.CharArray | None = ...,
         ): ...
         @overload
