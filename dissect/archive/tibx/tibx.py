@@ -30,10 +30,14 @@ from dissect.archive.tibx.c_tibx import (
     EXT_SUPERBLOCK_OFFSET,
     EXTENT_ALIGNMENT,
     EXTENT_INDEX_WHOLE_SEGMENT,
+    IMAP_KEY_SIZE,
+    IMAP_STREAM_SIZE,
+    IMAP_VALUE_SIZE,
     MBR_SIGNATURE,
     MBR_TYPE_GPT_PROTECTIVE,
     PAGE_SIZE,
     TLV_FILE_TABLE,
+    TLV_IMAP,
     TLV_KEYMAP,
     TLV_SLICES,
     c_boot,
@@ -43,6 +47,7 @@ from dissect.archive.tibx.exception import (
     CorruptArchiveError,
     Error,
     InvalidArchiveError,
+    InvalidPasswordError,
     UnsupportedFormatError,
 )
 from dissect.archive.tibx.lsm import iter_tree_cells, read_archive_header
@@ -144,6 +149,11 @@ class TIBX:
         self._segment_index = None
         self._segment_layout: dict[tuple[int, int], int] | None = None
         self._clear_segment_cache()
+        self._reset_imap_caches()
+
+    def _reset_imap_caches(self) -> None:
+        # The imap may be encrypted, so what it holds also depends on the data key
+        self._imap_streams: list[tuple[int, int, int]] | None = None
         self._reset_view_caches()
 
     def _reset_view_caches(self) -> None:
@@ -153,6 +163,7 @@ class TIBX:
         self._extents: ExtentTable | None = None
         self._streams: list[TibxVolume] | None = None
         self._volumes: list[TibxVolume] | None = None
+        self._stream_sizes: dict[int, int] | None = None
 
     def _clear_segment_cache(self) -> None:
         self._segment_cache: OrderedDict[int, bytes] = OrderedDict()
@@ -263,6 +274,7 @@ class TIBX:
 
         self._data_key = unwrap_data_key(self.header, password)
         self._clear_segment_cache()
+        self._reset_imap_caches()
 
     def recovery_points(self) -> list[RecoveryPoint]:
         """The backups in this archive, oldest first.
@@ -397,6 +409,58 @@ class TIBX:
             self._volumes = [stream for stream in streams if self._is_volume(stream, bitmap_spans)]
         return self._volumes
 
+    def _imap_stream_records(self) -> list[tuple[int, int, int]]:
+        """``(slice_id, stream id, size)`` for every data stream the imap (TLV[0]) names.
+
+        Every backup records all of its items in the imap -- its disks, partitions and
+        Acronis metadata, or its files and directories -- each with the data_map streams
+        that hold its data, and their sizes.
+
+        Raises:
+            ~dissect.archive.tibx.exception.InvalidPasswordError: If the imap is encrypted and the archive is
+                locked.
+        """
+        if self._imap_streams is None:
+            records: list[tuple[int, int, int]] = []
+            imap = self.header.tree(TLV_IMAP)
+            if imap is not None and imap.has_records:
+                seen: set[bytes] = set()
+                for cell in iter_tree_cells(self.store, imap, self._data_key):
+                    if cell.key in seen:
+                        continue
+                    seen.add(cell.key)
+                    value = cell.value
+                    if not cell.alive or len(cell.key) < IMAP_KEY_SIZE or len(value) < IMAP_VALUE_SIZE:
+                        continue
+                    end = IMAP_VALUE_SIZE + (c_tibx.imap_value(value).extra_streams + 1) * IMAP_STREAM_SIZE
+                    if len(value) < end:
+                        continue
+                    slice_id = c_tibx.imap_key(cell.key).slice_id
+                    for offset in range(IMAP_VALUE_SIZE, end, IMAP_STREAM_SIZE):
+                        stream = c_tibx.imap_stream(value[offset : offset + IMAP_STREAM_SIZE])
+                        records.append((slice_id, stream.id, stream.size))
+            self._imap_streams = records
+        return self._imap_streams
+
+    def _stream_size(self, volume_id: int) -> int | None:
+        """The size the imap gives data_map stream ``volume_id``, as of the selected recovery point.
+
+        ``None`` if the imap does not name the stream, or if it is encrypted and the archive
+        is locked.
+        """
+        if self._stream_sizes is None:
+            try:
+                records = self._imap_stream_records()
+            except InvalidPasswordError:
+                return None
+            # Oldest backup first, so the newest one in view decides
+            self._stream_sizes = {
+                stream_id: size
+                for slice_id, stream_id, size in sorted(records)
+                if self._slice_limit is None or slice_id <= self._slice_limit
+            }
+        return self._stream_sizes.get(volume_id)
+
     @staticmethod
     def _is_volume(stream: TibxVolume, bitmap_spans: set[int]) -> bool:
         """Whether a data_map stream is a backed-up volume rather than Acronis metadata.
@@ -528,14 +592,22 @@ class TibxVolume:
 
     @property
     def size(self) -> int:
-        """The volume size in bytes, from its boot sector, capped by the data_map span."""
+        """The volume size in bytes, as the imap records it.
+
+        That is the partition's size: an NTFS boot sector leaves the partition's last
+        sector out, and a sparse volume's boot sector can say far more than the data_map
+        holds. Without an imap record, as for an encrypted archive that is locked, the size
+        comes from the boot sector, capped by the data_map span.
+        """
         if self._size is None:
-            span = self._span
-            size = _boot_sector_size(self.read(0, 2048))
-            # An absent or absurd boot-sector size means this is not a filesystem
-            # volume (or the BPB was misread) -- trust the data_map span instead
-            if size <= 0 or size > span * 64:
-                size = span
+            size = self.tibx._stream_size(self.volume_id)
+            if size is None:
+                span = self._span
+                size = _boot_sector_size(self.read(0, 2048))
+                # An absent or absurd boot-sector size means this is not a filesystem
+                # volume (or the BPB was misread) -- trust the data_map span instead
+                if size <= 0 or size > span * 64:
+                    size = span
             self._size = size
         return self._size
 

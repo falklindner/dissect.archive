@@ -223,7 +223,7 @@ def unwrap_data_key(header: ArchiveHeader, password: str | bytes) -> DataKey:
 
 
 def decrypt_segment(payload: bytes, data_key: DataKey) -> bytes:
-    """Decrypt an ``SE`` segment payload to its stored bytes.
+    """Decrypt an ``SE`` segment payload, or an encrypted LSM cell stream, to its stored bytes.
 
     Returns the still-compressed (or stored) plaintext; the caller decompresses per the
     segment's compression field. For CBC the padding is left intact -- the caller truncates

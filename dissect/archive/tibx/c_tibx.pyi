@@ -504,6 +504,45 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
+    class imap_key(__cs__.Structure):
+        slice_id: _c_tibx.uint32
+        flags: _c_tibx.uint8
+        item_class: _c_tibx.uint8
+        type: _c_tibx.uint8
+        @overload
+        def __init__(
+            self,
+            slice_id: _c_tibx.uint32 | None = ...,
+            flags: _c_tibx.uint8 | None = ...,
+            item_class: _c_tibx.uint8 | None = ...,
+            type: _c_tibx.uint8 | None = ...,
+        ): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class imap_value(__cs__.Structure):
+        extra_streams: _c_tibx.uint8
+        @overload
+        def __init__(self, extra_streams: _c_tibx.uint8 | None = ...): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
+    class imap_stream(__cs__.Structure):
+        index: _c_tibx.uint8
+        state: _c_tibx.uint8
+        id: _c_tibx.uint64
+        size: _c_tibx.uint64
+        @overload
+        def __init__(
+            self,
+            index: _c_tibx.uint8 | None = ...,
+            state: _c_tibx.uint8 | None = ...,
+            id: _c_tibx.uint64 | None = ...,
+            size: _c_tibx.uint64 | None = ...,
+        ): ...
+        @overload
+        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
+
     class wrapped_key(__cs__.Structure):
         format: _c_tibx.uint8
         alg: _c_tibx.uint8
@@ -734,6 +773,7 @@ TLV_DIRECTORY_OFFSET: Literal[0x400]
 TLV_HEADER_SIZE: int
 TLV_SLOT_COUNT: Literal[19]
 
+TLV_IMAP: Literal[0]
 TLV_DATA_MAP: Literal[1]
 TLV_SEGMENT_MAP: Literal[2]
 TLV_SLICES: Literal[5]
@@ -751,6 +791,10 @@ EXTENT_INDEX_WHOLE_SEGMENT: Literal[0xFFFF]
 
 SEGMENT_MAP_KEY_SIZE: int
 SEGMENT_MAP_VALUE_SIZE: int
+
+IMAP_KEY_SIZE: int
+IMAP_VALUE_SIZE: int
+IMAP_STREAM_SIZE: int
 
 EXT_SUPERBLOCK_OFFSET: Literal[0x400]
 EXT_MAGIC: Literal[0xEF53]

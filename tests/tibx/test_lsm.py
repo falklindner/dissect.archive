@@ -7,7 +7,8 @@ import pytest
 
 from dissect.archive.tibx import lsm
 from dissect.archive.tibx.c_tibx import ENVELOPE_SIZE, LSM_CELL_STREAM_OFFSET, c_tibx
-from dissect.archive.tibx.exception import CorruptArchiveError
+from dissect.archive.tibx.crypto import DataKey
+from dissect.archive.tibx.exception import CorruptArchiveError, InvalidPasswordError
 from dissect.archive.tibx.lsm import (
     LsmSuperBlock,
     decode_cells_compact,
@@ -50,6 +51,43 @@ def test_compact_cells_multiple_groups() -> None:
     decoded = decode_cells_compact(compact_cells(cells), 30, key_length=8, value_length=4)
     assert len(decoded) == 30
     assert decoded[29].key == struct.pack(">Q", 29)
+
+
+def _variable_cells(cells: list[Cell]) -> bytes:
+    # The cells of a variable-key tree: one group, each cell led by its leb128 lengths
+    out = c_tibx.lsm_cell_group_header(count=len(cells), alive=(1 << len(cells)) - 1).dumps()
+    for cell in cells:
+        out += bytes([len(cell.key), len(cell.value)]) + cell.key + cell.value
+    return out
+
+
+def test_compact_cells_variable_length() -> None:
+    key = b"K" * 200
+    buf = c_tibx.lsm_cell_group_header(count=2, alive=0b11).dumps()
+    buf += bytes([200 & 0x7F | 0x80, 200 >> 7, 3]) + key + b"abc" + bytes([1, 0]) + b"k"
+    decoded = decode_cells_compact(buf, 2, key_length=0, value_length=0)
+    assert [(c.key, c.value) for c in decoded] == [(key, b"abc"), (b"k", b"")]
+
+
+def test_memtree_variable_keys() -> None:
+    cells = [Cell(b"ab", b"xyz"), Cell(b"abc", b"")]
+    sb = LsmSuperBlock(lsb(0, 0, memtree_cells=cells, memtree_blob=_variable_cells(cells)), tlv_index=0)
+    assert [(c.key, c.value) for c in iter_memtree_cells(sb)] == [(b"ab", b"xyz"), (b"abc", b"")]
+
+
+def test_memtree_encrypted() -> None:
+    # Framed like an AES-GCM segment: the IV, the tag, then the ciphertext
+    from Crypto.Cipher import AES
+
+    cells = [Cell(b"ab", b"xyz")]
+    key, iv = bytes(range(32)), bytes(range(16))
+    ciphertext, tag = AES.new(key, AES.MODE_GCM, nonce=iv).encrypt_and_digest(_variable_cells(cells))
+    payload = lsb(0, 0, memtree_cells=cells, memtree_blob=iv + tag + ciphertext, memtree_encoding=0x80)
+    sb = LsmSuperBlock(payload, tlv_index=0)
+
+    with pytest.raises(InvalidPasswordError):
+        iter_memtree_cells(sb)
+    assert [(c.key, c.value) for c in iter_memtree_cells(sb, DataKey(alg=7, key=key))] == [(b"ab", b"xyz")]
 
 
 def test_variable_cells_leb128() -> None:

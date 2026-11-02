@@ -123,8 +123,8 @@ def test_acronis_archive(name: str, backups: list[str], volumes: int) -> None:
 @pytest.mark.parametrize(
     ("name", "volume_id", "digest"),
     [
-        ("t1_simple_ntfs", 0x4, "16c90fb48eedab726037df2cfc59d0d1b8140cf320e3fac57b33087848781676"),
-        ("t1_stored", 0x4, "aa55f3a300f8f687d3023d4df03b4c84264f55df7c1519b8bffdd166aa74cb68"),
+        ("t1_simple_ntfs", 0x4, "2f37a8c006003a77723338f740e61ecec223095ab43852c132e10d1af3829fa0"),
+        ("t1_stored", 0x4, "acf750441e2c47f8fcc7448e3bfd15bf99c6818cd2c737ae81f1a5ca0143d0d6"),
         ("ati_2020_disk_lz4_compr", 0xE, "d29989304fc63657dfdab3fd7fb0a804a747b93580b7abb622a29f3d55ae33e7"),
     ],
 )
@@ -184,13 +184,13 @@ def test_acronis_codec_per_backup() -> None:
             "t1_enc_aes",
             c_tibx.EncrAlg.AES_256_GCM,
             0x4,
-            "4d71863bceccc3b8b3d8ce0d3bdf1926b479775926c588f014f3b51c45de0320",
+            "d13f328efd801ac02dfb847a83bb1c0432182273619cf3b7121558f2bb177ea0",
         ),
         (
             "ati_2020_disk_enc_lz4_compr",
             c_tibx.EncrAlg.AES_256_CBC,
             0x6,
-            "134a9b44bdf6c383dae8c863a6fcbba254b805c4c49ae12a02367bf3d081aad6",
+            "122fd1031eec87f138c2c8607fb858bb81ec3d9041115344a5b8a52e1f2251c0",
         ),
     ],
 )
@@ -213,9 +213,9 @@ def test_acronis_encrypted(name: str, alg: c_tibx.EncrAlg, volume_id: int, diges
             "t1_chain_inc",
             0x4,
             [
-                "76cb61ecc47f9ced80d80270b2e32bf457ebf69bbd0a7b671890ea3e13e01596",
-                "4d8189da83582ac549918ba85131c51d5bd4543f5b739a8b984d4369a904591e",
-                "2c388dfbc8d3446f5d7f36bb7d62a46234a0ceb49aad99defbe202822bc34e07",
+                "14601f43adb0681ddf24a630acc050d00d1448627d5d0e810f925786efb5b8fb",
+                "ed9dfc11d43d84d2a88acfb094ca80cd6859966cfafd2d740a22c4b42225025a",
+                "e7e893d56c2ca997fbf4c86864927bcdf3b498205f46ada0fd4c3d6f2488f4df",
             ],
         ),
         (
@@ -223,8 +223,8 @@ def test_acronis_encrypted(name: str, alg: c_tibx.EncrAlg, volume_id: int, diges
             "ati_2020_disk_enc_lz4_compr",
             0x6,
             [
-                "32da7e79b4787c254e3b4ba74b73a6633f4d17b49d2a1c82a7c711acce1dd94b",
-                "134a9b44bdf6c383dae8c863a6fcbba254b805c4c49ae12a02367bf3d081aad6",
+                "0a2702360cdb9902aa64f59f072402736b4f0f57be4fc1e83a5884900e226084",
+                "122fd1031eec87f138c2c8607fb858bb81ec3d9041115344a5b8a52e1f2251c0",
             ],
         ),
     ],
@@ -245,6 +245,45 @@ def test_acronis_unformatted_partition() -> None:
     # Imaged sector by sector; its index is the one that needs LZ4 dictionary blocks
     with _open("t1_disk_gpt") as tibx:
         assert _sha256(tibx, 0x19) == "18fdb2a2fbfda6a212c8c82d848835dc863e905a481ad400c0ba0c084d80fce7"
+
+
+@pytest.mark.parametrize(
+    ("name", "recovery_point", "sizes"),
+    [
+        # NTFS leaves the partition's last sector out of the volume size in its boot sector
+        ("t1_simple_ntfs", "latest", {0x4: 50331648}),
+        ("t1_disk_mbr", "latest", {0x4: 50331648, 0x7: 41943040}),
+        # The boot sector size is more than 64 times what this sparse volume stores
+        ("ati_2020_disk_lz4_compr", 2, {0xE: 2097152}),
+        # Unformatted partitions have no boot sector
+        ("t1_disk_gpt", "latest", {0x11: 33554432, 0x15: 33554432, 0x19: 33554432}),
+        # The imap is encrypted
+        ("ati_2020_disk_enc_lz4_compr", "latest", {0x6: 3145728}),
+    ],
+)
+def test_acronis_volume_size(name: str, recovery_point: int | str, sizes: dict[int, int]) -> None:
+    # The partition's size, as the imap records it and as Acronis's tibxread reads it
+    with _open(name) as tibx:
+        if tibx.encrypted:
+            tibx.unlock(PASSWORD)
+        tibx.use_recovery_point(recovery_point)
+        volumes = {volume.volume_id: volume for volume in tibx.volumes()}
+        assert {volume_id: volumes[volume_id].size for volume_id in sizes} == sizes
+
+
+@pytest.mark.parametrize(
+    ("recovery_point", "digest"),
+    [
+        # A freshly formatted FAT16, which stores 20 KiB of its 2 MiB
+        (2, "b69c98b5ac590d9173bd06df0388cbdd18ad0a12acf5963bcd6607254ac8ff36"),
+        (3, "d29989304fc63657dfdab3fd7fb0a804a747b93580b7abb622a29f3d55ae33e7"),
+    ],
+)
+def test_acronis_sparse_volume(recovery_point: int, digest: str) -> None:
+    # What ``tibxread calculate hash --volume 1-1`` gives (verified for recovery point 2)
+    with _open("ati_2020_disk_lz4_compr") as tibx:
+        tibx.use_recovery_point(recovery_point)
+        assert _sha256(tibx, 0xE) == digest
 
 
 @pytest.mark.parametrize("name", ARCHIVES)

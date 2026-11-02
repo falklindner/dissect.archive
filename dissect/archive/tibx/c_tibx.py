@@ -320,6 +320,29 @@ struct segment_map_value {
     char        hash[20];
 };
 
+/* imap (TLV[0]) record key: one item of one backup, such as a disk, partition or file.
+ * Every backup records all of its items again, under its own slice id. The item's path
+ * follows, to the end of the key. */
+struct imap_key {
+    uint32      slice_id;
+    uint8       flags;
+    uint8       item_class;
+    uint8       type;
+};
+
+/* imap record value: 1 + extra_streams imap_stream records follow */
+struct imap_value {
+    uint8       extra_streams;          /* streams after the first */
+};
+
+/* A data stream of an imap item: its content (index 0), or more about it */
+struct imap_stream {
+    uint8       index;
+    uint8       state;                  /* 3 data stored, 2 empty */
+    uint64      id;                     /* data_map volume_id the data is stored under */
+    uint64      size;                   /* size of the data */
+};
+
 /* Password-wrapped data key, stored in the keymap tree (TLV[7]) mem-tree. The wrapped
  * key itself follows this header and runs to the end of the blob: its length is not
  * carried in the format, only its PKCS#7 padding is. */
@@ -459,6 +482,7 @@ TLV_DIRECTORY_OFFSET = 0x400
 TLV_HEADER_SIZE = len(c_tibx.tlv_header)
 TLV_SLOT_COUNT = 19
 
+TLV_IMAP = 0
 TLV_DATA_MAP = 1
 TLV_SEGMENT_MAP = 2
 TLV_SLICES = 5
@@ -478,6 +502,10 @@ EXTENT_INDEX_WHOLE_SEGMENT = 0xFFFF
 
 SEGMENT_MAP_KEY_SIZE = len(c_tibx.segment_map_key)
 SEGMENT_MAP_VALUE_SIZE = len(c_tibx.segment_map_value)
+
+IMAP_KEY_SIZE = len(c_tibx.imap_key)
+IMAP_VALUE_SIZE = len(c_tibx.imap_value)
+IMAP_STREAM_SIZE = len(c_tibx.imap_stream)
 
 EXT_SUPERBLOCK_OFFSET = 0x400
 EXT_MAGIC = 0xEF53
