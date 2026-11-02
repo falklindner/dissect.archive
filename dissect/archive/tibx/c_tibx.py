@@ -508,8 +508,15 @@ TLV_SLOT_COUNT = 19
 TLV_IMAP = 0
 TLV_DATA_MAP = 1
 TLV_SEGMENT_MAP = 2
+TLV_DEDUP_MAP = 3
+TLV_NLINK_MAP = 4
 TLV_SLICES = 5
+TLV_UMAP = 6
 TLV_KEYMAP = 7
+TLV_NOTARY = 8
+TLV_META = 9
+TLV_OSTOR_HISTORY = 13
+TLV_UNUSED = 17
 TLV_VOLUMES = 18
 
 # Wrapped-key blob: the fixed header above, then the padded key to the end of the blob
