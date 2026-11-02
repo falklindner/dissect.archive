@@ -509,9 +509,9 @@ def test_tombstone_masks_older_records() -> None:
 
 
 @pytest.mark.parametrize("use_ctree", [False, True], ids=["memtree", "ctree"])
-def test_version_set_file_table(tmp_path: Path, use_ctree: bool) -> None:
+def test_version_set_volumes(tmp_path: Path, use_ctree: bool) -> None:
     # Version set: base compacted to one physical page but logically spanning 8 pages;
-    # the version file maps at page 8 via the TLV[18] file table, all offsets global
+    # the version file maps at page 8 via the TLV[18] volumes, all offsets global
     data = b"version-file volume content" * 100
     stub, version = build_version_set([ExtentSpec(10, 0, data)], stub_logical_pages=8, use_ctree=use_ctree)
     (tmp_path / "Ver.tibx").write_bytes(stub)

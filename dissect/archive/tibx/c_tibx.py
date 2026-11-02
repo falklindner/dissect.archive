@@ -165,9 +165,10 @@ struct arch_superblock {
     arch_header body;
 };
 
-/* A file of a split archive other than the first: its number -- the -NNNN in its file
- * name -- and where it starts in the archive as a whole. Index 0 is an unused entry. */
-struct arci_volume {
+/* A file of a split archive ("volumes" in Acronis's dumps): its index -- 0 for the first
+ * file, NNNN for the file named -NNNN after it -- and where it starts in the archive as a
+ * whole. Not a backed-up volume, as TIBX.volumes() returns. */
+struct ar_volume {
     uint32      index;
     uint64      start_offs;
 };
@@ -194,7 +195,7 @@ struct arci_header {
     uint64      prev_ci_offset;         /* offset to previous commit info page; the newest in a rewritten CI0 */
     uint64      crc64;                  /* CRC-64 (Redis) of the page's first 512 bytes, both checksums zeroed */
     uint64      volume_offset;          /* offset of this page within its own file of the archive */
-    arci_volume volumes[4];             /* files of the archive, in no order and possibly repeated; index 0 = unused */
+    ar_volume   volumes[4];             /* files of the archive, in no order and possibly repeated; index 0 = unused */
     uint128     uuid;
     uint128     session;
 };
@@ -383,14 +384,6 @@ struct wrapped_key {
     uint8       _reserved;
     char        salt[16];               /* PBKDF2 salt */
 };
-
-/* TLV[18] file table record: where each physical file of the archive set begins in
- * the logical page store. One entry per version file; a "single version scheme"
- * cleanup compacts (physically truncates) older files but keeps their logical range. */
-struct file_table_entry {
-    uint32      index;
-    uint64      byte_offset;            /* logical page-store offset of file[index] */
-};
 """
 
 c_tibx = cstruct(endian=">").load(tibx_def)
@@ -517,7 +510,7 @@ TLV_DATA_MAP = 1
 TLV_SEGMENT_MAP = 2
 TLV_SLICES = 5
 TLV_KEYMAP = 7
-TLV_FILE_TABLE = 18
+TLV_VOLUMES = 18
 
 # Wrapped-key blob: the fixed header above, then the padded key to the end of the blob
 WRAPPED_KEY_HEADER_SIZE = len(c_tibx.wrapped_key)

@@ -36,10 +36,10 @@ from dissect.archive.tibx.c_tibx import (
     MBR_SIGNATURE,
     MBR_TYPE_GPT_PROTECTIVE,
     PAGE_SIZE,
-    TLV_FILE_TABLE,
     TLV_IMAP,
     TLV_KEYMAP,
     TLV_SLICES,
+    TLV_VOLUMES,
     c_boot,
     c_tibx,
 )
@@ -808,29 +808,32 @@ class _ZeroStream(AlignedStream):
         return b"\x00" * length
 
 
-def _file_table_offsets(handle: BinaryIO, expected: int) -> list[int] | None:
-    """The logical byte offset of every file of an archive set, from ``handle``'s TLV[18].
+def _volume_offsets(handle: BinaryIO, expected: int) -> list[int] | None:
+    """The logical byte offset of every file of an archive set, from the volumes in ``handle``'s TLV[18].
+
+    Acronis calls the files of an archive its volumes; they have nothing to do with the
+    backed-up volumes of :meth:`TIBX.volumes`.
 
     Version files carry the archive's newest commit roots, so the *last* file's live
-    root has the authoritative file table. Returns None when the file carries no
+    root has the authoritative volumes. Returns None when the file carries no
     plausible table for ``expected`` files -- notably for raw byte-split parts, which
     are page-misaligned fragments without their own roots.
     """
-    entry_size = len(c_tibx.file_table_entry)
+    entry_size = len(c_tibx.ar_volume)
     try:
         store = PageStore(handle)
         header = read_archive_header(store, store.live_root())
     except Error:
         return None
-    payload = header.tlv[TLV_FILE_TABLE].payload if len(header.tlv) > TLV_FILE_TABLE else b""
+    payload = header.tlv[TLV_VOLUMES].payload if len(header.tlv) > TLV_VOLUMES else b""
     if len(payload) // entry_size != expected:
         return None
     offsets = []
     for index in range(expected):
-        entry = c_tibx.file_table_entry(payload[index * entry_size :])
+        entry = c_tibx.ar_volume(payload[index * entry_size :])
         if entry.index != index:
             return None
-        offsets.append(entry.byte_offset)
+        offsets.append(entry.start_offs)
     if offsets[0] != 0 or offsets != sorted(set(offsets)):
         return None
     return offsets
@@ -841,7 +844,7 @@ def _stitch(handles: list[BinaryIO]) -> MappingStream:
 
     Split archives are raw byte-splits of one page store: the parts concatenate.
     Version sets (each backup version appended as ``Name-0001.tibx``, ...) instead
-    record every file's logical start offset in the TLV[18] file table: after a
+    record every file's logical start offset in the volumes of TLV[18]: after a
     "single version scheme" cleanup the base file is compacted -- physically
     truncated, its data pages tombstoned -- while retaining its logical address
     range, so concatenation would misplace every absolute offset in the maps.
@@ -852,7 +855,7 @@ def _stitch(handles: list[BinaryIO]) -> MappingStream:
         handle.seek(0, 2)
         sizes.append(handle.tell())
 
-    offsets = _file_table_offsets(handles[-1], expected=len(handles)) if len(handles) > 1 else None
+    offsets = _volume_offsets(handles[-1], expected=len(handles)) if len(handles) > 1 else None
     if offsets is not None:
         # A trustworthy table never maps a file below the previous file's end
         position = 0

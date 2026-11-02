@@ -232,7 +232,7 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
-    class arci_volume(__cs__.Structure):
+    class ar_volume(__cs__.Structure):
         index: _c_tibx.uint32
         start_offs: _c_tibx.uint64
         @overload
@@ -258,7 +258,7 @@ class _c_tibx(__cs__.cstruct):
         prev_ci_offset: _c_tibx.uint64
         crc64: _c_tibx.uint64
         volume_offset: _c_tibx.uint64
-        class arci_volume(__cs__.Structure):
+        class ar_volume(__cs__.Structure):
             index: _c_tibx.uint32
             start_offs: _c_tibx.uint64
             @overload
@@ -266,7 +266,7 @@ class _c_tibx(__cs__.cstruct):
             @overload
             def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
-        volumes: __cs__.Array[arci_volume]
+        volumes: __cs__.Array[ar_volume]
         uuid: _c_tibx.uint128
         session: _c_tibx.uint128
         @overload
@@ -285,7 +285,7 @@ class _c_tibx(__cs__.cstruct):
             prev_ci_offset: _c_tibx.uint64 | None = ...,
             crc64: _c_tibx.uint64 | None = ...,
             volume_offset: _c_tibx.uint64 | None = ...,
-            volumes: __cs__.Array[arci_volume] | None = ...,
+            volumes: __cs__.Array[ar_volume] | None = ...,
             uuid: _c_tibx.uint128 | None = ...,
             session: _c_tibx.uint128 | None = ...,
         ): ...
@@ -588,14 +588,6 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
-    class file_table_entry(__cs__.Structure):
-        index: _c_tibx.uint32
-        byte_offset: _c_tibx.uint64
-        @overload
-        def __init__(self, index: _c_tibx.uint32 | None = ..., byte_offset: _c_tibx.uint64 | None = ...): ...
-        @overload
-        def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
-
 # Technically `c_tibx` is an instance of `_c_tibx`, but then we can't use it in type hints
 c_tibx: TypeAlias = _c_tibx
 
@@ -805,7 +797,7 @@ TLV_DATA_MAP: Literal[1]
 TLV_SEGMENT_MAP: Literal[2]
 TLV_SLICES: Literal[5]
 TLV_KEYMAP: Literal[7]
-TLV_FILE_TABLE: Literal[18]
+TLV_VOLUMES: Literal[18]
 
 WRAPPED_KEY_HEADER_SIZE: int
 WRAPPED_KEY_SALT_SIZE: Literal[16]

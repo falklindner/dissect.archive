@@ -1,8 +1,9 @@
 """LSM index layer: the ARCH header's TLV directory, L-SB superblocks and tree walking.
 
 The ARCH header body carries a 19-slot TLV directory (at body offset ``0x400``); slots
-0-8 hold **L-SB** superblocks, one per LSM tree (slot 1 = ``data_map``, slot 2 =
-``segment_map``, slot 5 = ``slices``, slot 7 = ``keymap``, slot 18 = volume table).
+0-8 hold **L-SB** superblocks, one per LSM tree (slot 0 = ``imap``, slot 1 = ``data_map``,
+slot 2 = ``segment_map``, slot 4 = ``nlink_map``, slot 5 = ``slices``, slot 7 =
+``keymap``), and slot 18 holds the archive's volumes.
 Each L-SB describes the tree's on-disk ctree runs (B-tree roots of LEAF/LDIR pages)
 plus a residual **mem-tree** holding not-yet-compacted records -- small archives keep
 *all* records in the mem-tree with empty ctrees.

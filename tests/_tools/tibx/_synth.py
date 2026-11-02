@@ -604,7 +604,7 @@ def build_lsm_archive(
 
     ``page_base`` makes all absolute page/byte offsets (segment_map, ctrees) global
     for a *version file* mapped at that logical page offset of a version set;
-    ``extra_slots`` adds raw TLV payloads (e.g. slot 18, the file table).
+    ``extra_slots`` adds raw TLV payloads (e.g. slot 18, the volumes).
     """
     data_key = bytes(range(KEY_LENGTH[alg])) if password is not None else None
     pages, dm_cells, sm_cells, _ = _segments_and_maps(
@@ -649,11 +649,9 @@ def build_lsm_archive(
     return header + b"".join(pages) + arci_page(page_base * PAGE, uuid, commit_seq=1, prev_ci_offset=FIRST_CI_OFFSET)
 
 
-def file_table(offsets: list[int]) -> bytes:
-    """Encode a TLV[18] file table: the logical byte offset of each archive file."""
-    return b"".join(
-        c_tibx.file_table_entry(index=index, byte_offset=offset).dumps() for index, offset in enumerate(offsets)
-    )
+def volumes(offsets: list[int]) -> bytes:
+    """Encode the TLV[18] volumes: the logical byte offset of each archive file."""
+    return b"".join(c_tibx.ar_volume(index=index, start_offs=offset).dumps() for index, offset in enumerate(offsets))
 
 
 def build_version_set(
@@ -664,9 +662,9 @@ def build_version_set(
     Mirrors a "single version scheme" cleanup: the base file physically holds only an
     empty initial root but logically spans ``stub_logical_pages`` (the removed pages of
     the deleted old version), and the version file, mapped at that logical offset by
-    the TLV[18] file table, carries the live backup with global absolute offsets.
+    the TLV[18] volumes, carries the live backup with global absolute offsets.
     """
-    table = file_table([0, stub_logical_pages * PAGE])
+    table = volumes([0, stub_logical_pages * PAGE])
     stub = arch_header_page({1: lsb(31, 10), 2: lsb(8, 32), 18: table}, modified_ms=1, uuid=b"\xaa" * 16)
     version = build_lsm_archive(extents, use_ctree=use_ctree, page_base=stub_logical_pages, extra_slots={18: table})
     return stub, version
