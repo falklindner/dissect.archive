@@ -51,6 +51,11 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
+    class SliceType(__cs__.Enum):
+        FULL = ...
+        INCREMENTAL = ...
+        DIFFERENTIAL = ...
+
     class slice_key(__cs__.Structure):
         slice_id: _c_tibx.uint32
         @overload
@@ -817,6 +822,8 @@ EXTENT_INDEX_WHOLE_SEGMENT: Literal[0xFFFF]
 
 SEGMENT_MAP_KEY_SIZE: int
 SEGMENT_MAP_VALUE_SIZE: int
+
+SLICE_TYPE_MASK: Literal[0x7F]
 
 IMAP_KEY_SIZE: int
 IMAP_VALUE_SIZE: int

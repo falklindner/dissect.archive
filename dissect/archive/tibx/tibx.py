@@ -36,6 +36,7 @@ from dissect.archive.tibx.c_tibx import (
     MBR_SIGNATURE,
     MBR_TYPE_GPT_PROTECTIVE,
     PAGE_SIZE,
+    SLICE_TYPE_MASK,
     TLV_IMAP,
     TLV_KEYMAP,
     TLV_SLICES,
@@ -108,7 +109,19 @@ class RecoveryPoint:
         self._record = record
 
     def __repr__(self) -> str:
-        return f"<RecoveryPoint index={self.index} slice={self.slice_id} guid={self.guid} finished={self.finished}>"
+        return (
+            f"<RecoveryPoint index={self.index} slice={self.slice_id} guid={self.guid} "
+            f"finished={self.finished} type={self.type}>"
+        )
+
+    @property
+    def type(self) -> str:
+        """The type of this backup: ``"FULL"``, ``"INCREMENTAL"`` or ``"DIFFERENTIAL"``.
+
+        A type this parser does not know comes back as ``"unknown (<value>)"``.
+        """
+        slice_type = c_tibx.SliceType(self._record.flags & SLICE_TYPE_MASK)
+        return slice_type.name or f"unknown ({int(slice_type):#x})"
 
     @property
     def created(self) -> datetime.datetime:

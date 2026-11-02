@@ -70,6 +70,14 @@ struct page_header {
     uint32      crc32c;                 /* CRC-32C of the page, checksum bytes zeroed */
 };
 
+/* The type of a backup: the low 7 bits of slice_record.flags, which Acronis's ARCH header
+ * dump prints as the slice's "type" */
+enum SliceType : uint8 {
+    FULL            = 0x01,
+    INCREMENTAL     = 0x06,
+    DIFFERENTIAL    = 0x0A
+};
+
 /* TLV[5] "slices" record: one backup of the archive. Every data_map extent carries this
  * key's slice id in its own slice_id, to say which backup wrote it. The guid is the one
  * "acrocmd list backups" prints for the backup, and is stored mixed-endian. */
@@ -88,7 +96,7 @@ struct slice_record {
     uint32      items_added;
     uint32      items_changed;
     uint32      items_removed;
-    uint8       flags;                  /* low 7 bits: type (1 full, 6 incremental, 10 differential); bit 7: deleted */
+    uint8       flags;                  /* low 7 bits: the SliceType; bit 7: deleted */
     uint64      last_segment_id;        /* last segment id of the backup */
     uint32      features;               /* see `slice_features2str()` */
     uint64      data_size;              /* data bytes on disk, observed; 0 in True Image 2020 */
@@ -532,6 +540,8 @@ EXTENT_INDEX_WHOLE_SEGMENT = 0xFFFF
 
 SEGMENT_MAP_KEY_SIZE = len(c_tibx.segment_map_key)
 SEGMENT_MAP_VALUE_SIZE = len(c_tibx.segment_map_value)
+
+SLICE_TYPE_MASK = 0x7F
 
 IMAP_KEY_SIZE = len(c_tibx.imap_key)
 IMAP_VALUE_SIZE = len(c_tibx.imap_value)

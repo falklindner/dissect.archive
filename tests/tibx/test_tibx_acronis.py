@@ -242,6 +242,20 @@ def test_acronis_recovery_points(name: str, volume_id: int, expected: list[str])
         assert _sha256(tibx, volume_id) == expected[-1]
 
 
+@pytest.mark.parametrize(
+    ("name", "types"),
+    [
+        ("t1_simple_ntfs", ["FULL"]),
+        ("t1_chain_inc", ["FULL", "INCREMENTAL", "INCREMENTAL"]),
+        ("t1_chain_diff", ["FULL", "DIFFERENTIAL"]),
+        ("ati_2020_disk_lz4_compr", ["FULL", "INCREMENTAL", "INCREMENTAL", "INCREMENTAL"]),
+    ],
+)
+def test_acronis_recovery_point_types(name: str, types: list[str]) -> None:
+    with _open(name) as tibx:
+        assert [point.type for point in tibx.recovery_points()] == types
+
+
 def test_acronis_unformatted_partition() -> None:
     # Imaged sector by sector; its index is the one that needs LZ4 dictionary blocks
     with _open("t1_disk_gpt") as tibx:
