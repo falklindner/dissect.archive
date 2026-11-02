@@ -21,7 +21,7 @@ from collections import OrderedDict, defaultdict
 from itertools import compress, islice, repeat
 from operator import add, itemgetter, le, ne
 from pathlib import Path
-from typing import TYPE_CHECKING, BinaryIO
+from typing import TYPE_CHECKING, BinaryIO, NamedTuple
 
 from dissect.util.stream import AlignedStream, MappingStream
 
@@ -66,6 +66,10 @@ if TYPE_CHECKING:
 # segments, and a count of ~32 thrashed to a near-100% miss rate. A byte budget keeps many
 # more small segments resident while still bounding memory for large ones.
 SEGMENT_CACHE_BUDGET = 256 * 1024 * 1024
+
+# A partition's item name: Acronis looks partitions up as disk%u/part%u. The same
+# partition is also linked as part/<hash>.
+PARTITION_NAME_RE = re.compile(rb"disk\d+/part\d+")
 
 SPLIT_PART_RE = re.compile(r"^(?P<stem>.+?)-(?P<num>\d{4})\.tibx$", re.IGNORECASE)
 
@@ -117,6 +121,17 @@ class RecoveryPoint:
         return datetime.datetime.fromtimestamp(self._record.ftime_ms / 1000, datetime.timezone.utc)
 
 
+class ItemStream(NamedTuple):
+    """One stream of an item record in the imap ("items"), with what the parser needs of the item."""
+
+    slice_id: int
+    name: bytes
+    flags: int
+    index: int
+    id: int
+    size: int
+
+
 class TIBX:
     """An Acronis TIBX ("archive3") backup archive.
 
@@ -153,7 +168,7 @@ class TIBX:
 
     def _reset_imap_caches(self) -> None:
         # The imap may be encrypted, so what it holds also depends on the data key
-        self._imap_streams: list[tuple[int, int, int]] | None = None
+        self._item_streams_cache: list[ItemStream] | None = None
         self._reset_view_caches()
 
     def _reset_view_caches(self) -> None:
@@ -402,15 +417,44 @@ class TIBX:
         and does not start with a partition table -- which keeps an unformatted or
         unrecognised partition, something ``acrocmd list content`` reports as a partition
         of type ``None``. Use :meth:`streams` for the unfiltered list.
+
+        A partition that stores no data at all, such as one never formatted, has no data_map
+        stream. It is listed last, from the imap, and reads as zeros, as Acronis's
+        ``tibxread`` reads it. If the imap is encrypted, a locked archive does not list it.
         """
         if self._volumes is None:
             streams = self.streams()
             bitmap_spans = _bitmap_spans(streams)
             self._volumes = [stream for stream in streams if self._is_volume(stream, bitmap_spans)]
+            self._volumes.extend(self._empty_partitions())
         return self._volumes
 
-    def _imap_stream_records(self) -> list[tuple[int, int, int]]:
-        """``(slice_id, stream id, size)`` for every data stream the imap (TLV[0]) names.
+    def _empty_partitions(self) -> list[TibxVolume]:
+        """The partitions of the selected recovery point whose content has no data_map stream."""
+        try:
+            records = self._item_streams()
+        except InvalidPasswordError:
+            return []
+        # An item's version in a backup is its newest record up to that backup, as Acronis
+        # lists items; one that is deleted or incomplete is not there
+        versions: dict[bytes, ItemStream] = {}
+        for record in records:
+            if record.index == 0 and (self._slice_limit is None or record.slice_id <= self._slice_limit):
+                version = versions.get(record.name)
+                if version is None or record.slice_id > version.slice_id:
+                    versions[record.name] = record
+        streams = {stream.volume_id for stream in self.streams()}
+        return [
+            TibxVolume(self, record.id, self.extents, 0, 0)
+            for name, record in versions.items()
+            if PARTITION_NAME_RE.fullmatch(name)
+            and record.flags & c_tibx.ItemFlags.COMPLETE
+            and not record.flags & c_tibx.ItemFlags.DELETED
+            and record.id not in streams
+        ]
+
+    def _item_streams(self) -> list[ItemStream]:
+        """Every data stream the imap (TLV[0]) names.
 
         Every backup records all of its items in the imap -- its disks, partitions and
         Acronis metadata, or its files and directories -- each with the data_map streams
@@ -420,8 +464,8 @@ class TIBX:
             ~dissect.archive.tibx.exception.InvalidPasswordError: If the imap is encrypted and the archive is
                 locked.
         """
-        if self._imap_streams is None:
-            records: list[tuple[int, int, int]] = []
+        if self._item_streams_cache is None:
+            records: list[ItemStream] = []
             imap = self.header.tree(TLV_IMAP)
             if imap is not None and imap.has_records:
                 seen: set[bytes] = set()
@@ -435,12 +479,15 @@ class TIBX:
                     end = IMAP_VALUE_SIZE + (c_tibx.imap_value(value).extra_streams + 1) * IMAP_STREAM_SIZE
                     if len(value) < end:
                         continue
-                    slice_id = c_tibx.imap_key(cell.key).slice_id
+                    key = c_tibx.imap_key(cell.key)
+                    name = cell.key[IMAP_KEY_SIZE:]
                     for offset in range(IMAP_VALUE_SIZE, end, IMAP_STREAM_SIZE):
                         stream = c_tibx.imap_stream(value[offset : offset + IMAP_STREAM_SIZE])
-                        records.append((slice_id, stream.id, stream.size))
-            self._imap_streams = records
-        return self._imap_streams
+                        records.append(
+                            ItemStream(key.slice_id, name, int(key.flags), stream.index, stream.id, stream.size)
+                        )
+            self._item_streams_cache = records
+        return self._item_streams_cache
 
     def _stream_size(self, volume_id: int) -> int | None:
         """The size the imap gives data_map stream ``volume_id``, as of the selected recovery point.
@@ -450,14 +497,15 @@ class TIBX:
         """
         if self._stream_sizes is None:
             try:
-                records = self._imap_stream_records()
+                records = self._item_streams()
             except InvalidPasswordError:
                 return None
             # Oldest backup first, so the newest one in view decides
             self._stream_sizes = {
-                stream_id: size
-                for slice_id, stream_id, size in sorted(records)
-                if self._slice_limit is None or slice_id <= self._slice_limit
+                record.id: record.size
+                for record in sorted(records)
+                if (self._slice_limit is None or record.slice_id <= self._slice_limit)
+                and not record.flags & c_tibx.ItemFlags.DELETED
             }
         return self._stream_sizes.get(volume_id)
 

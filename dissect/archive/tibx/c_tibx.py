@@ -340,13 +340,18 @@ struct segment_map_value {
     char        hash[20];               /* SHA-1 of the decompressed segment */
 };
 
-/* imap (TLV[0]) record key: one item of one backup, such as a disk, partition or file.
- * Every backup records all of its items again, under its own slice id. The item's path
- * follows, to the end of the key. */
+flag ItemFlags : uint16 {
+    COMPLETE    = 0x0001,               /* set by archive_item_complete(); cleared while the item is written */
+    LINKED      = 0x0002,               /* the item has more names, see the nlink_map */
+    DELETED     = 0x0100                /* gone as of this backup; hides the older versions */
+};
+
+/* imap (TLV[0], "items") record key: one version of an item, such as a disk, partition or
+ * file, as of a backup. The item's path follows, to the end of the key. An item's version
+ * in a backup is its newest record with a slice id up to that backup's. */
 struct imap_key {
     uint32      slice_id;
-    uint8       flags;
-    uint8       item_class;
+    ItemFlags   flags;
     uint8       type;
 };
 
@@ -355,10 +360,15 @@ struct imap_value {
     uint8       extra_streams;          /* streams after the first */
 };
 
+flag StreamFlags : uint8 {
+    WRITTEN     = 0x01,                 /* written by the record's backup */
+    UNKNOWN_2   = 0x02                  /* always set by libarchive3's writer, never read */
+};
+
 /* A data stream of an imap item: its content (index 0), or more about it */
 struct imap_stream {
     uint8       index;
-    uint8       state;                  /* 3 data stored, 2 empty */
+    StreamFlags flags;
     uint64      id;                     /* data_map volume_id the data is stored under */
     uint64      size;                   /* size of the data */
 };

@@ -273,18 +273,22 @@ def test_acronis_volume_size(name: str, recovery_point: int | str, sizes: dict[i
 
 
 @pytest.mark.parametrize(
-    ("recovery_point", "digest"),
+    ("recovery_point", "volume_id", "digest"),
     [
+        # Before it was formatted, the partition stores no data at all, and reads as zeros
+        (0, 0x6, "5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee"),
+        (1, 0x6, "5647f05ec18958947d32874eeb788fa396a05d0bab7c1b71f112ceb7e9b31eee"),
         # A freshly formatted FAT16, which stores 20 KiB of its 2 MiB
-        (2, "b69c98b5ac590d9173bd06df0388cbdd18ad0a12acf5963bcd6607254ac8ff36"),
-        (3, "d29989304fc63657dfdab3fd7fb0a804a747b93580b7abb622a29f3d55ae33e7"),
+        (2, 0xE, "b69c98b5ac590d9173bd06df0388cbdd18ad0a12acf5963bcd6607254ac8ff36"),
+        (3, 0xE, "d29989304fc63657dfdab3fd7fb0a804a747b93580b7abb622a29f3d55ae33e7"),
     ],
 )
-def test_acronis_sparse_volume(recovery_point: int, digest: str) -> None:
-    # What ``tibxread calculate hash --volume 1-1`` gives (verified for recovery point 2)
+def test_acronis_sparse_volume(recovery_point: int, volume_id: int, digest: str) -> None:
+    # What ``tibxread calculate hash --volume 1-1`` gives (verified for recovery points 0 and 2)
     with _open("ati_2020_disk_lz4_compr") as tibx:
         tibx.use_recovery_point(recovery_point)
-        assert _sha256(tibx, 0xE) == digest
+        assert [volume.volume_id for volume in tibx.volumes()] == [volume_id]
+        assert _sha256(tibx, volume_id) == digest
 
 
 @pytest.mark.parametrize("name", ["ati_2020_disk_lz4_compr", "ati_2020_disk_enc_lz4_compr"])

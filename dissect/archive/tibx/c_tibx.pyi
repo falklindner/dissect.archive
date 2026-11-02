@@ -524,17 +524,20 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
+    class ItemFlags(__cs__.Flag):
+        COMPLETE = ...
+        LINKED = ...
+        DELETED = ...
+
     class imap_key(__cs__.Structure):
         slice_id: _c_tibx.uint32
-        flags: _c_tibx.uint8
-        item_class: _c_tibx.uint8
+        flags: _c_tibx.ItemFlags
         type: _c_tibx.uint8
         @overload
         def __init__(
             self,
             slice_id: _c_tibx.uint32 | None = ...,
-            flags: _c_tibx.uint8 | None = ...,
-            item_class: _c_tibx.uint8 | None = ...,
+            flags: _c_tibx.ItemFlags | None = ...,
             type: _c_tibx.uint8 | None = ...,
         ): ...
         @overload
@@ -547,16 +550,20 @@ class _c_tibx(__cs__.cstruct):
         @overload
         def __init__(self, fh: bytes | memoryview | bytearray | BinaryIO, /): ...
 
+    class StreamFlags(__cs__.Flag):
+        WRITTEN = ...
+        UNKNOWN_2 = ...
+
     class imap_stream(__cs__.Structure):
         index: _c_tibx.uint8
-        state: _c_tibx.uint8
+        flags: _c_tibx.StreamFlags
         id: _c_tibx.uint64
         size: _c_tibx.uint64
         @overload
         def __init__(
             self,
             index: _c_tibx.uint8 | None = ...,
-            state: _c_tibx.uint8 | None = ...,
+            flags: _c_tibx.StreamFlags | None = ...,
             id: _c_tibx.uint64 | None = ...,
             size: _c_tibx.uint64 | None = ...,
         ): ...
