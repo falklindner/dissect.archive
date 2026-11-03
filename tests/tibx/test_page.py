@@ -128,19 +128,6 @@ def test_live_root_all_roots_torn() -> None:
         store.live_root()
 
 
-def test_commit_roots_ordered_by_commit_time() -> None:
-    # Three roots written out of timestamp order; enumeration sorts oldest -> newest
-    data = (
-        arch_page(1000, 7000, b"\x03" * 16)
-        + data_page(SEG_PAYLOAD)
-        + arch_page(1000, 2000, b"\x01" * 16)
-        + arch_page(1000, 5000, b"\x02" * 16)
-    )
-    roots = PageStore(io.BytesIO(data)).commit_roots()
-    assert [sb.modified_ms for sb in roots] == [2000, 5000, 7000]
-    assert [sb.offset for sb in roots] == [2 * PAGE_SIZE, 3 * PAGE_SIZE, 0]
-
-
 def test_page_crc_ignores_checksum_field() -> None:
     page = bytearray(PAGE_SIZE)
     page[0], page[1] = PAGE_MARKER, c_tibx.PageType.ARCH

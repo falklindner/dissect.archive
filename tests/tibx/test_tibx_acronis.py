@@ -320,55 +320,36 @@ def test_acronis_segment_hash(name: str) -> None:
 
 @pytest.mark.parametrize("name", ARCHIVES)
 def test_acronis_commit_info(name: str) -> None:
-    # The commit info chain finds what a page scan finds, without one
+    # In an intact archive CI0, the last commit info and the last header all name the same root
     with _open(name) as tibx:
         store = tibx.store
         assert store.live_root().offset == store._last_ci().arch_offset == store._last_arch().offset
 
-        chained = store._chained_roots()
-        assert chained is not None
-        assert sorted(root.offset for root in chained) == sorted(root.offset for root in store._scan_commit_roots())
 
-
-@pytest.mark.parametrize("name", ARCHIVES)
-def test_acronis_commit_infos(name: str) -> None:
-    # One commit info page per commit, page 2's first, found along the chain as the page scan
-    # finds them
-    with _open(name) as tibx:
-        store = tibx.store
-        infos = store.commit_infos()
-        assert store._chained_commit_infos(store.live_root()) is not None
-        assert [ci.offset for ci in infos] == [ci.offset for ci in store._scan_commit_infos()]
-        assert infos[0].offset == FIRST_CI_OFFSET
-        assert len(infos) == len(store.commit_roots())
-        assert {ci.archive_uuid for ci in infos} == {store.live_root().archive_uuid}
-
-
-def test_acronis_commit_infos_rewritten_ci0() -> None:
+def test_acronis_commit_info_rewritten_ci0() -> None:
     # Cyber Protect 15 rewrites CI0 after each commit: it describes the newest commit, and
     # is the last commit info written
     with _open("t1_chain_inc") as tibx:
-        infos = tibx.store.commit_infos()
-        assert [ci.commit_seq for ci in infos] == [5, 1, 2, 3, 4, 5]
-        assert [ci.ci_seq for ci in infos] == [10, 1, 3, 5, 7, 9]
-        assert infos[0].flags == c_tibx.ArciFlags.REWRITE | c_tibx.ArciFlags.CI0
-        assert all(ci.flags == c_tibx.ArciFlags.REWRITE for ci in infos[1:])
-        assert infos[0].arch_offset == infos[-1].arch_offset == tibx.store.live_root().offset
+        store = tibx.store
+        ci0 = store._ci0()
+        newest = store._commit_info_at(store.live_root().ci_offset)
+        assert ci0.flags == c_tibx.ArciFlags.REWRITE | c_tibx.ArciFlags.CI0
+        assert newest.flags == c_tibx.ArciFlags.REWRITE
+        assert ci0.commit_seq == newest.commit_seq == 5
+        assert (ci0.ci_seq, newest.ci_seq) == (10, 9)
+        assert ci0.arch_offset == newest.arch_offset == store.live_root().offset
 
 
 def test_acronis_commit_info_split_archive() -> None:
     # CI0 is only in the first file of a split archive, and names the newest commit in the
-    # last; the commit info chain runs across both files, in offsets of the whole archive
+    # last, in offsets of the whole archive
     with _open("t1_chain_diff") as tibx:
         store = tibx.store
         assert store._ci0().arch_offset == store.live_root().offset == 0xBC000
-        chained = store._chained_roots()
-        assert [root.offset for root in chained] == [0xBC000, 0xB9000, 0xB6000, 0x79000, 0x76000, 0x3000, 0]
 
         # Commit info offsets are in the whole archive, volume offsets in the page's own file
-        infos = store.commit_infos()
-        assert [ci.offset for ci in infos] == [0x2000, 0x5000, 0x78000, 0x7B000, 0xB8000, 0xBB000, 0xBE000]
-        assert [ci.volume_offset for ci in infos] == [0x2000, 0x5000, 0x78000, 0x7B000, 0x3C000, 0x3F000, 0x42000]
+        newest = store._commit_info_at(store.live_root().ci_offset)
+        assert (newest.offset, newest.volume_offset) == (0xBE000, 0x42000)
 
 
 @pytest.mark.parametrize("name", ["t1_chain_inc", "ati_2020_disk_lz4_compr"])
@@ -394,7 +375,6 @@ def test_acronis_live_root_trusts_ci0() -> None:
     store = PageStore(io.BytesIO(bytes(data)))
     assert store._last_ci().arch_offset == 0xF3000
     assert store.live_root().offset == 0xB6000
-    assert [root.offset for root in store.commit_roots()][-1] == 0xB6000
 
 
 def test_acronis_commit_info_ci0_after_failed_backup() -> None:
@@ -406,21 +386,15 @@ def test_acronis_commit_info_ci0_after_failed_backup() -> None:
 
     assert store.live_root().offset == 0xF3000
     assert fh.reads == 3  # CI0, the commit info it names and its header
-    assert store._chained_roots() is not None
-    assert len(store.commit_roots()) == 6
 
 
 def test_acronis_commit_info_without_ci0() -> None:
     # True Image 2020 has no CI0, its first commit info page stays the first commit's: the
-    # backward scan finds the newest commit, however much data follows it, and the commit
-    # info chain the rest
+    # backward scan finds the newest commit, however much data follows it
     store = PageStore(io.BytesIO(_sample("ati_2020_disk_lz4_compr", trailing=2 * SCAN_CHUNK_MIN_PAGES)))
     assert store._ci0() is None
     assert store._commit_info_at(FIRST_CI_OFFSET) is not None
     assert store.live_root().offset == 0x53000
-    chained = store._chained_roots()
-    assert chained is not None
-    assert len(chained) == len(store.commit_roots()) == 7
 
 
 def test_acronis_commit_info_damaged_ci0_and_end() -> None:
@@ -428,44 +402,17 @@ def test_acronis_commit_info_damaged_ci0_and_end() -> None:
     store = PageStore(io.BytesIO(data))
     assert store._ci0() is None
     assert store.live_root().offset == 0xF3000
-    # Without page 2 the commit info chain has no end, but the page scan finds every root
-    assert store._chained_roots() is None
-    assert len(store.commit_roots()) == 6
-    assert [ci.offset for ci in store.commit_infos()] == [0x5000, 0x79000, 0x7C000, 0xB8000, 0xF6000]
-
-
-def test_acronis_commit_info_broken_chain_falls_back() -> None:
-    # A damaged commit info page halfway down the chain: the page scan still finds every root
-    intact = [root.offset for root in PageStore(io.BytesIO(_sample("t1_chain_inc"))).commit_roots()]
-    store = PageStore(io.BytesIO(_sample("t1_chain_inc", corrupt=(0x79000,))))
-    assert store._chained_roots() is None
-    assert [root.offset for root in store.commit_roots()] == intact
-    assert store.live_root().offset == 0xF3000
 
 
 def test_acronis_live_root_without_commit_info() -> None:
     # With every commit info page damaged, the last CRC-valid ARCH header is the live root
     store = PageStore(io.BytesIO(_sample("t1_chain_inc")))
-    offsets = tuple(ci.offset for ci in store.commit_infos())
+    offsets = tuple(
+        index * PAGE_SIZE for index in range(store.page_count) if store.page(index)[1] == c_tibx.PageType.ARCI
+    )
     store = PageStore(io.BytesIO(_sample("t1_chain_inc", corrupt=offsets)))
     assert store._ci0() is None
     assert store._last_ci() is None
-    assert store.live_root().offset == 0xF3000
-
-
-@pytest.mark.parametrize("prev_ci_offset", [0xF6000, 0x79000])
-def test_acronis_commit_info_cyclic_chain_falls_back(prev_ci_offset: int) -> None:
-    # A commit info page pointing back to the newest one, or at itself -- damaged or crafted,
-    # with both CRCs intact: its ci_seq does not count down, so the walk stops rather than
-    # loops, and the page scan finds every root
-    intact = [root.offset for root in PageStore(io.BytesIO(_sample("t1_chain_inc"))).commit_roots()]
-    data = bytearray(_sample("t1_chain_inc"))
-    _rewrite_commit_info(data, 0x79000, prev_ci_offset=prev_ci_offset)
-
-    store = PageStore(io.BytesIO(bytes(data)))
-    assert store._commit_info_at(0x79000) is not None
-    assert store._chained_roots() is None
-    assert [root.offset for root in store.commit_roots()] == intact
     assert store.live_root().offset == 0xF3000
 
 

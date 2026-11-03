@@ -59,15 +59,13 @@ SCAN_CHUNK_MIN_PAGES = 16
 SCAN_CHUNK_MAX_PAGES = 1024
 
 # ENVELOPE PARSING -- page envelopes go through :class:`c_tibx.page_header` everywhere
-# except the page sweeps -- :func:`_is_valid_page`, :meth:`PageStore._last_ci`,
-# :meth:`PageStore._last_arch`, :meth:`PageStore._scan_commit_roots` and
-# :meth:`PageStore._scan_commit_infos` -- which index the envelope bytes directly.
+# except the page sweeps -- :func:`_is_valid_page`, :meth:`PageStore._last_ci` and
+# :meth:`PageStore._last_arch` -- which index the envelope bytes directly.
 #
 # cstruct costs ~3.6 us per envelope against ~0.33 us for the indexing, but that ratio is
 # not the one that matters; measured end to end on a 949 MiB archive (242,977 pages):
 #
 #   verify()               1.06x  -- dominated by CRC-32C (13.1 s of the 13.9 s)
-#   _scan_commit_roots()   1.92x  -- 859 ms vs 1644 ms
 #
 # and on an archive whose live root is 84k pages before EOF, as in one real archive (most
 # have it within the last 3 pages, where the choice is unmeasurable):
@@ -298,13 +296,13 @@ class PageStore:
         page = self._page_at(offset)
         return None if page is None else _commit_info(page, offset)
 
-    def _root_at(self, offset: int, ci_offset: int) -> SuperBlock | None:
-        """The CRC-valid ARCH root at byte ``offset``, if its commit info is at ``ci_offset``."""
-        page = self._page_at(offset)
+    def _root_of(self, ci: CommitInfo) -> SuperBlock | None:
+        """The CRC-valid ARCH root that ``ci`` describes, if that root names ``ci`` as its commit info."""
+        page = self._page_at(ci.arch_offset)
         if page is None or not _is_valid_page(page, c_tibx.PageType.ARCH, ARCH_MAGIC):
             return None
-        root = SuperBlock(page, offset)
-        return root if root.ci_offset == ci_offset else None
+        root = SuperBlock(page, ci.arch_offset)
+        return root if root.ci_offset == ci.offset else None
 
     def _pages_backward(self) -> Iterator[tuple[int, bytes]]:
         """Iterate over all ``(index, page)`` pairs from EOF backward.
@@ -376,95 +374,14 @@ class PageStore:
             # CI0 names the newest commit info, which must describe the same root
             ci = self._commit_info_at(ci0.prev_ci_offset)
             if ci is not None and ci.arch_offset == ci0.arch_offset:
-                root = self._root_at(ci.arch_offset, ci.offset)
+                root = self._root_of(ci)
                 if root is not None:
                     return root
-        if (ci := self._last_ci()) is not None and (root := self._root_at(ci.arch_offset, ci.offset)) is not None:
+        if (ci := self._last_ci()) is not None and (root := self._root_of(ci)) is not None:
             return root
         if (root := self._last_arch()) is not None:
             return root
         raise CorruptArchiveError("No ARCH superblock found")
-
-    def commit_roots(self) -> list[SuperBlock]:
-        """Return all ARCH commit roots, oldest to newest (by commit time).
-
-        Each commit root is a complete copy-on-write snapshot of the archive, at a commit
-        rather than a backup: a backup takes several commits (see
-        :meth:`TIBX.recovery_points`). They are found by following the commit info chain back
-        from the :meth:`live_root`, and by a full page scan if the chain does not check out.
-        """
-        roots = self._chained_roots()
-        if roots is None:
-            roots = self._scan_commit_roots()
-        roots.sort(key=lambda sb: sb.modified_ms)
-        return roots
-
-    def _chained_roots(self) -> list[SuperBlock] | None:
-        """Every commit root along the commit info chain, newest first, or None if it breaks."""
-        try:
-            root = self.live_root()
-        except CorruptArchiveError:
-            return None
-        if (chain := self._chained_commit_infos(root)) is None:
-            return None
-        roots = [root]
-        for ci in chain[1:]:
-            # The first commit's header is page 0. Where CI0 is kept up to date it describes
-            # the newest commit instead, so page 0 is checked against CI0's place rather
-            # than against CI0's contents.
-            offset = 0 if ci.offset == FIRST_CI_OFFSET else ci.arch_offset
-            if (root := self._root_at(offset, ci.offset)) is None:
-                return None
-            roots.append(root)
-        return roots
-
-    def _scan_commit_roots(self) -> list[SuperBlock]:
-        """Every page that carries the ARCH magic, by a full page scan."""
-        roots = []
-        for i, page in self.pages():
-            # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
-            if page[0] == PAGE_MARKER and page[1] == _ARCH_TYPE and page[8:12] == ARCH_MAGIC:
-                roots.append(SuperBlock(page, i * PAGE_SIZE))
-        return roots
-
-    def commit_infos(self) -> list[CommitInfo]:
-        """Return all commit info pages, oldest to newest.
-
-        The first is the one at page 2: the first commit's, or CI0 (see :meth:`_ci0`), which
-        describes the newest commit instead. They are found by following the commit info chain back
-        from the :meth:`live_root`, and by a full page scan if the chain does not check out.
-        """
-        try:
-            chain = self._chained_commit_infos(self.live_root())
-        except CorruptArchiveError:
-            chain = None
-        return self._scan_commit_infos() if chain is None else chain[::-1]
-
-    def _chained_commit_infos(self, root: SuperBlock) -> list[CommitInfo] | None:
-        """The commit info chain back from ``root``'s, newest first and page 2's last, or None if it breaks."""
-        chain = []
-        ci = self._commit_info_at(root.ci_offset)
-        while ci is not None:
-            chain.append(ci)
-            if ci.offset == FIRST_CI_OFFSET:
-                return chain
-            previous = self._commit_info_at(ci.prev_ci_offset)
-            # Each commit info is written after the one before it, so ci_seq counts down
-            # along the chain wherever "rewrite" mode put the pages; that also ends a chain
-            # that loops. Only a CI0, which ends the chain, was written after them all.
-            if previous is not None and previous.offset != FIRST_CI_OFFSET and previous.ci_seq >= ci.ci_seq:
-                return None
-            ci = previous
-        return None
-
-    def _scan_commit_infos(self) -> list[CommitInfo]:
-        """Every commit info page whose CRC-32C and CRC-64 hold, by a full page scan."""
-        infos = []
-        for i, page in self.pages():
-            # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
-            if page[1] == _ARCI_TYPE and (ci := _commit_info(page, i * PAGE_SIZE)):
-                infos.append(ci)
-        return infos
 
     def verify(self) -> dict:
         """CRC-32C every page and return a summary.
