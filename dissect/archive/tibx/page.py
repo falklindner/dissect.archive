@@ -25,6 +25,7 @@ mniedermaier).
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import TYPE_CHECKING, BinaryIO
 
 from dissect.util import ts
@@ -392,11 +393,11 @@ class PageStore:
 
         Returns:
             A dict with ``ok``/``bad``/``holes`` page counts, the ``bad_pages`` indices
-            and an ``ok``-page count per type name in ``by_type``.
+            and an ``ok``-page count per type name in ``by_type``, most common first.
         """
         zero_page = b"\x00" * PAGE_SIZE
         ok = bad = holes = 0
-        by_type: dict[str, int] = {}
+        by_type: Counter[str] = Counter()
         bad_pages: list[int] = []
         for index, page in self.pages():
             if page == zero_page:
@@ -406,8 +407,14 @@ class PageStore:
             if header.crc32c == page_crc32c(page):
                 ok += 1
                 name = _type_name(header.type)
-                by_type[name] = by_type.get(name, 0) + 1
+                by_type[name] += 1
             else:
                 bad += 1
                 bad_pages.append(index)
-        return {"ok": ok, "bad": bad, "holes": holes, "bad_pages": bad_pages, "by_type": by_type}
+        return {
+            "ok": ok,
+            "bad": bad,
+            "holes": holes,
+            "bad_pages": bad_pages,
+            "by_type": dict(by_type.most_common()),
+        }
