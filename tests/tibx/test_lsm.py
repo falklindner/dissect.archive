@@ -1,0 +1,279 @@
+from __future__ import annotations
+
+import io
+import struct
+
+import pytest
+
+from dissect.archive.tibx import lsm
+from dissect.archive.tibx.c_tibx import ENVELOPE_SIZE, LSB_CTREE_OFFSET, LSM_CELL_STREAM_OFFSET, c_tibx
+from dissect.archive.tibx.crypto import DataKey
+from dissect.archive.tibx.exception import CorruptArchiveError, InvalidPasswordError
+from dissect.archive.tibx.lsm import (
+    LsmSuperBlock,
+    decode_cells_compact,
+    decode_cells_variable,
+    decode_page_cells,
+    iter_memtree_cells,
+    read_archive_header,
+    walk_tree,
+)
+from dissect.archive.tibx.page import PageStore
+from tests._tools.tibx._synth import (
+    PAGE,
+    Cell,
+    CountingIO,
+    arch_header_page,
+    arch_page,
+    blank_page,
+    compact_cells,
+    lsb,
+    lsm_page,
+)
+
+
+def test_compact_cells_roundtrip_with_tombstone() -> None:
+    cells = [
+        Cell(b"k" * 8, b"v" * 4),
+        Cell(b"t" * 8, b"", alive=False),
+        Cell(b"m" * 8, b"w" * 4),
+    ]
+    decoded = decode_cells_compact(compact_cells(cells), 3, key_length=8, value_length=4)
+    assert [(c.key, c.value, c.alive) for c in decoded] == [
+        (b"k" * 8, b"v" * 4, True),
+        (b"t" * 8, b"", False),
+        (b"m" * 8, b"w" * 4, True),
+    ]
+
+
+def test_compact_cells_multiple_groups() -> None:
+    cells = [Cell(struct.pack(">Q", i), struct.pack(">I", i)) for i in range(30)]
+    decoded = decode_cells_compact(compact_cells(cells), 30, key_length=8, value_length=4)
+    assert len(decoded) == 30
+    assert decoded[29].key == struct.pack(">Q", 29)
+
+
+def _variable_cells(cells: list[Cell]) -> bytes:
+    # The cells of a variable-key tree: one group, each cell led by its leb128 lengths
+    out = c_tibx.lsm_cell_group_header(count=len(cells), alive=(1 << len(cells)) - 1).dumps()
+    for cell in cells:
+        out += bytes([len(cell.key), len(cell.value)]) + cell.key + cell.value
+    return out
+
+
+def test_compact_cells_variable_length() -> None:
+    key = b"K" * 200
+    buf = c_tibx.lsm_cell_group_header(count=2, alive=0b11).dumps()
+    buf += bytes([200 & 0x7F | 0x80, 200 >> 7, 3]) + key + b"abc" + bytes([1, 0]) + b"k"
+    decoded = decode_cells_compact(buf, 2, key_length=0, value_length=0)
+    assert [(c.key, c.value) for c in decoded] == [(key, b"abc"), (b"k", b"")]
+
+
+def test_memtree_variable_keys() -> None:
+    cells = [Cell(b"ab", b"xyz"), Cell(b"abc", b"")]
+    sb = LsmSuperBlock(lsb(0, 0, memtree_cells=cells, memtree_blob=_variable_cells(cells)), tlv_index=0)
+    assert [(c.key, c.value) for c in iter_memtree_cells(sb)] == [(b"ab", b"xyz"), (b"abc", b"")]
+
+
+def test_memtree_encrypted() -> None:
+    # Framed like an AES-GCM segment: the IV, the tag, then the ciphertext
+    from Crypto.Cipher import AES
+
+    cells = [Cell(b"ab", b"xyz")]
+    key, iv = bytes(range(32)), bytes(range(16))
+    ciphertext, tag = AES.new(key, AES.MODE_GCM, nonce=iv).encrypt_and_digest(_variable_cells(cells))
+    payload = lsb(0, 0, memtree_cells=cells, memtree_blob=iv + tag + ciphertext, memtree_encoding=0x80)
+    sb = LsmSuperBlock(payload, tlv_index=0)
+
+    with pytest.raises(InvalidPasswordError):
+        iter_memtree_cells(sb)
+    assert [(c.key, c.value) for c in iter_memtree_cells(sb, DataKey(alg=7, key=key))] == [(b"ab", b"xyz")]
+
+
+def test_variable_cells_leb128() -> None:
+    # leb128 key_len | leb128 val_len | key | val, with a >127 length
+    key = b"K" * 200
+    buf = bytes([200 & 0x7F | 0x80, 200 >> 7]) + bytes([3]) + key + b"abc"
+    decoded = decode_cells_variable(buf, 1)
+    assert decoded[0].key == key
+    assert decoded[0].value == b"abc"
+
+
+def test_variable_cells_truncated() -> None:
+    with pytest.raises(CorruptArchiveError):
+        decode_cells_variable(b"", 1)
+
+
+def test_lsb_parse_memtree_and_ctrees() -> None:
+    cells = [Cell(b"a" * 8, b"1" * 4), Cell(b"b" * 8, b"2" * 4)]
+    sb = LsmSuperBlock(lsb(8, 4, memtree_cells=cells), tlv_index=1)
+    assert sb.key_length == 8
+    assert sb.value_length == 4
+    assert sb.memtree_node_count == 2
+    assert sb.has_records
+    assert all(c.offset is None for c in sb.ctrees)
+    assert [(c.key, c.value) for c in iter_memtree_cells(sb)] == [(b"a" * 8, b"1" * 4), (b"b" * 8, b"2" * 4)]
+
+    sb = LsmSuperBlock(lsb(8, 4, ctrees=[(3 * PAGE, 5)]), tlv_index=1)
+    assert sb.ctrees[0].root_page == 3
+    assert sb.has_records
+    assert iter_memtree_cells(sb) == []
+
+    assert not LsmSuperBlock(lsb(8, 4), tlv_index=1).has_records
+
+
+def test_lsb_ignores_slots_past_nr_ctree() -> None:
+    # Acronis reads only nr_ctree slots: a stale ctree past them is not part of the tree
+    payload = bytearray(lsb(8, 4, ctrees=[(3 * PAGE, 5)]))
+    slot = LSB_CTREE_OFFSET + len(c_tibx.ctree_ref)
+    payload[slot : slot + len(c_tibx.ctree_ref)] = c_tibx.ctree_ref(offset=9 * PAGE, tree_sz=PAGE, tree_nr=7).dumps()
+    sb = LsmSuperBlock(bytes(payload), tlv_index=1)
+    assert [ctree.root_page for ctree in sb.ctrees] == [3]
+    assert sb.ctrees[0].tree_nr == 5
+
+
+def test_leaf_page_cells() -> None:
+    cells = [Cell(b"k" * 8, b"v" * 4)]
+    page = lsm_page(0x03, b"LEAF", cells, key_length=8, compact=True)
+    decoded = decode_page_cells(page[8:], key_length=8, value_length=4)
+    assert [(c.key, c.value) for c in decoded] == [(b"k" * 8, b"v" * 4)]
+
+
+def test_walk_tree_through_ldir() -> None:
+    # page 0: ARCH; page 1: LDIR -> pages 2 and 3 (LEAF)
+    leaf_a = [Cell(b"a" * 8, b"1" * 4), Cell(b"b" * 8, b"2" * 4)]
+    leaf_b = [Cell(b"c" * 8, b"3" * 4)]
+    ldir = [
+        Cell(b"a" * 8, struct.pack(">Q", 2 * PAGE)),
+        Cell(b"c" * 8, struct.pack(">Q", 3 * PAGE)),
+    ]
+    archive = (
+        arch_page(1000, 2000, b"\xab" * 16)
+        + lsm_page(0x04, b"LDIR", ldir, key_length=8, compact=False)
+        + lsm_page(0x03, b"LEAF", leaf_a, key_length=8, compact=True)
+        + lsm_page(0x03, b"LEAF", leaf_b, key_length=8, compact=True)
+    )
+    store = PageStore(io.BytesIO(archive))
+    cells = list(walk_tree(store, 1, key_length=8, value_length=4))
+    assert [(c.key, c.value) for c in cells] == [
+        (b"a" * 8, b"1" * 4),
+        (b"b" * 8, b"2" * 4),
+        (b"c" * 8, b"3" * 4),
+    ]
+
+
+def _unchecked_lsm_page(page_type: int, magic: bytes, cells: list[Cell], key_length: int, compact: bool) -> bytes:
+    """An LSM page without its CRC: tree walks do not check it, and thousands are needed."""
+    stream = compact_cells(cells) if compact else b"".join(cell.key + cell.value for cell in cells)
+    page = blank_page(page_type)
+    header = c_tibx.lsm_page_header(
+        magic=magic,
+        version=1,
+        encoding=0,
+        cell_count=len(cells),
+        uncompressed_size=len(stream),
+        on_disk_size=len(stream),
+        seq=1,
+    )
+    page[ENVELOPE_SIZE : ENVELOPE_SIZE + len(c_tibx.lsm_page_header)] = header.dumps()
+    start = ENVELOPE_SIZE + LSM_CELL_STREAM_OFFSET
+    page[start : start + len(stream)] = stream
+    return bytes(page)
+
+
+def test_walk_tree_past_8192_pages() -> None:
+    # The segment_map of a large archive runs to thousands of pages; a walk that stops at
+    # a fixed page budget loses every record past it without an error
+    leaves_per_ldir, ldir_count = 100, 85
+    leaf_count = leaves_per_ldir * ldir_count
+    first_leaf = 2 + ldir_count
+    pages = []
+    root = [Cell(struct.pack(">Q", i * leaves_per_ldir), struct.pack(">Q", (2 + i) * PAGE)) for i in range(ldir_count)]
+    pages.append(_unchecked_lsm_page(0x04, b"LDIR", root, key_length=8, compact=False))
+    for i in range(ldir_count):
+        children = [
+            Cell(struct.pack(">Q", leaf), struct.pack(">Q", (first_leaf + leaf) * PAGE))
+            for leaf in range(i * leaves_per_ldir, (i + 1) * leaves_per_ldir)
+        ]
+        pages.append(_unchecked_lsm_page(0x04, b"LDIR", children, key_length=8, compact=False))
+    pages.extend(
+        _unchecked_lsm_page(0x03, b"LEAF", [Cell(struct.pack(">Q", leaf), b"v" * 4)], key_length=8, compact=True)
+        for leaf in range(leaf_count)
+    )
+    store = PageStore(io.BytesIO(arch_page(1000, 2000, b"\xab" * 16) + b"".join(pages)))
+
+    keys = [cell.key for cell in walk_tree(store, 1, key_length=8, value_length=4)]
+    assert len(pages) > 8192
+    assert keys == [struct.pack(">Q", leaf) for leaf in range(leaf_count)]
+
+
+def _tree_in_walk_order(leaves_per_ldir: int, ldir_count: int) -> tuple[list[bytes], list[bytes]]:
+    """A root LDIR at page 1 over ``ldir_count`` LDIRs, then their LEAFs, as a tree written in one go."""
+    first_leaf = 2 + ldir_count
+    root = [Cell(struct.pack(">Q", i * leaves_per_ldir), struct.pack(">Q", (2 + i) * PAGE)) for i in range(ldir_count)]
+    pages = [_unchecked_lsm_page(0x04, b"LDIR", root, key_length=8, compact=False)]
+    for i in range(ldir_count):
+        children = [
+            Cell(struct.pack(">Q", leaf), struct.pack(">Q", (first_leaf + leaf) * PAGE))
+            for leaf in range(i * leaves_per_ldir, (i + 1) * leaves_per_ldir)
+        ]
+        pages.append(_unchecked_lsm_page(0x04, b"LDIR", children, key_length=8, compact=False))
+    keys = [struct.pack(">Q", leaf) for leaf in range(leaves_per_ldir * ldir_count)]
+    pages.extend(_unchecked_lsm_page(0x03, b"LEAF", [Cell(key, b"v" * 4)], key_length=8, compact=True) for key in keys)
+    return pages, keys
+
+
+@pytest.mark.parametrize(
+    ("read_ahead", "reads"),
+    [
+        # The root, the three LDIRs together, then the 50 LEAFs of each LDIR together
+        (256, 1 + 1 + 3),
+        # At most 16 pages a read: each run of 50 LEAFs takes 4 reads
+        (16, 1 + 1 + 3 * 4),
+    ],
+)
+def test_walk_tree_reads_consecutive_pages_together(
+    monkeypatch: pytest.MonkeyPatch, read_ahead: int, reads: int
+) -> None:
+    monkeypatch.setattr(lsm, "WALK_READ_AHEAD_PAGES", read_ahead)
+    pages, keys = _tree_in_walk_order(leaves_per_ldir=50, ldir_count=3)
+    fh = CountingIO(arch_page(1000, 2000, b"\xab" * 16) + b"".join(pages))
+    store = PageStore(fh)
+    fh.reads = 0
+
+    assert [cell.key for cell in walk_tree(store, 1, key_length=8, value_length=4)] == keys
+    assert fh.reads == reads
+
+
+def test_walk_tree_reads_ahead_only_within_the_archive() -> None:
+    # A last LEAF pointer past the end of the archive is skipped as before, and the
+    # read-ahead before it stops at the last page
+    pages, keys = _tree_in_walk_order(leaves_per_ldir=4, ldir_count=1)
+    ldir = [Cell(key, struct.pack(">Q", (3 + leaf) * PAGE)) for leaf, key in enumerate(keys)]
+    ldir.append(Cell(struct.pack(">Q", 99), struct.pack(">Q", (3 + len(keys)) * PAGE)))
+    pages[1] = _unchecked_lsm_page(0x04, b"LDIR", ldir, key_length=8, compact=False)
+    store = PageStore(io.BytesIO(arch_page(1000, 2000, b"\xab" * 16) + b"".join(pages)))
+
+    assert [cell.key for cell in walk_tree(store, 1, key_length=8, value_length=4)] == keys
+
+
+def test_walk_tree_rejects_cycles() -> None:
+    # An LDIR that points back at itself would otherwise be walked forever
+    ldir = [Cell(b"a" * 8, struct.pack(">Q", 1 * PAGE))]
+    archive = arch_page(1000, 2000, b"\xab" * 16) + lsm_page(0x04, b"LDIR", ldir, key_length=8, compact=False)
+    store = PageStore(io.BytesIO(archive))
+    with pytest.raises(CorruptArchiveError, match="revisits page 1"):
+        list(walk_tree(store, 1, key_length=8, value_length=4))
+
+
+def test_archive_header_tlv_and_trees() -> None:
+    dm = lsb(31, 10, memtree_cells=[Cell(b"\x00" * 31, b"\x01" * 10)])
+    sm = lsb(8, 32, memtree_cells=[Cell(b"\x00" * 8, b"\x02" * 32)])
+    store = PageStore(io.BytesIO(arch_header_page({1: dm, 2: sm})))
+    header = read_archive_header(store)
+    assert header.version == 8
+    assert len(header.tlv) == 19
+    assert header.tree(1) is not None
+    assert header.tree(1).key_length == 31
+    assert header.tree(2).value_length == 32
+    assert header.tree(3) is None

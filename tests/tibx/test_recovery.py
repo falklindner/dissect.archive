@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import io
+import uuid
+
+import pytest
+
+from dissect.archive.tibx.c_tibx import c_tibx
+from dissect.archive.tibx.exception import InvalidArchiveError
+from dissect.archive.tibx.tibx import TIBX
+from tests._tools.tibx._synth import (
+    PAGE,
+    Cell,
+    ExtentSpec,
+    build_lsm_archive,
+    lsb,
+    lsm_page,
+    slice_record,
+)
+
+# A chain lives in one archive: each backup writes its extents under its own slice id, and
+# the slices tree (TLV[5]) records the backups. Slice ids are not contiguous in the wild --
+# a real differential chain numbered its two backups 2 and 4 -- so this uses 2, 3, 5.
+SLICES = [2, 3, 5]
+
+
+def _chain() -> TIBX:
+    archive = build_lsm_archive(
+        [
+            ExtentSpec(10, 0, b"base state" + b"\x00" * 54, slice_id=2),
+            ExtentSpec(10, 0, b"after first backup" + b"\x00" * 46, slice_id=3),
+            ExtentSpec(10, 0, b"after second backup" + b"\x00" * 45, slice_id=5),
+        ],
+        slices=SLICES,
+    )
+    return TIBX(io.BytesIO(archive))
+
+
+def test_slice_record_size() -> None:
+    # Ensure that the slice_record struct remains correct size
+    assert len(c_tibx.slice_record) == 0x84
+
+
+def test_recovery_points_are_backups_not_commit_roots() -> None:
+    # Acronis writes a varying number of ARCH commit roots per backup, so counting roots
+    # invents recovery points that were never taken. The slices tree is the archive's own
+    # record of its backups, and matches what "acrocmd list backups" lists.
+    tibx = _chain()
+    points = tibx.recovery_points()
+
+    assert len(points) == 3
+    assert [p.index for p in points] == [0, 1, 2]
+    assert [p.slice_id for p in points] == SLICES
+
+
+def test_recovery_point_carries_guid_and_times() -> None:
+    point = _chain().recovery_points()[1]
+
+    assert point.guid == uuid.UUID(bytes_le=bytes([3]) * 16)
+    assert point.created.timestamp() == pytest.approx(3.0)
+    assert point.finished.timestamp() == pytest.approx(3.01)
+
+
+def test_latest_is_default() -> None:
+    tibx = _chain()
+    assert tibx.streams()[0].read(0, 19) == b"after second backup"
+
+
+def test_select_by_index() -> None:
+    tibx = _chain()
+    tibx.use_recovery_point(0)
+    assert tibx.streams()[0].read(0, 10) == b"base state"
+
+    tibx.use_recovery_point(1)
+    assert tibx.streams()[0].read(0, 18) == b"after first backup"
+
+    tibx.use_recovery_point(2)
+    assert tibx.streams()[0].read(0, 19) == b"after second backup"
+
+
+def test_selection_is_by_slice_not_position() -> None:
+    # Selecting a point takes every extent up to and including its slice id. Picking the
+    # middle backup of a chain whose ids are 2, 3, 5 must not be read as "slice <= 1".
+    tibx = _chain()
+    tibx.use_recovery_point(1)
+
+    assert {extent.slice_id for extent in tibx.extents} == {2, 3}
+
+
+def test_select_oldest_and_latest() -> None:
+    tibx = _chain()
+    tibx.use_recovery_point("oldest")
+    assert tibx.streams()[0].read(0, 10) == b"base state"
+    tibx.use_recovery_point("latest")
+    assert tibx.streams()[0].read(0, 19) == b"after second backup"
+
+
+def test_index_out_of_range() -> None:
+    tibx = _chain()
+    with pytest.raises(InvalidArchiveError, match="out of range"):
+        tibx.use_recovery_point(5)
+
+
+def test_invalid_selector() -> None:
+    tibx = _chain()
+    with pytest.raises(InvalidArchiveError, match="invalid recovery point"):
+        tibx.use_recovery_point("bogus")
+
+
+def test_archive_without_slices_reports_no_recovery_points() -> None:
+    # An archive whose slices tree is absent records no backups. Reporting none is right;
+    # the previous behaviour counted commit roots and reported points that never existed.
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)])
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert tibx.recovery_points() == []
+    with pytest.raises(InvalidArchiveError, match="records no backups"):
+        tibx.use_recovery_point(0)
+
+
+def test_recovery_points_from_memtree_and_ctrees() -> None:
+    # As the slices tree grows its records move from the mem-tree into on-disk ctrees, like
+    # those of every LSM tree. Across them the newest record of a slice wins.
+    extents = [ExtentSpec(10, 0, b"x" * 64, slice_id=slice_id) for slice_id in SLICES]
+
+    def cell(slice_id: int, marker: int) -> Cell:
+        key = c_tibx.slice_key(slice_id=slice_id).dumps()
+        return Cell(key, slice_record(bytes([marker]) * 16, 1000 * slice_id, 1000 * slice_id + 10))
+
+    leaf_page = len(build_lsm_archive(extents)) // PAGE
+    slices = lsb(
+        4,
+        len(c_tibx.slice_record),
+        memtree_cells=[cell(3, 0x33)],  # newer than the ctree's record of slice 3
+        ctrees=[(leaf_page * PAGE, 3)],
+    )
+    leaf = lsm_page(c_tibx.PageType.LEAF, b"LEAF", [cell(2, 2), cell(3, 3), cell(5, 5)], key_length=4, compact=True)
+    tibx = TIBX(io.BytesIO(build_lsm_archive(extents, extra_slots={5: slices}) + leaf))
+
+    points = tibx.recovery_points()
+    assert [point.slice_id for point in points] == SLICES
+    assert [point.guid.bytes_le[0] for point in points] == [2, 0x33, 5]
+
+    tibx.use_recovery_point(2)
+    assert tibx.extents

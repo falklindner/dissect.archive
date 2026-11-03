@@ -1,0 +1,302 @@
+from __future__ import annotations
+
+import io
+from typing import TYPE_CHECKING
+
+import pytest
+
+from dissect.archive.tibx.c_tibx import c_tibx
+from dissect.archive.tibx.crypto import (
+    DataKey,
+    decrypt_segment,
+    has_password_wrapped_key,
+    unwrap_data_key,
+)
+from dissect.archive.tibx.exception import (
+    CorruptArchiveError,
+    InvalidPasswordError,
+    UnsupportedFormatError,
+)
+from dissect.archive.tibx.lsm import read_archive_header
+from dissect.archive.tibx.page import PageStore
+from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX
+from tests._tools.tibx._synth import ExtentSpec, build_lsm_archive
+
+if TYPE_CHECKING:
+    from dissect.archive.tibx.lsm import ArchiveHeader
+
+PASSWORD = b"dissect"
+DATA_KEY = bytes(range(32))
+
+
+def _header(archive: bytes) -> ArchiveHeader:
+    store = PageStore(io.BytesIO(archive))
+    return read_archive_header(store)
+
+
+def test_unwrap_data_key_roundtrip() -> None:
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"encrypted content" * 100)], password=PASSWORD)
+    key = unwrap_data_key(_header(archive), PASSWORD)
+    assert isinstance(key, DataKey)
+    assert key.alg == 3
+    assert key.key == DATA_KEY
+
+
+def test_unwrap_accepts_str_password() -> None:
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD)
+    assert unwrap_data_key(_header(archive), "dissect").key == DATA_KEY
+
+
+def test_unwrap_wrong_password() -> None:
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD)
+    with pytest.raises(InvalidPasswordError):
+        unwrap_data_key(_header(archive), b"wrong")
+
+
+def test_unwrap_no_keymap() -> None:
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)])  # not encrypted
+    with pytest.raises(InvalidPasswordError, match="no keymap"):
+        unwrap_data_key(_header(archive), PASSWORD)
+
+
+@pytest.mark.parametrize(("alg", "key_length"), [(5, 16), (6, 24), (7, 32)], ids=["aes128", "aes192", "aes256"])
+def test_gcm_data_key_unwrapped(alg: int, key_length: int) -> None:
+    # The wrap is CBC whatever the segment cipher is, so every GCM variant unwraps to a
+    # key of the length its alg id names
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD, alg=alg)
+    data_key = unwrap_data_key(_header(archive), PASSWORD)
+
+    assert data_key.alg == alg
+    assert len(data_key.key) == key_length
+    assert data_key.gcm
+
+
+def _rebuild_with_keymap(base: bytes, keymap_blob: bytes) -> bytes:
+    """``base`` with its TLV[7] keymap mem-tree replaced by ``keymap_blob``."""
+    from tests._tools.tibx._synth import Cell, arch_header_page, lsb
+
+    header = _header(base)
+    keymap = lsb(0, 0, memtree_cells=[Cell(b"", b"")], memtree_blob=keymap_blob, memtree_encoding=0)
+    slots = {i: header.tlv[i].payload for i in (1, 2)}
+    slots[7] = keymap
+    return arch_header_page(slots) + base[0x1000:]
+
+
+def test_detects_password_wrapped_key() -> None:
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD)
+    assert has_password_wrapped_key(_header(archive))
+    assert TIBX(io.BytesIO(archive)).encrypted
+
+
+def test_not_encrypted_without_keymap() -> None:
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)])
+    assert not has_password_wrapped_key(_header(archive))
+    assert not TIBX(io.BytesIO(archive)).encrypted
+
+
+def test_keymap_without_password_wrapped_key_is_not_encrypted() -> None:
+    # A keymap tree that holds records but no password-wrapped blob (e.g. a public-key
+    # wrapped key) must not be reported as password-protected: the old "a keymap exists"
+    # heuristic would prompt for a password that could never unwrap anything.
+    base = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD)
+    pubkey_only = bytes([0x02]) + bytes(range(0x40))  # FORMAT_PUBKEY, never FORMAT_PASSWORD
+    archive = _rebuild_with_keymap(base, pubkey_only)
+
+    assert _header(archive).tree(7).has_records  # the cheap precondition still holds
+    assert not has_password_wrapped_key(_header(archive))
+    assert not TIBX(io.BytesIO(archive)).encrypted
+
+
+def test_malformed_wrapped_blob_is_not_encrypted() -> None:
+    # A stray 0x01 byte is not enough -- the blob must parse structurally (algorithm id,
+    # iteration exponent, full salt, AES-block-multiple wrapped key).
+    base = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD)
+    archive = _rebuild_with_keymap(base, bytes([0x01, 0xEE, 0xEE, 0x00]) + b"\x00" * 21)
+    assert not has_password_wrapped_key(_header(archive))
+
+
+def test_gcm_archive_reported_password_protected() -> None:
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD, alg=7)
+    assert has_password_wrapped_key(_header(archive))
+
+
+def test_gcm_tag_mismatch_is_corruption() -> None:
+    # A wrong password cannot reach here -- the PKCS#7 unwrap rejects it first -- so a tag
+    # that does not authenticate means the ciphertext was damaged
+    from Crypto.Cipher import AES
+
+    key = bytes(range(32))
+    iv = bytes(range(16))
+    ciphertext, tag = AES.new(key, AES.MODE_GCM, nonce=iv).encrypt_and_digest(b"the quick brown fox")
+    payload = iv + tag + ciphertext
+
+    assert decrypt_segment(payload, DataKey(alg=7, key=key)) == b"the quick brown fox"
+
+    flipped = bytearray(payload)
+    flipped[-1] ^= 0xFF
+    with pytest.raises(CorruptArchiveError, match="AES-GCM authentication"):
+        decrypt_segment(bytes(flipped), DataKey(alg=7, key=key))
+
+
+def test_decrypt_segment_padding_stripped_by_caller() -> None:
+    from Crypto.Cipher import AES
+
+    plaintext = b"the quick brown fox" * 4
+    padded = plaintext + bytes([16 - len(plaintext) % 16]) * (16 - len(plaintext) % 16)
+    iv = bytes(range(16))
+    payload = iv + AES.new(DATA_KEY, AES.MODE_CBC, iv).encrypt(padded)
+    out = decrypt_segment(payload, DataKey(alg=3, key=DATA_KEY))
+    assert out.startswith(plaintext)
+
+
+@pytest.mark.parametrize(
+    "compression",
+    [c_tibx.ComprAlg.ZSTD, c_tibx.ComprAlg.LZ4, c_tibx.ComprAlg.ZLIB, c_tibx.ComprAlg.NONE],
+    ids=["zstd", "lz4", "zlib", "stored"],
+)
+@pytest.mark.parametrize("alg", [3, 7], ids=["cbc", "gcm"])
+def test_encrypted_archive_end_to_end(compression: c_tibx.ComprAlg, alg: int) -> None:
+    content = b"secret volume payload, needs a password" * 200
+    archive = build_lsm_archive([ExtentSpec(10, 0, content)], compression=compression, password=PASSWORD, alg=alg)
+    tibx = TIBX(io.BytesIO(archive))
+    assert tibx.encrypted
+
+    volume = tibx.streams()[0]
+    with pytest.raises(InvalidPasswordError):
+        volume.read(0, len(content))  # locked
+
+    tibx.unlock(PASSWORD)
+    assert volume.read(0, len(content)) == content
+
+
+def test_gcm_stored_payload_ending_in_padding_bytes_is_not_unpadded() -> None:
+    # GCM plaintext is exact, so the PKCS#7 strip the CBC path needs must not run here.
+    # Length is a multiple of 16 and the tail is a valid padding pattern -- exactly what
+    # a stored run of disk sectors can look like -- so unpadding would eat four real bytes.
+    content = b"stored sectors that end like PKCS#7 padding." + bytes([4, 4, 4, 4])
+    assert len(content) % 16 == 0
+    archive = build_lsm_archive(
+        [ExtentSpec(10, 0, content)], compression=c_tibx.ComprAlg.NONE, password=PASSWORD, alg=7
+    )
+
+    tibx = TIBX(io.BytesIO(archive))
+    tibx.unlock(PASSWORD)
+    assert tibx.streams()[0].read(0, len(content)) == content
+
+
+def _with_encr_alg(archive: bytes, alg: int) -> bytes:
+    """``archive`` with ``arch_superblock.encr_alg`` on page 0 set to ``alg``."""
+    from tests._tools.tibx._synth import PAGE, finalize
+
+    page = bytearray(archive[:PAGE])
+    superblock = c_tibx.arch_superblock(bytes(page))
+    superblock.body.encr_alg = alg
+    page[: len(c_tibx.arch_superblock)] = superblock.dumps()
+    return finalize(page) + archive[PAGE:]
+
+
+def test_encr_alg_alone_marks_archive_encrypted() -> None:
+    # The superblock is the archive-level signal and costs nothing to read: an archive
+    # whose keymap we cannot make sense of is still encrypted if encr_alg says so.
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)])
+    assert not TIBX(io.BytesIO(archive)).encrypted
+
+    encrypted = _with_encr_alg(archive, c_tibx.EncrAlg.AES_256_CBC)
+    assert TIBX(io.BytesIO(encrypted)).encrypted
+    # ... but nothing about it suggests a password would help
+    assert not TIBX(io.BytesIO(encrypted)).password_protected
+
+
+def test_encr_alg_agrees_with_keymap_detection() -> None:
+    # Both signals point the same way on a normal password-protected archive.
+    archive = _with_encr_alg(
+        build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD),
+        c_tibx.EncrAlg.AES_256_CBC,
+    )
+    tibx = TIBX(io.BytesIO(archive))
+    assert tibx.encrypted
+    assert tibx.password_protected
+    tibx.unlock(PASSWORD)
+
+
+def test_certificate_wrapped_archive_rejects_password() -> None:
+    # Wrapped to a certificate, not a password: prompting for one can never work, so say
+    # so instead of failing with a generic "wrong password".
+    base = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD)
+    blob = bytearray(_header(base).tree(7).memtree_payload)
+    blob[blob.index(bytes([0x01, 0x03]))] = 0x02  # FORMAT_PASSWORD -> FORMAT_PUBKEY
+    archive = _with_encr_alg(_rebuild_with_keymap(base, bytes(blob)), c_tibx.EncrAlg.AES_256_CBC)
+
+    tibx = TIBX(io.BytesIO(archive))
+    assert tibx.encrypted
+    assert not tibx.password_protected
+    with pytest.raises(UnsupportedFormatError, match="not password-protected"):
+        tibx.unlock(PASSWORD)
+
+
+def test_locked_archive_can_still_be_enumerated() -> None:
+    # Listing what an archive contains must not require the password: dissect.target's
+    # loader enumerates volumes before it has looked a key up in the keychain, and the
+    # scrubbing tooling reads an archive's metadata streams without one at all.
+    content = b"secret volume payload, needs a password" * 200
+    archive = build_lsm_archive([ExtentSpec(10, 0, content)], password=PASSWORD, alg=7)
+
+    tibx = TIBX(io.BytesIO(archive))  # deliberately not unlocked
+    assert tibx.encrypted
+    assert len(tibx.streams()) == 1
+    assert len(tibx.volumes()) == 0  # too small to be a volume, and unreadable while locked
+
+    with pytest.raises(InvalidPasswordError):
+        tibx.streams()[0].read(0, 16)
+
+
+def test_locked_large_stream_is_a_volume_without_the_password() -> None:
+    # A partition-sized stream is classified on its data_map span, which needs no read --
+    # so it is still reported as a volume while the archive is locked.
+    archive = build_lsm_archive(
+        [ExtentSpec(10, MIN_VOLUME_SIZE, b"encrypted tail".ljust(512, b"\x00"))], password=PASSWORD, alg=7
+    )
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert [v.volume_id for v in tibx.volumes()] == [10]
+
+
+def test_locked_volume_repr() -> None:
+    # repr() must not need the password: it is what logging and the REPL show
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 64)], password=PASSWORD)
+    tibx = TIBX(io.BytesIO(archive))
+
+    assert "span=64" in repr(tibx.streams())
+
+
+def test_unlock_resets_segment_cache_budget() -> None:
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"x" * 0x1000)], password=PASSWORD)
+    tibx = TIBX(io.BytesIO(archive))
+    tibx.unlock(PASSWORD)
+    tibx.streams()[0].read(0, 16)
+    assert tibx._segment_cache_bytes
+
+    tibx.unlock(PASSWORD)
+    assert not tibx._segment_cache
+    assert tibx._segment_cache_bytes == 0
+
+
+@pytest.mark.parametrize("alg", [3, 7])
+def test_encrypted_segment_shorter_than_its_length(alg: int) -> None:
+    # As for a plaintext segment, a segment that decodes short is corrupt: zero-filling the
+    # rest would pass damage off as volume data
+    from tests._tools.tibx._synth import PAGE, SEGMENT_HEADER_OFFSET, finalize
+
+    archive = build_lsm_archive(
+        [ExtentSpec(10, 0, b"x" * 64)], compression=c_tibx.ComprAlg.NONE, password=PASSWORD, alg=alg
+    )
+    page = bytearray(archive[PAGE : 2 * PAGE])  # the segment follows the ARCH page
+    header = c_tibx.segment_header(bytes(page[SEGMENT_HEADER_OFFSET:]))
+    header.length += 16
+    page[SEGMENT_HEADER_OFFSET : SEGMENT_HEADER_OFFSET + len(c_tibx.segment_header)] = header.dumps()
+    archive = archive[:PAGE] + finalize(page) + archive[2 * PAGE :]
+
+    tibx = TIBX(io.BytesIO(archive))
+    tibx.unlock(PASSWORD)
+    with pytest.raises(CorruptArchiveError, match="decoded 64 bytes, expected 80"):
+        tibx.streams()[0].read(0, 16)

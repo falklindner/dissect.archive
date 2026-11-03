@@ -1,0 +1,150 @@
+from __future__ import annotations
+
+import io
+
+import pytest
+from dissect.util import ts
+
+from dissect.archive.tibx.c_tibx import PAGE_MARKER, PAGE_SIZE, c_tibx
+from dissect.archive.tibx.exception import CorruptArchiveError, InvalidArchiveError
+from dissect.archive.tibx.page import PageStore, SuperBlock, page_crc32c
+from tests._tools.tibx._synth import SEG_PAYLOAD, CountingIO, arch_page, arci_page, build_archive, data_page
+
+
+def test_rejects_non_tibx() -> None:
+    with pytest.raises(InvalidArchiveError):
+        PageStore(io.BytesIO(b"\x00" * PAGE_SIZE))
+
+
+def test_rejects_short_file() -> None:
+    with pytest.raises(InvalidArchiveError):
+        PageStore(io.BytesIO(b"\x41\x01"))
+
+
+def test_page_access_and_types() -> None:
+    store = PageStore(io.BytesIO(build_archive()))
+    assert store.page_count == 3
+    assert store.size == 3 * PAGE_SIZE
+    assert store.page_type(0) == c_tibx.PageType.ARCH
+    assert store.page_type(1) == c_tibx.PageType.DATA
+    assert store.page_type(2) == c_tibx.PageType.ARCI
+    assert store.page_type_name(0) == "ARCH"
+    assert store.page_type_name(1) == "DATA"
+    assert store.page_type_name(2) == "ARCI"
+    assert [i for i, _ in store.pages()] == [0, 1, 2]
+    assert store.page(0)[8:12] == b"ARCH"
+
+
+def test_reads_returned_in_parts() -> None:
+    # TIBX.open opens a single file unbuffered, and a raw file may return a read in parts
+    class Trickle(io.BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            return super().read(min(size, 1000) if size is not None and size >= 0 else size)
+
+    archive = build_archive()
+    store = PageStore(Trickle(archive))
+    assert store.read_run(0, 2) == [archive[:PAGE_SIZE], archive[PAGE_SIZE : 2 * PAGE_SIZE]]
+    assert store.page(1) == archive[PAGE_SIZE : 2 * PAGE_SIZE]
+    assert store.live_root().offset == 0
+
+
+def test_superblock_fields() -> None:
+    uuid = bytes(range(16))
+    sb = SuperBlock(arch_page(1_720_000_000_123, 1_720_000_555_999, uuid), offset=0)
+    assert sb.archive_uuid == uuid
+    assert sb.created_ms == 1_720_000_000_123
+    assert sb.modified_ms == 1_720_000_555_999
+    assert sb.created == ts.from_unix_ms(1_720_000_000_123)
+    assert sb.modified == ts.from_unix_ms(1_720_000_555_999)
+
+
+def test_superblock_rejects_non_arch() -> None:
+    with pytest.raises(InvalidArchiveError):
+        SuperBlock(data_page(SEG_PAYLOAD), offset=0)
+
+
+def test_verify_all_pages_ok() -> None:
+    result = PageStore(io.BytesIO(build_archive())).verify()
+    assert result["bad"] == 0
+    assert result["ok"] == 3
+    assert result["by_type"] == {"ARCH": 1, "DATA": 1, "ARCI": 1}
+
+
+def test_verify_detects_corruption() -> None:
+    data = bytearray(build_archive())
+    data[PAGE_SIZE + 0x40] ^= 0xFF  # flip a byte in the DATA page body
+    result = PageStore(io.BytesIO(bytes(data))).verify()
+    assert result["bad"] == 1
+    assert result["bad_pages"] == [1]
+
+
+def test_live_root_is_highest_offset_arch() -> None:
+    # Two ARCH roots; the live root must be the higher-offset (newer) one
+    data = arch_page(1000, 2000, b"\x01" * 16) + arch_page(3000, 5000, b"\x02" * 16)
+    root = PageStore(io.BytesIO(data)).live_root()
+    assert root.offset == PAGE_SIZE
+    assert root.archive_uuid == b"\x02" * 16
+    assert root.modified_ms == 5000
+
+
+def test_live_root_skips_torn_final_commit() -> None:
+    # The newest ARCH has a bad CRC (torn commit, e.g. power loss); transactional
+    # recovery must fall back to the newest complete (CRC-valid) root.
+    good = arch_page(1000, 2000, b"\x11" * 16)
+    torn = bytearray(arch_page(3000, 5000, b"\x22" * 16))
+    torn[0x80] ^= 0xFF
+    root = PageStore(io.BytesIO(good + bytes(torn))).live_root()
+    assert root.offset == 0
+    assert root.modified_ms == 2000
+
+
+@pytest.mark.parametrize("trailing", [0, 15, 16, 47, 48, 5000])
+def test_live_root_far_from_eof(trailing: int) -> None:
+    # The newest commit can be far from EOF -- 84k pages in one real archive -- and is found
+    # in growing chunks, not a read per page. The counts put its commit info on chunk
+    # boundaries.
+    data = (
+        arch_page(1000, 2000, b"\x01" * 16)
+        + arch_page(3000, 5000, b"\x02" * 16, ci_offset=2 * PAGE_SIZE)
+        + arci_page(PAGE_SIZE, b"\x02" * 16, commit_seq=1)
+    )
+    fh = CountingIO(data + data_page(SEG_PAYLOAD) * trailing)
+    store = PageStore(fh)
+    fh.reads = 0
+
+    root = store.live_root()
+    assert root.offset == PAGE_SIZE
+    assert root.modified_ms == 5000
+    # A read per chunk of the scan, where there was one per page before: up to 5002. Plus
+    # one for CI0 and one for the header of the commit info found
+    assert fh.reads <= 12
+
+
+def test_live_root_all_roots_torn() -> None:
+    torn = bytearray(arch_page(1000, 2000, b"\x11" * 16))
+    torn[0x80] ^= 0xFF
+    store = PageStore(io.BytesIO(bytes(torn)))
+    with pytest.raises(CorruptArchiveError):
+        store.live_root()
+
+
+def test_page_crc_ignores_checksum_field() -> None:
+    page = bytearray(PAGE_SIZE)
+    page[0], page[1] = PAGE_MARKER, c_tibx.PageType.ARCH
+    page[8:12] = b"ARCH"
+    base = page_crc32c(bytes(page))
+
+    # Whatever is stored in the CRC field must not affect the page CRC itself
+    page[4:8] = b"\xde\xad\xbe\xef"
+    assert page_crc32c(bytes(page)) == base
+
+    # But any body change must
+    page[0x80] ^= 0xFF
+    assert page_crc32c(bytes(page)) != base
+
+
+def test_superblock_rejects_truncated_page() -> None:
+    # cstruct raises EOFError on a short buffer; callers should only ever see the parser's
+    # own exception type.
+    with pytest.raises(InvalidArchiveError):
+        SuperBlock(b"\x41\x01\x00\x00\x00\x00\x00\x00ARCH", offset=0)

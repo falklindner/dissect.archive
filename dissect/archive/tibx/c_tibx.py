@@ -1,0 +1,555 @@
+"""Structure definitions for the Acronis TIBX ("archive3") file format.
+
+A ``.tibx`` is a flat sequence of 4096-byte pages. Byte 0 of every page is the marker
+``0x41`` (``'A'``), byte 1 the page type, and a CRC-32C of the page (checksum bytes
+zeroed) is stored at ``+0x04``. The page content ("body") starts after this 8-byte
+envelope.
+
+Most multi-byte fields are big-endian, so the definitions are loaded into a big-endian
+cstruct instance. cstruct applies one byte order per instance, so the one little-endian
+field of a TIBX record -- the segment_map ``page_count`` -- is declared as raw bytes and
+decoded where it is used; the LEAF sequence id is little-endian too, but unused. The LSM
+cell-group header only looks little-endian: it is a count byte followed by a big-endian
+24-bit bitmap.
+
+:data:`c_boot` holds the few filesystem boot-sector fields the parser reads to size a
+volume, and the MBR partition table it reads to tell a disk's bootstrap region from one.
+Those formats are not TIBX's and are little-endian, so they get their own instance.
+
+The format is not documented by Acronis. These definitions encode the format findings of
+``acronis-tibx`` (MIT License, Copyright (c) 2026 mniedermaier) and were confirmed against
+archives written by Acronis Cyber Protect / True Image 2026; fields still marked
+``_reserved`` or ``_pad`` are ones whose meaning is not yet established.
+"""
+
+from __future__ import annotations
+
+from dissect.cstruct import cstruct
+
+tibx_def = """
+#define PAGE_SIZE 0x1000
+
+enum PageType : uint8 {
+    ARCH    = 0x01,     /* superblock / commit root (+ continuation pages) */
+    ARCI    = 0x02,     /* commit info */
+    LEAF    = 0x03,     /* LSM tree leaf */
+    LDIR    = 0x04,     /* LSM tree directory */
+    GOLOMB  = 0x05,     /* dedup_map Golomb filter */
+    DATA    = 0xFF      /* data segment (SG header or continuation) */
+};
+
+enum EncrAlg : uint8 {
+    NONE            = 0,    // none
+    AES_128_CBC     = 1,    // aes-128-cbc
+    AES_192_CBC     = 2,    // aes-192-cbc
+    AES_256_CBC     = 3,    // aes-256-cbc
+    GOST2015        = 4,    // gost2015
+    AES_128_GCM     = 5,    // aes-128-gcm
+    AES_192_GCM     = 6,    // aes-192-gcm
+    AES_256_GCM     = 7     // aes-256-gcm
+};
+
+enum ComprLvl : uint8 {
+    NONE   = 0,  // "none"
+    LOW    = 1,  // "low"
+    NORMAL = 2,  // "normal"
+    HIGH   = 3   // "high"
+};
+
+enum ComprAlg : uint8 {
+    NONE   = 0,
+    LZ4    = 1,
+    ZLIB   = 2,
+    ZSTD   = 3
+};
+
+struct page_header {
+    uint8       marker;                 /* always 0x41 'A' */
+    PageType    type;
+    uint16      _pad;
+    uint32      crc32c;                 /* CRC-32C of the page, checksum bytes zeroed */
+};
+
+/* The type of a backup: the low 7 bits of slice_record.flags, which Acronis's ARCH header
+ * dump prints as the slice's "type" */
+enum SliceType : uint8 {
+    FULL            = 0x01,
+    INCREMENTAL     = 0x06,
+    DIFFERENTIAL    = 0x0A
+};
+
+/* TLV[5] "slices" record: one backup of the archive. Every data_map extent carries this
+ * key's slice id in its own slice_id, to say which backup wrote it. The guid is the one
+ * "acrocmd list backups" prints for the backup, and is stored mixed-endian. */
+struct slice_key {
+    uint32      slice_id;
+};
+
+struct slice_record {
+    char        guid[16];
+    uint64      ctime_ms;               /* backup start, ms since the Unix epoch */
+    uint64      ftime_ms;               /* backup finish, ms since the Unix epoch */
+    uint64      user_size;              /* uncompressed bytes of the backup */
+    uint64      compr_size;             /* compressed bytes of the backup */
+    uint32      last_full_sid;          /* 1 in all samples */
+    uint32      base_full_sid;          /* 0 in all samples, even for a differential backup */
+    uint32      items_added;
+    uint32      items_changed;
+    uint32      items_removed;
+    uint8       flags;                  /* low 7 bits: the SliceType; bit 7: deleted */
+    uint64      last_segment_id;        /* last segment id of the backup */
+    uint32      features;               /* see `slice_features2str()` */
+    uint64      data_size;              /* data bytes on disk, observed; 0 in True Image 2020 */
+    char        _reserved[43];          /* zero */
+};
+
+/* A slice record as the ARCH header carries it, with extra metadata */
+struct arch_slice {
+    slice_record    slice;
+    uint32          sid;                /* slice id */
+    uint32          encr_key_id;
+};
+
+/* Start of an ARCH header body, i.e. of an ARCH page after its envelope. The TLV
+ * directory follows at TLV_DIRECTORY_OFFSET into the body. */
+struct arch_header {
+    char        magic[4];               /* "ARCH" */
+    uint32      header_size;            /* total header body size, may span pages */
+    uint16      header_version;         /* 8 in current archives */
+    ComprLvl    compr_lvl;
+    EncrAlg     encr_alg;
+    uint8       dedup;                  /* 0 = "off", 1 = "on" */
+    uint8       hash_alg;
+    uint8       chunking_alg;
+    uint8       hash_window_width;
+    uint64      created_ms;             /* creation time, ms since Unix epoch */
+    uint64      modified_ms;            /* commit time, ms since Unix epoch */
+    char        archive_uuid[16];
+    uint64      archive_size;           /* ar_io_get_archive_size(): file size at this commit */
+    uint64      last_item_id;
+    uint64      last_segment_id;
+    uint32      next_sid;
+    uint32      slice_count;
+    uint32      slices_to_delete;
+    uint32      first_unfinished_sid;   /* observed: the latest backup's sid, even once complete */
+    arch_slice  cur_slice;
+    uint32      cur_extent_count;       /* data_map extents the last backup wrote */
+    arch_slice  last_slice;
+    uint32      ar_flags;               /* set by `ar_flags_set_write_mode()` */
+    uint64      commit_seq;
+    uint64      reuse_seq;
+    uint64      commit_info_seq;
+    uint64      first_ci_offset;
+    uint64      first_hdr_offset;
+    uint64      prev_hdr_offset;        /* the previous commit root, -1 for the first */
+    uint64      ci_offset;              /* offset to the commit info (CI) page for this ARCH */
+    uint64      space_usage_data;       /* data bytes on disk */
+    uint64      unused_space;           /* grows by 0x3000 (three header pages) per commit */
+    uint64      deallocated_space;
+    uint64      split_size;             /* 0xfffffffffffff000 when not split */
+    uint64      compr_size;             /* compressed bytes */
+    uint64      user_size;              /* uncompressed bytes */
+    uint64      features;
+    uint64      features_ro;
+    uint64      features_rw;
+    uint64      full_begin_seg_id;      /* segment id range of the full backup */
+    uint64      full_end_seg_id;
+    uint64      diff_begin_seg_id;
+    uint64      chain_start_pg;         /* first page of a differential chain */
+    uint8       notary_degree;
+    uint8       notary_hash_alg;
+    uint8       notary_flags;
+    uint64      notary_last_item_id;
+    uint64      _unk_223;
+    uint64      _unk_22b;
+    uint32      reuse_delay;
+    uint64      next_reuse_seq;
+    uint64      next_reuse_time;
+    uint64      encr_mtime;
+};
+
+struct arch_superblock {
+    page_header header;
+    arch_header body;
+};
+
+/* A file of a split archive ("volumes" in Acronis's dumps): its index -- 0 for the first
+ * file, NNNN for the file named -NNNN after it -- and where it starts in the archive as a
+ * whole. Not a backed-up volume, as TIBX.volumes() returns. */
+struct ar_volume {
+    uint32      index;
+    uint64      start_offs;
+};
+
+flag ArciFlags : uint32 {
+    REWRITE     = 0x1,                  /* ar_mode rewrite; append mode if clear */
+    CI0         = 0x2                   /* marks the CI0 page: it names the newest commit */
+};
+
+/* Commit info ("ARCI"), the body of the page written right after each commit's ARCH header.
+ * It points back at that header (arch_offset, arch_size), the header's ci_offset points at
+ * it, and prev_ci_offset chains the commit info pages back to the first one. */
+struct arci_header {
+    char        magic[4];               /* "ARCI" */
+    uint16      version;                /* 8 in current archives */
+    uint16      _pad;
+    ArciFlags   flags;
+    uint32      arch_size;              /* total size of the ARCH superblock, divide by 0x1000 = number of pages */
+    uint64      arch_offset;            /* offset to ARCH page */
+    uint64      commit_seq;             /* commit sequence number */
+    uint64      reuse_seq;
+    uint64      ci_seq;                 /* sequence number of the commit info write, CI0 rewrites included */
+    uint64      first_ci_offset;        /* offset to the first commit info page */
+    uint64      prev_ci_offset;         /* offset to previous commit info page; the newest in a rewritten CI0 */
+    uint64      crc64;                  /* CRC-64 (Redis) of the page's first 512 bytes, both checksums zeroed */
+    uint64      volume_offset;          /* offset of this page within its own file of the archive */
+    ar_volume   volumes[4];             /* files of the archive, in no order and possibly repeated; index 0 = unused */
+    uint128     uuid;
+    uint128     session;
+};
+
+struct arci_page {
+    page_header header;
+    arci_header commit_info;
+};
+
+/* One TLV directory entry: the payload follows, and the next entry starts at the next
+ * 4-byte boundary after it */
+struct tlv_header {
+    uint32      length;
+};
+
+/* Data segment header, at page offset +0x08 of a DATA page */
+struct segment_header {
+    char        magic[2];               /* "SG" plaintext / "SE" encrypted */
+    uint16      version;                /* 0x0001 */
+    uint32      length;                 /* uncompressed payload size */
+    uint32      zlength;                /* compressed payload size */
+    uint32      key_id;                 /* encryption key id, 0 = plaintext */
+    ComprAlg    compression;            /* compression codec */
+    uint8       cache_level;            /* 0 data, 1 filesystem metadata, 2 Acronis metadata, 3 device */
+};
+
+/* Prefix of an encrypted ("SE") segment payload, ahead of the ciphertext. Which one
+ * applies is decided by the wrapped key's alg: a CBC variant carries the IV alone and
+ * pads the ciphertext, a GCM variant follows the IV with the tag over that ciphertext. */
+struct segment_cbc_header {
+    char        iv[16];
+};
+
+struct segment_gcm_header {
+    char        iv[16];
+    char        tag[16];                /* AES-GCM tag, computed with no additional data */
+};
+
+/* Header of one block of a linked-LZ4 chain (LSM cell streams, mem-tree blobs); the
+ * compressed block follows */
+struct lz4_block_header {
+    uint32      compressed_size;
+    uint32      uncompressed_size;
+};
+
+/* LSM superblock (L-SB), carried as a TLV payload in the ARCH header body */
+struct lsm_superblock {
+    char        magic[4];               /* "L-SB" */
+    uint8       format_version;         /* "ver" */
+    uint8       nr_ctree;               /* ctree slots in use, from the first */
+    uint8       nr_max_ctree;           /* ctree slots: LSB_CTREE_SLOTS */
+    uint8       _padding;
+    uint32      seq;                    /* commit sequence */
+    uint32      max_ext_len;            /* longest extent: 1 MiB in the data_map, 0x3FFFFFFF in the umap, else 0 */
+    uint32      key_length;             /* per-record key bytes (0 = variable) */
+    uint32      value_length;           /* per-record value bytes */
+    /* followed by LSB_CTREE_SLOTS x ctree_ref, then the mem-tree header */
+};
+
+struct ctree_ref {
+    uint64      offset;                 /* root page byte offset; 0xFF..FF / 0 = empty */
+    uint64      tree_sz;                /* bytes the ctree takes */
+    uint32      seq;                    /* the L-SB seq the ctree was written at; its pages carry it too */
+    uint32      _padding;
+    uint64      tree_nr;                /* records in the ctree */
+};
+
+struct lsm_memtree_header {
+    uint8       encoding;               /* low 7 bits codec (0 raw, 1 LZ4), bit 7 encrypted */
+    uint8       _reserved;
+    uint16      node_count;             /* "c0_count": records in the mem tree */
+    uint32      extra_len;              /* extra payload bytes after the fixed L-SB */
+    uint32      uncompressed_size;      /* size of the decoded cell stream */
+};
+
+/* Object tag of an LSM page */
+enum LsmTag : uint8 {
+    CI          = 0x43,                 /* 'C' ci (commit info) */
+    DATA_MAP    = 0x44,                 /* 'D' dmap */
+    HEADER      = 0x48,                 /* 'H' header */
+    LINK_MAP    = 0x4C,                 /* 'L' nlink_map */
+    NAME_MAP    = 0x4E,                 /* 'N' name_map */
+    SEGMENT_MAP = 0x53,                 /* 'S' segment_map */
+    UNUSED_MAP  = 0x55,                 /* 'U' umap */
+    DEDUP_MAP   = 0x64,                 /* 'd' dedup_map */
+    ENCR_MAP    = 0x65,                 /* 'e' keymap */
+    GOLOMB      = 0x67,                 /* 'g' golomb */
+    NOTARY_MAP  = 0x6E,                 /* 'n' notary */
+    OSTOR       = 0x6F,                 /* 'o' ostor */
+    SLICE_MAP   = 0x73,                 /* 's' smap */
+    DATA        = 0xFF                  /* data */
+};
+
+/* Inner header of a LEAF / LDIR page (at the start of the page body) */
+struct lsm_page_header {
+    char        magic[4];               /* "LEAF" or "LDIR" */
+    uint8       version;                /* < 2 */
+    uint8       encoding;               /* low 7 bits codec, bit 7 encrypted */
+    uint16      cell_count;
+    uint32      uncompressed_size;      /* size of the decoded cell stream */
+    uint32      on_disk_size;           /* size of the stored cell stream */
+    uint32      seq;                    /* seq of the ctree the page belongs to, checked on reading */
+    LsmTag      tag;                    /* 'D' on data_map, 'S' on segment_map pages; 0 where not written */
+    char        _reserved[3];
+    /* zero pad up to LSM_CELL_STREAM_OFFSET, where the cell stream starts */
+};
+
+/* Precedes each group of cells in a compact cell stream */
+struct lsm_cell_group_header {
+    uint8       count;                  /* cells in this group, 1-24 */
+    uint24      alive;                  /* bit i set: cell i carries a value; a tombstone only its key */
+};
+
+/* LDIR record value: where the child page is */
+struct ldir_value {
+    uint64      child_offset;           /* byte offset of the child LEAF / LDIR page */
+};
+
+/* data_map (TLV[1]) record: 31-byte key + 10-byte value */
+struct data_map_key {
+    uint64      volume_id;
+    uint64      source_offset;          /* byte offset within the volume */
+    uint24      extent_length;
+    uint32      slice_id;               /* backup slice that wrote this extent ("field3") */
+    uint64      extent_id;
+};
+
+struct data_map_value {
+    uint64      segment_id;
+    uint16      extent_index;           /* 0xFFFF = extent fills the whole segment */
+};
+
+/* segment_map (TLV[2]) record: 8-byte key + 32-byte value */
+struct segment_map_key {
+    uint64      segment_id;
+};
+
+struct segment_map_value {
+    uint64      page_count : 8;         /* pages the segment takes */
+    uint64      page_offset : 56;       /* page index of the segment's header page */
+    uint32      cache_level : 2;        /* equal to the segment header's cache_level in every sample */
+    uint32      refs : 30;              /* reference count: how many data_map records use the segment */
+    char        hash[20];               /* SHA-1 of the decompressed segment */
+};
+
+flag ItemFlags : uint16 {
+    COMPLETE    = 0x0001,               /* set by archive_item_complete(); cleared while the item is written */
+    LINKED      = 0x0002,               /* the item has more names, see the nlink_map */
+    DELETED     = 0x0100                /* gone as of this backup; hides the older versions */
+};
+
+/* imap (TLV[0], "items") record key: one version of an item, such as a disk, partition or
+ * file, as of a backup. The item's path follows, to the end of the key. An item's version
+ * in a backup is its newest record with a slice id up to that backup's. */
+struct imap_key {
+    uint32      slice_id;
+    ItemFlags   flags;
+    uint8       type;
+};
+
+/* imap record value: 1 + extra_streams imap_stream records follow */
+struct imap_value {
+    uint8       extra_streams;          /* streams after the first */
+};
+
+flag StreamFlags : uint8 {
+    WRITTEN     = 0x01,                 /* written by the record's backup */
+    UNKNOWN_2   = 0x02                  /* always set by libarchive3's writer, never read */
+};
+
+/* A data stream of an imap item: its content (index 0), or more about it */
+struct imap_stream {
+    uint8       index;
+    StreamFlags flags;
+    uint64      id;                     /* data_map volume_id the data is stored under */
+    uint64      size;                   /* size of the data */
+};
+
+/* Password-wrapped data key, stored in the keymap tree (TLV[7]) mem-tree. The wrapped
+ * key itself follows this header and runs to the end of the blob: its length is not
+ * carried in the format, only its PKCS#7 padding is. */
+struct wrapped_key {
+    uint8       format;                 /* 0x01 password-wrapped, 0x02 certificate-wrapped */
+    uint8       alg;                    /* segment cipher, see KEY_LENGTH; the wrap is always CBC */
+    uint8       iter_log2;              /* PBKDF2 iterations = 1 << iter_log2 */
+    uint8       _reserved;
+    char        salt[16];               /* PBKDF2 salt */
+};
+"""
+
+c_tibx = cstruct(endian=">").load(tibx_def)
+
+# Only the fields needed to tell a volume's filesystem apart and read its size, and to
+# recognise a disk's partition table
+boot_def = """
+struct ntfs_boot_sector {
+    char        jump[3];
+    char        oem_id[8];              /* "NTFS    " */
+    uint16      bytes_per_sector;
+    char        _unused[27];
+    uint64      total_sectors;          /* +0x28 */
+};
+
+struct exfat_boot_sector {
+    char        jump[3];
+    char        fs_name[8];             /* "EXFAT   " */
+    char        _must_be_zero[53];
+    uint64      partition_offset;       /* +0x40 */
+    uint64      volume_length;          /* +0x48, in sectors */
+    char        _unused[28];
+    uint8       bytes_per_sector_shift; /* +0x6C */
+};
+
+struct fat_boot_sector {
+    char        jump[3];
+    char        oem_id[8];
+    uint16      bytes_per_sector;       /* +0x0B */
+    uint8       sectors_per_cluster;
+    uint16      reserved_sectors;
+    uint8       fat_count;
+    uint16      root_entries;
+    uint16      total_sectors_16;       /* +0x13, 0 if the volume needs total_sectors_32 */
+    uint8       media;
+    uint16      fat_size_16;
+    uint16      sectors_per_track;
+    uint16      heads;
+    uint32      hidden_sectors;
+    uint32      total_sectors_32;       /* +0x20 */
+    char        _fat16_ext[18];
+    char        fs_type_16[8];          /* +0x36, "FAT12   " / "FAT16   " */
+    char        _fat32_ext[20];
+    char        fs_type_32[8];          /* +0x52, "FAT32   " */
+};
+
+/* ext2/3/4 superblock, EXT_SUPERBLOCK_OFFSET bytes into the volume */
+struct ext_superblock {
+    uint32      inodes_count;
+    uint32      blocks_count;           /* +0x04, low 32 bits */
+    char        _unused0[16];
+    uint32      log_block_size;         /* +0x18, block size is 1024 << log_block_size */
+    char        _unused1[28];
+    uint16      magic;                  /* +0x38, EXT_MAGIC */
+};
+
+struct mbr_partition {
+    uint8       boot_flag;              /* 0x80 active, 0x00 inactive */
+    char        chs_first[3];
+    uint8       type;                   /* 0x00 for an unused entry */
+    char        chs_last[3];
+    uint32      lba_start;
+    uint32      sectors;
+};
+
+/* A disk's master boot record */
+struct mbr {
+    char            bootstrap[446];
+    mbr_partition   partitions[4];      /* +0x1BE */
+    uint16          signature;          /* +0x1FE, MBR_SIGNATURE */
+};
+"""
+
+c_boot = cstruct(endian="<").load(boot_def)
+
+PAGE_SIZE: int = c_tibx.PAGE_SIZE
+ENVELOPE_SIZE = len(c_tibx.page_header)
+PAGE_BODY_SIZE = PAGE_SIZE - ENVELOPE_SIZE
+
+PAGE_MARKER = 0x41
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+SEGMENT_MAGIC = b"SG"
+SEGMENT_MAGIC_ENCRYPTED = b"SE"
+SEGMENT_HEADER_OFFSET = ENVELOPE_SIZE
+SEGMENT_PAYLOAD_OFFSET = 0x2C
+# Compressed bytes on the segment's first page; the rest spills onto continuation pages
+SEGMENT_FIRST_PAGE_PAYLOAD = PAGE_SIZE - SEGMENT_PAYLOAD_OFFSET
+
+SEGMENT_CBC_HEADER_SIZE = len(c_tibx.segment_cbc_header)
+SEGMENT_GCM_HEADER_SIZE = len(c_tibx.segment_gcm_header)
+
+# Extents sharing a segment (extent_index != 0xFFFF) are concatenated in index order,
+# each aligned up to this boundary (empirical: exact fit on all observed segments)
+EXTENT_ALIGNMENT = 16
+
+LZ4_BLOCK_HEADER_SIZE = len(c_tibx.lz4_block_header)
+
+LSM_MAGIC_SUPERBLOCK = b"L-SB"
+LSM_MAGIC_LEAF = b"LEAF"
+LSM_MAGIC_LDIR = b"LDIR"
+# Cell stream starts this many bytes into a LEAF/LDIR page body
+LSM_CELL_STREAM_OFFSET = 0x34
+LSM_CELL_GROUP_HEADER_SIZE = len(c_tibx.lsm_cell_group_header)
+LSM_CELL_GROUP_MAX = 24
+LDIR_VALUE_SIZE = len(c_tibx.ldir_value)
+# L-SB fixed layout: the lsm_superblock fields, a fixed number of ctree_ref slots, the
+# mem-tree header, then reserved space up to LSB_FIXED_SIZE; the mem-tree blob follows
+LSB_CTREE_SLOTS = 10
+LSB_CTREE_OFFSET = len(c_tibx.lsm_superblock)
+LSB_MEMTREE_OFFSET = LSB_CTREE_OFFSET + LSB_CTREE_SLOTS * len(c_tibx.ctree_ref)
+LSB_FIXED_SIZE = 0x178
+
+CTREE_EMPTY_SENTINEL = 0xFFFFFFFFFFFFFFFF
+
+# ARCH header body: TLV directory location and slot count
+TLV_DIRECTORY_OFFSET = 0x400
+TLV_HEADER_SIZE = len(c_tibx.tlv_header)
+TLV_SLOT_COUNT = 19
+
+TLV_IMAP = 0
+TLV_DATA_MAP = 1
+TLV_SEGMENT_MAP = 2
+TLV_DEDUP_MAP = 3
+TLV_NLINK_MAP = 4
+TLV_SLICES = 5
+TLV_UMAP = 6
+TLV_KEYMAP = 7
+TLV_NOTARY = 8
+TLV_META = 9
+TLV_OSTOR_HISTORY = 13
+TLV_UNUSED = 17
+TLV_VOLUMES = 18
+
+# Wrapped-key blob: the fixed header above, then the padded key to the end of the blob
+WRAPPED_KEY_HEADER_SIZE = len(c_tibx.wrapped_key)
+WRAPPED_KEY_SALT_SIZE = 16
+WRAPPED_KEY_FORMAT_PASSWORD = 0x01
+WRAPPED_KEY_FORMAT_PUBKEY = 0x02
+
+DATA_MAP_KEY_SIZE = len(c_tibx.data_map_key)
+DATA_MAP_VALUE_SIZE = len(c_tibx.data_map_value)
+# data_map_value.extent_index for "extent fills its segment"
+EXTENT_INDEX_WHOLE_SEGMENT = 0xFFFF
+
+SEGMENT_MAP_KEY_SIZE = len(c_tibx.segment_map_key)
+SEGMENT_MAP_VALUE_SIZE = len(c_tibx.segment_map_value)
+
+SLICE_TYPE_MASK = 0x7F
+
+IMAP_KEY_SIZE = len(c_tibx.imap_key)
+IMAP_VALUE_SIZE = len(c_tibx.imap_value)
+IMAP_STREAM_SIZE = len(c_tibx.imap_stream)
+
+EXT_SUPERBLOCK_OFFSET = 0x400
+EXT_MAGIC = 0xEF53
+
+MBR_SIGNATURE = 0xAA55
+# mbr_partition.type of the one partition covering a GPT disk in its protective MBR
+MBR_TYPE_GPT_PROTECTIVE = 0xEE

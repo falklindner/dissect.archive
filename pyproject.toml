@@ -26,7 +26,7 @@ classifiers = [
 ]
 dependencies = [
     "dissect.cstruct>=4,<5",
-    "dissect.util>=3.22,<4",
+    "dissect.util>=3.25.dev18,<4",  # TODO: Update on release!
 ]
 dynamic = ["version"]
 
@@ -37,12 +37,14 @@ repository = "https://github.com/fox-it/dissect.archive"
 
 [project.optional-dependencies]
 full = [
+    "pycryptodome",
+    "backports.zstd; python_version < '3.14'",
     "rich",
 ]
 dev = [
     "dissect.archive[full]",
     "dissect.cstruct>=4.0.dev,<5.0.dev",
-    "dissect.util>=3.22.dev,<4.0.dev",
+    "dissect.util>=3.25.dev18,<4.0.dev",  # TODO: Update on release!
 ]
 
 [dependency-groups]
@@ -134,6 +136,7 @@ strict = true
 
 [tool.ruff.lint.per-file-ignores]
 "tests/docs/**" = ["INP001"]
+"**.pyi" = ["PYI042"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["dissect.archive"]
