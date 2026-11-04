@@ -87,7 +87,12 @@ class LsmSuperBlock:
         if payload[:4] != LSM_MAGIC_SUPERBLOCK:
             raise CorruptArchiveError(f"L-SB magic missing in TLV slot {tlv_index}")
         self.tlv_index = tlv_index
-        self.sb = c_tibx.lsm_superblock(payload)
+        try:
+            self.sb = c_tibx.lsm_superblock(payload)
+        except EOFError:
+            # The header of an archive cut off after its first page is short, and so is the
+            # L-SB that runs past the cut
+            raise CorruptArchiveError(f"L-SB truncated in TLV slot {tlv_index}")
         self.seq = self.sb.seq
         self.key_length = self.sb.key_length
         self.value_length = self.sb.value_length
