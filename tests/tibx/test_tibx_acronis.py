@@ -18,7 +18,7 @@ import io
 import pytest
 
 from dissect.archive.tibx.c_tibx import PAGE_SIZE, TLV_SEGMENT_MAP, c_tibx
-from dissect.archive.tibx.exception import InvalidPasswordError
+from dissect.archive.tibx.exception import CorruptArchiveError, InvalidPasswordError
 from dissect.archive.tibx.lsm import iter_tree_cells
 from dissect.archive.tibx.map import load_segment_index
 from dissect.archive.tibx.page import (
@@ -457,3 +457,9 @@ def test_acronis_commit_info_crc64_mismatch() -> None:
     store = PageStore(io.BytesIO(bytes(data)))
     assert store._commit_info_at(0xF6000) is None
     assert store.live_root().offset == 0xB6000
+
+
+def test_acronis_truncated_header() -> None:
+    # Cut off after its first page, the archive holds only part of its two-page ARCH header
+    with pytest.raises(CorruptArchiveError, match="L-SB truncated"):
+        TIBX(io.BytesIO(_sample("t1_chain_inc")[:PAGE_SIZE]))

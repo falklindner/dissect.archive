@@ -122,6 +122,13 @@ def test_lsb_parse_memtree_and_ctrees() -> None:
     assert not LsmSuperBlock(lsb(8, 4), tlv_index=1).has_records
 
 
+def test_lsb_truncated() -> None:
+    # cstruct raises EOFError on a short buffer; callers should only ever see the parser's
+    # own exception type.
+    with pytest.raises(CorruptArchiveError, match="L-SB truncated in TLV slot 1"):
+        LsmSuperBlock(lsb(8, 4)[:16], tlv_index=1)
+
+
 def test_lsb_ignores_slots_past_nr_ctree() -> None:
     # Acronis reads only nr_ctree slots: a stale ctree past them is not part of the tree
     payload = bytearray(lsb(8, 4, ctrees=[(3 * PAGE, 5)]))
