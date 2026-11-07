@@ -36,6 +36,7 @@ from dissect.archive.tibx.c_tibx import (
     MBR_SIGNATURE,
     MBR_TYPE_GPT_PROTECTIVE,
     PAGE_SIZE,
+    SLICE_DELETED,
     SLICE_TYPE_MASK,
     TLV_IMAP,
     TLV_KEYMAP,
@@ -83,6 +84,9 @@ MIN_VOLUME_SIZE = 1 << 20
 
 # Partitions are imaged in whole sectors of at least this size
 SECTOR_SIZE = 512
+
+# A GUID has 32 hex digits, however it is written; an index of that length never occurs
+GUID_HEX_DIGITS = 32
 
 # Cluster sizes a filesystem may use, from a sector to the 2 MiB NTFS allows; for telling a
 # volume's allocation bitmap by its span
@@ -133,6 +137,40 @@ class RecoveryPoint:
         """When this backup finished."""
         return datetime.datetime.fromtimestamp(self._record.ftime_ms / 1000, datetime.timezone.utc)
 
+    @property
+    def deleted(self) -> bool:
+        """Whether the archive marks this backup as deleted, which bit 7 of its flags does."""
+        return bool(self._record.flags & SLICE_DELETED)
+
+    @property
+    def size(self) -> int:
+        """The uncompressed size of this backup, as its record states it."""
+        return self._record.user_size
+
+    @property
+    def compressed_size(self) -> int:
+        """The compressed size of this backup, as its record states it."""
+        return self._record.compr_size
+
+    @property
+    def items_added(self) -> int:
+        """How many items this backup added to the imap.
+
+        Items are what the imap records: the disks, partitions and Acronis metadata of a
+        disk backup, or the files and directories of a file-level backup.
+        """
+        return self._record.items_added
+
+    @property
+    def items_changed(self) -> int:
+        """How many imap items this backup changed. See :attr:`items_added` for what an item is."""
+        return self._record.items_changed
+
+    @property
+    def items_removed(self) -> int:
+        """How many imap items this backup removed. See :attr:`items_added` for what an item is."""
+        return self._record.items_removed
+
 
 class ItemStream(NamedTuple):
     """One stream of an item record in the imap ("items"), with what the parser needs of the item."""
@@ -167,6 +205,7 @@ class TIBX:
         self.header = read_archive_header(self.store, self.root)
 
         self._recovery_points: list[RecoveryPoint] | None = None
+        self._recovery_point: RecoveryPoint | None = None
         self._slice_limit: int | None = None
         self._data_key = None
         self._reset_snapshot_caches()
@@ -242,6 +281,16 @@ class TIBX:
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+    @property
+    def uuid(self) -> uuid.UUID:
+        """The archive's UUID, from its live ARCH header.
+
+        Every file of a split archive or backup chain carries the same UUID, so it names the
+        archive as a whole, whatever its files are called. It is stored mixed-endian, like
+        the GUIDs of its backups.
+        """
+        return uuid.UUID(bytes_le=self.root.archive_uuid)
 
     @property
     def encrypted(self) -> bool:
@@ -339,23 +388,46 @@ class TIBX:
             ]
         return self._recovery_points
 
-    def use_recovery_point(self, recovery_point: int | str = "latest") -> None:
+    @property
+    def recovery_point(self) -> RecoveryPoint | None:
+        """The backup that volumes and reads reflect.
+
+        The one :meth:`use_recovery_point` selected, or while ``"latest"`` is selected, the
+        newest backup the archive records. ``None`` if the archive records no backups.
+        """
+        if self._recovery_point is not None:
+            return self._recovery_point
+        points = self.recovery_points()
+        return points[-1] if points else None
+
+    def use_recovery_point(self, recovery_point: int | str | uuid.UUID = "latest") -> None:
         """Select which recovery point volumes and reads reflect.
 
+        An index can shift between two looks at the same archive, as Acronis deletes old
+        backups to its retention rules. A GUID does not, so it is the way to name a backup
+        that has to be found again later.
+
         Args:
-            recovery_point: ``"latest"`` (the live root, default), ``"oldest"``, or an
-                integer index into :meth:`recovery_points`.
+            recovery_point: ``"latest"`` (the live root, default), ``"oldest"``, an integer
+                index into :meth:`recovery_points`, or the GUID of a backup, as a
+                :class:`~uuid.UUID` or a string such as ``acrocmd list backups`` prints.
 
         Raises:
-            ~dissect.archive.tibx.exception.InvalidArchiveError: If an integer index is out of range.
+            ~dissect.archive.tibx.exception.InvalidArchiveError: If an integer index is out of range,
+                or no backup has the GUID.
         """
         if recovery_point == "latest":
+            self._recovery_point = None
             self._slice_limit = None
         else:
             points = self.recovery_points()
             if not points:
                 raise InvalidArchiveError("archive records no backups to select from")
-            if recovery_point == "oldest":
+            if isinstance(recovery_point, uuid.UUID) or (
+                isinstance(recovery_point, str) and len(recovery_point) >= GUID_HEX_DIGITS
+            ):
+                chosen = _recovery_point_by_guid(points, recovery_point)
+            elif recovery_point == "oldest":
                 chosen = points[0]
             else:
                 try:
@@ -368,6 +440,7 @@ class TIBX:
             # Extents carry the slice that wrote them, and resolve_extents already treats
             # slice_id as the primary recency signal -- so dropping everything newer than
             # the chosen slice is exactly the archive as it stood after that backup.
+            self._recovery_point = chosen
             self._slice_limit = chosen.slice_id
         self._reset_view_caches()
 
@@ -785,6 +858,19 @@ def resolve_extents(extents: ExtentTable, start: int = 0, stop: int | None = Non
             previous = winner
         position = until
     return interval_starts, interval_stops, interval_covering
+
+
+def _recovery_point_by_guid(points: list[RecoveryPoint], guid: str | uuid.UUID) -> RecoveryPoint:
+    """The recovery point among ``points`` whose GUID is ``guid``."""
+    if not isinstance(guid, uuid.UUID):
+        try:
+            guid = uuid.UUID(guid)
+        except ValueError:
+            raise InvalidArchiveError(f"invalid recovery point {guid!r}")
+    for point in points:
+        if point.guid == guid:
+            return point
+    raise InvalidArchiveError(f"no recovery point with GUID {guid}")
 
 
 def find_split_parts(path: Path) -> list[Path]:

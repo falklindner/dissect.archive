@@ -542,6 +542,7 @@ SEGMENT_MAP_KEY_SIZE = len(c_tibx.segment_map_key)
 SEGMENT_MAP_VALUE_SIZE = len(c_tibx.segment_map_value)
 
 SLICE_TYPE_MASK = 0x7F
+SLICE_DELETED = 0x80
 
 IMAP_KEY_SIZE = len(c_tibx.imap_key)
 IMAP_VALUE_SIZE = len(c_tibx.imap_value)
