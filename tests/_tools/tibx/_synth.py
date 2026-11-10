@@ -652,13 +652,20 @@ def build_lsm_archive(
     return header + b"".join(pages) + arci_page(page_base * PAGE, uuid, commit_seq=1, prev_ci_offset=FIRST_CI_OFFSET)
 
 
-def volumes(offsets: list[int]) -> bytes:
-    """Encode the TLV[18] volumes: the logical byte offset of each archive file."""
-    return b"".join(c_tibx.ar_volume(index=index, start_offs=offset).dumps() for index, offset in enumerate(offsets))
+def volumes(offsets: list[int], indexes: list[int] | None = None) -> bytes:
+    """Encode the TLV[18] volumes: the logical byte offset of each archive file, indexed 0, 1, ... by default."""
+    indexes = range(len(offsets)) if indexes is None else indexes
+    return b"".join(
+        c_tibx.ar_volume(index=index, start_offs=offset).dumps() for index, offset in zip(indexes, offsets, strict=True)
+    )
 
 
 def build_version_set(
-    extents: list[ExtentSpec], stub_logical_pages: int = 8, use_ctree: bool = False
+    extents: list[ExtentSpec],
+    stub_logical_pages: int = 8,
+    use_ctree: bool = False,
+    indexes: list[int] | None = None,
+    missing: list[int] | None = None,
 ) -> tuple[bytes, bytes]:
     """Build a two-file version set: a compacted base stub + one version file.
 
@@ -666,8 +673,16 @@ def build_version_set(
     empty initial root but logically spans ``stub_logical_pages`` (the removed pages of
     the deleted old version), and the version file, mapped at that logical offset by
     the TLV[18] volumes, carries the live backup with global absolute offsets.
+
+    ``indexes`` are the indexes the table gives the two files, 0 and 1 by default. The
+    table also names the files numbered ``missing``, which the set does not have.
     """
-    table = volumes([0, stub_logical_pages * PAGE])
+    indexes = [0, 1] if indexes is None else indexes
+    offsets = [0, stub_logical_pages * PAGE]
+    for number in missing or []:
+        indexes = [*indexes, number]
+        offsets = [*offsets, (stub_logical_pages + 1024 * number) * PAGE]
+    table = volumes(offsets, indexes)
     stub = arch_header_page({1: lsb(31, 10), 2: lsb(8, 32), 18: table}, modified_ms=1, uuid=b"\xaa" * 16)
     version = build_lsm_archive(extents, use_ctree=use_ctree, page_base=stub_logical_pages, extra_slots={18: table})
     return stub, version

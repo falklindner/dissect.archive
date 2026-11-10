@@ -5,6 +5,7 @@ from dissect.archive.tibx.exception import (
     Error,
     InvalidArchiveError,
     InvalidPasswordError,
+    MissingFilesError,
     TibxError,
     UnsupportedFormatError,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "Error",
     "InvalidArchiveError",
     "InvalidPasswordError",
+    "MissingFilesError",
     "RecoveryPoint",
     "TibxError",
     "TibxVolume",

@@ -18,7 +18,7 @@ import uuid
 from array import array
 from bisect import bisect_right
 from collections import OrderedDict, defaultdict
-from itertools import compress, islice, repeat
+from itertools import compress, groupby, islice, repeat
 from operator import add, itemgetter, le, ne
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, NamedTuple
@@ -49,6 +49,7 @@ from dissect.archive.tibx.exception import (
     Error,
     InvalidArchiveError,
     InvalidPasswordError,
+    MissingFilesError,
     UnsupportedFormatError,
 )
 from dissect.archive.tibx.lsm import iter_tree_cells, read_archive_header
@@ -60,6 +61,7 @@ from dissect.archive.tibx.stream import TibxVolumeStream
 if TYPE_CHECKING:
     from typing_extensions import Self
 
+    from dissect.archive.tibx.lsm import ArchiveHeader
     from dissect.archive.tibx.map import Extent, ExtentTable
 
 # Decompressed segments are cached per archive under a memory budget rather than a fixed
@@ -73,6 +75,9 @@ SEGMENT_CACHE_BUDGET = 256 * 1024 * 1024
 PARTITION_NAME_RE = re.compile(rb"disk\d+/part\d+")
 
 SPLIT_PART_RE = re.compile(r"^(?P<stem>.+?)-(?P<num>\d{4})\.tibx$", re.IGNORECASE)
+
+# Ranges of missing files an error names before it leaves the rest out
+MISSING_FILES_NAMED = 10
 
 # Smallest stream taken to be a partition rather than Acronis metadata, for a stream whose
 # filesystem this parser does not recognise. The two populations are far apart in practice:
@@ -155,16 +160,24 @@ class TIBX:
     Args:
         fh: A file-like object of the archive, or the ordered file-like objects of a
             split archive's parts (a raw byte-split of one logical page store).
+
+    Raises:
+        ~dissect.archive.tibx.exception.MissingFilesError: If the archive names more files
+            than ``fh`` gives.
     """
 
     def __init__(self, fh: BinaryIO | list[BinaryIO]):
         self._handles: list[BinaryIO] = []
+        files = None
         if isinstance(fh, list):
+            files = len(fh)
             fh = _stitch(fh)
         self.fh = fh
         self.store = PageStore(fh)
         self.root = self.store.live_root()
         self.header = read_archive_header(self.store, self.root)
+        if files is not None:
+            self._check_files(files)
 
         self._recovery_points: list[RecoveryPoint] | None = None
         self._slice_limit: int | None = None
@@ -203,8 +216,12 @@ class TIBX:
 
         The returned instance owns the file handles; call :meth:`close` (or use it as a
         context manager) to release them.
+
+        Raises:
+            ~dissect.archive.tibx.exception.MissingFilesError: If files of the archive are missing.
         """
         parts = find_split_parts(Path(path))
+        numbers = _part_numbers(parts)
         handles = []
         try:
             # Open one by one so a failure mid-list doesn't leak already-opened handles
@@ -214,13 +231,33 @@ class TIBX:
                 # that is no multiple of it into two reads. A split set goes through a
                 # MappingStream, which expects whole reads from its parts.
                 handles.append(part.open("rb", buffering=0 if len(parts) == 1 else -1))  # noqa: PERF401
-            tibx = cls(handles if len(handles) > 1 else handles[0])
+            try:
+                tibx = cls(_stitch(handles, numbers) if len(handles) > 1 else handles[0])
+            except Error as e:
+                if numbers[0]:
+                    # A later file on its own, which need not even start with a header
+                    first = SPLIT_PART_RE.match(parts[0].name).group("stem") + parts[0].suffix
+                    raise MissingFilesError(f"missing the first file of this archive, {first}") from e
+                raise
+            tibx._check_files(len(handles), numbers)
         except Exception:
             for handle in handles:
                 handle.close()
             raise
         tibx._handles = handles
         return tibx
+
+    def _check_files(self, found: int, numbers: list[int] | None = None) -> None:
+        """Check that the ``found`` files, numbered ``numbers`` if known, are all the files of the archive.
+
+        The table of the archive as a whole is checked here, after the files were mapped by
+        the table in the last one, if it had one: a raw byte-split part has none.
+
+        Raises:
+            ~dissect.archive.tibx.exception.MissingFilesError: If they are not.
+        """
+        if (missing := _missing_files(_file_table(self.header), found, numbers)) is not None:
+            raise MissingFilesError(missing)
 
     def close(self) -> None:
         """Close the file handles owned by this instance (opened via :meth:`open`).
@@ -821,38 +858,105 @@ class _ZeroStream(AlignedStream):
         return b"\x00" * length
 
 
-def _volume_offsets(handle: BinaryIO, expected: int) -> list[int] | None:
-    """The logical byte offset of every file of an archive set, from the volumes in ``handle``'s TLV[18].
+def _part_numbers(parts: list[Path]) -> list[int]:
+    """The number of each file of an archive, as :func:`find_split_parts` returns them: 0 for the first file."""
+    if len(parts) == 1:
+        # A file named -NNNN on its own: the first file is missing
+        match = SPLIT_PART_RE.match(parts[0].name)
+        return [int(match.group("num")) if match else 0]
+    return [0, *(int(SPLIT_PART_RE.match(part.name).group("num")) for part in parts[1:])]
+
+
+def _file_table(header: ArchiveHeader) -> dict[int, int]:
+    """The files of the archive that ``header``'s TLV[18] names: where each starts in the archive, by index.
 
     Acronis calls the files of an archive its volumes; they have nothing to do with the
     backed-up volumes of :meth:`TIBX.volumes`.
-
-    Version files carry the archive's newest commit roots, so the *last* file's live
-    root has the authoritative volumes. Returns None when the file carries no
-    plausible table for ``expected`` files -- notably for raw byte-split parts, which
-    are page-misaligned fragments without their own roots.
     """
     entry_size = len(c_tibx.ar_volume)
+    payload = header.tlv[TLV_VOLUMES].payload if len(header.tlv) > TLV_VOLUMES else b""
+    table = {}
+    for offset in range(0, len(payload) - entry_size + 1, entry_size):
+        entry = c_tibx.ar_volume(payload[offset : offset + entry_size])
+        table[entry.index] = entry.start_offs
+    return table
+
+
+def _own_file_table(handle: BinaryIO) -> dict[int, int] | None:
+    """The file table of the newest commit in the file ``handle`` itself.
+
+    Version files carry the archive's newest commit roots, so the *last* file's live root
+    has the authoritative table. None if the file has no commit root of its own, as a raw
+    byte-split part, a page-misaligned fragment, has not.
+    """
     try:
         store = PageStore(handle)
-        header = read_archive_header(store, store.live_root())
+        return _file_table(read_archive_header(store, store.live_root()))
     except Error:
         return None
-    payload = header.tlv[TLV_VOLUMES].payload if len(header.tlv) > TLV_VOLUMES else b""
-    if len(payload) // entry_size != expected:
+
+
+def _missing_files(table: dict[int, int], found: int, numbers: list[int] | None = None) -> str | None:
+    """Which of the files ``table`` names are missing, in words; None if none are.
+
+    Args:
+        table: The archive's file table, from :func:`_file_table`.
+        found: How many files of the archive there are.
+        numbers: Their numbers, if known: 0 for the first file, NNNN for the one named -NNNN.
+
+    A table of no more files than were found names no missing file: any file it does not
+    name is left over.
+    """
+    if len(table) <= found:
         return None
-    offsets = []
-    for index in range(expected):
-        entry = c_tibx.ar_volume(payload[index * entry_size :])
-        if entry.index != index:
-            return None
-        offsets.append(entry.start_offs)
+    if numbers is None or not set(numbers) <= table.keys():
+        # Which ones are missing is unknown, or the table does not index the files by number
+        return f"missing {len(table) - found} of the {len(table)} files of this archive"
+    missing = sorted(table.keys() - set(numbers))
+    names = []
+    if missing[0] == 0:
+        names.append("the first file")
+    # Runs of consecutive numbers as one range
+    for _, run in groupby(enumerate(number for number in missing if number), lambda item: item[1] - item[0]):
+        run_numbers = [number for _, number in run]
+        first, last = run_numbers[0], run_numbers[-1]
+        names.append(f"-{first:04d}" if first == last else f"-{first:04d} to -{last:04d}")
+    if len(names) > MISSING_FILES_NAMED:
+        names[MISSING_FILES_NAMED:] = ["..."]
+    return f"missing {len(missing)} of the {len(table)} files of this archive: {', '.join(names)}"
+
+
+def _file_offsets(table: dict[int, int], sizes: list[int], numbers: list[int] | None = None) -> list[int] | None:
+    """Where each file of an archive starts in it, by ``table``; None if the table cannot say.
+
+    Args:
+        table: The archive's file table, from :func:`_file_table`.
+        sizes: The size of each file, the first file first.
+        numbers: The number of each file, if known: 0 for the first, NNNN for the one named -NNNN.
+
+    An index in the table is the number of a file. A cleanup removes files from between the
+    others, and the table still indexes the rest by their number, in every real archive seen.
+    A table that does not index them by number but names as many files as there are is taken
+    in the order of the files, as it was before.
+    """
+    if numbers is not None and table.keys() == set(numbers):
+        offsets = [table[number] for number in numbers]
+    elif len(table) == len(sizes):
+        offsets = [table[index] for index in sorted(table)]
+    else:
+        return None
     if offsets[0] != 0 or offsets != sorted(set(offsets)):
         return None
+    # A trustworthy table never maps a file below the previous file's end
+    position = 0
+    for offset, size in zip(offsets, sizes, strict=True):
+        if offset < position:
+            return None
+        position = offset + size
     return offsets
 
 
-def _stitch(handles: list[BinaryIO]) -> MappingStream:
+def _stitch(handles: list[BinaryIO], numbers: list[int] | None = None) -> MappingStream:
     """Map the files of a multi-file archive into one logical page store.
 
     Split archives are raw byte-splits of one page store: the parts concatenate.
@@ -862,21 +966,26 @@ def _stitch(handles: list[BinaryIO]) -> MappingStream:
     truncated, its data pages tombstoned -- while retaining its logical address
     range, so concatenation would misplace every absolute offset in the maps.
     Compacted ranges are mapped as zeros; nothing alive references them.
+
+    Args:
+        handles: The files, the first file first.
+        numbers: The number of each file, if known: 0 for the first, NNNN for the one
+            named -NNNN.
+
+    Raises:
+        ~dissect.archive.tibx.exception.MissingFilesError: If the last file's table names
+            files that are not among ``handles``.
     """
     sizes = []
     for handle in handles:
         handle.seek(0, 2)
         sizes.append(handle.tell())
 
-    offsets = _volume_offsets(handles[-1], expected=len(handles)) if len(handles) > 1 else None
-    if offsets is not None:
-        # A trustworthy table never maps a file below the previous file's end
-        position = 0
-        for offset, size in zip(offsets, sizes, strict=False):
-            if offset < position:
-                offsets = None
-                break
-            position = offset + size
+    offsets = None
+    if len(handles) > 1 and (table := _own_file_table(handles[-1])) is not None:
+        if (missing := _missing_files(table, len(handles), numbers)) is not None:
+            raise MissingFilesError(missing)
+        offsets = _file_offsets(table, sizes, numbers)
     if offsets is None:
         offsets = []
         position = 0

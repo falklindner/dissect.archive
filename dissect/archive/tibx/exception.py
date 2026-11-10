@@ -17,6 +17,10 @@ class CorruptArchiveError(TibxError):
     """The archive is a TIBX archive but its structure is damaged."""
 
 
+class MissingFilesError(CorruptArchiveError):
+    """Files of an archive that consists of several are missing."""
+
+
 class UnsupportedFormatError(TibxError):
     """The archive uses a TIBX feature this parser does not (yet) support."""
 

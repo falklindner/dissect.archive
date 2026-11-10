@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from dissect.archive.tibx.c_tibx import c_tibx
+from dissect.archive.tibx.exception import MissingFilesError
 from dissect.archive.tibx.map import Extent, ExtentTable, load_extents, load_segment_index
 from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX, find_split_parts, resolve_extents
 from tests._tools.tibx._synth import (
@@ -35,6 +36,7 @@ from tests._tools.tibx._synth import (
     segment_map_value,
     segment_pages,
     sparse_extents,
+    volumes,
     write_split_parts,
 )
 
@@ -524,6 +526,68 @@ def test_version_set_volumes(tmp_path: Path, use_ctree: bool) -> None:
         result = tibx.store.verify()
         assert result["bad"] == 0
         assert result["holes"] == 7  # the compacted logical range of the base file
+
+
+@pytest.mark.parametrize(
+    ("indexes", "name"),
+    [([0, 5], "Ver-0005.tibx"), ([0, 1], "Ver-0005.tibx"), ([0, 1], "Ver-0001.tibx")],
+    ids=["by-file-number", "numbered-in-order", "no-gap"],
+)
+def test_version_set_after_cleanup(tmp_path: Path, indexes: list[int], name: str) -> None:
+    # A cleanup removed the files between the base and the version file. The table indexes
+    # them by file number, or 0, 1, ... in the order of the files: either maps them
+    data = b"version-file volume content" * 100
+    stub, version = build_version_set([ExtentSpec(10, 0, data)], indexes=indexes)
+    (tmp_path / "Ver.tibx").write_bytes(stub)
+    (tmp_path / name).write_bytes(version)
+
+    with TIBX.open(tmp_path / "Ver.tibx") as tibx:
+        assert tibx.streams()[0].read(0, len(data)) == data
+
+
+def test_version_set_missing_files(tmp_path: Path) -> None:
+    stub, version = build_version_set([ExtentSpec(10, 0, b"x" * 100)], indexes=[0, 9], missing=[1, 2, 3, 5])
+    (tmp_path / "Ver.tibx").write_bytes(stub)
+    (tmp_path / "Ver-0009.tibx").write_bytes(version)
+
+    with pytest.raises(MissingFilesError, match=r"missing 4 of the 6 files of this archive: -0001 to -0003, -0005$"):
+        TIBX.open(tmp_path / "Ver.tibx")
+    # From file-like objects, which are numbered 0, 1, ...: which files are missing is unknown
+    with pytest.raises(MissingFilesError, match=r"missing 4 of the 6 files of this archive$"):
+        TIBX([io.BytesIO(stub), io.BytesIO(version)])
+
+
+def test_version_file_on_its_own(tmp_path: Path) -> None:
+    # Only the version file: its table names the first file too
+    _, version = build_version_set([ExtentSpec(10, 0, b"x" * 100)])
+    (tmp_path / "Ver-0001.tibx").write_bytes(version)
+
+    with pytest.raises(MissingFilesError, match=r"missing 1 of the 2 files of this archive: the first file$"):
+        TIBX.open(tmp_path / "Ver-0001.tibx")
+
+
+def test_split_archive_missing_part(tmp_path: Path) -> None:
+    # A raw byte-split: the parts have no table of their own, the archive as a whole has
+    archive = build_lsm_archive(
+        [ExtentSpec(10, 0, b"split archive content" * 1000)], extra_slots={18: volumes([0, 4 * PAGE, 8 * PAGE])}
+    )
+    parts = write_split_parts(archive, tmp_path, "Split", (4 * PAGE, 8 * PAGE))
+    with TIBX.open(parts[0]) as tibx:
+        assert tibx.streams()[0].read(0, 21) == b"split archive content"
+
+    parts[1].unlink()
+    with pytest.raises(MissingFilesError, match=r"missing 1 of the 3 files of this archive: -0001$"):
+        TIBX.open(parts[0])
+
+
+def test_split_part_on_its_own(tmp_path: Path) -> None:
+    # A later part of a raw byte-split has no header of its own to read
+    archive = build_lsm_archive([ExtentSpec(10, 0, b"split archive content" * 1000)])
+    parts = write_split_parts(archive, tmp_path, "Split", (4 * PAGE,))
+    parts[0].unlink()
+
+    with pytest.raises(MissingFilesError, match=r"missing the first file of this archive, Split\.tibx$"):
+        TIBX.open(parts[1])
 
 
 def _ntfs_boot(total_sectors: int, sector_size: int = 512) -> bytes:
