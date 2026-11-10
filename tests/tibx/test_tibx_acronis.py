@@ -416,6 +416,23 @@ def test_acronis_live_root_without_commit_info() -> None:
     assert store.live_root().offset == 0xF3000
 
 
+def test_acronis_live_root_scans_once() -> None:
+    # No commit info and no ARCH header but the first: the archive is read to its start
+    # for the one and the other, once
+    store = PageStore(io.BytesIO(_sample("t1_chain_inc")))
+    offsets = tuple(
+        index * PAGE_SIZE
+        for index in range(1, store.page_count)
+        if store.page(index)[1] in (c_tibx.PageType.ARCI, c_tibx.PageType.ARCH)
+    )
+    data = _sample("t1_chain_inc", corrupt=offsets)
+    fh = CountingIO(data)
+    store = PageStore(fh)
+    fh.bytes = 0
+    assert store.live_root().offset == 0
+    assert fh.bytes <= len(data) + PAGE_SIZE  # and CI0's page
+
+
 @pytest.mark.parametrize(
     ("name", "torn", "previous"),
     [

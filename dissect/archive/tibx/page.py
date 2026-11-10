@@ -359,6 +359,31 @@ class PageStore:
                 return SuperBlock(page, index * PAGE_SIZE)
         return None
 
+    def _last_root(self) -> SuperBlock | None:
+        """The root of the commit of :meth:`_last_ci`, if it has a valid one, else :meth:`_last_arch`.
+
+        In one scan backward from EOF rather than one for each: an archive without usable
+        commit info is read to its start, and a 25 GB file cut off in the middle of a backup
+        took 49.5 GB of reads, 455 s over SMB.
+        """
+        last_arch = None
+        want_ci = True
+        for index, page in self._pages_backward():
+            # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
+            if want_ci and page[1] == _ARCI_TYPE and (ci := _commit_info(page, index * PAGE_SIZE)):
+                if (root := self._root_of(ci)) is not None:
+                    return root
+                if last_arch is not None:
+                    return last_arch
+                # The last ARCH header is before this commit info
+                want_ci = False
+            elif page[1] == _ARCH_TYPE and _is_valid_page(page, _ARCH_TYPE, ARCH_MAGIC):
+                if not want_ci:
+                    return SuperBlock(page, index * PAGE_SIZE)
+                if last_arch is None:
+                    last_arch = SuperBlock(page, index * PAGE_SIZE)
+        return last_arch
+
     def live_root(self) -> SuperBlock:
         """Return the live (newest complete) commit root.
 
@@ -378,9 +403,7 @@ class PageStore:
                 root = self._root_of(ci)
                 if root is not None:
                     return root
-        if (ci := self._last_ci()) is not None and (root := self._root_of(ci)) is not None:
-            return root
-        if (root := self._last_arch()) is not None:
+        if (root := self._last_root()) is not None:
             return root
         raise CorruptArchiveError("No ARCH superblock found")
 
