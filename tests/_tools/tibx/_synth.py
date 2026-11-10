@@ -586,6 +586,55 @@ def slice_record(guid: bytes, created_ms: int, finished_ms: int) -> bytes:
     return c_tibx.slice_record(guid=guid, ctime_ms=created_ms, ftime_ms=finished_ms).dumps()
 
 
+def leb128(value: int) -> bytes:
+    out = bytearray()
+    while value >= 0x80:
+        out.append(value & 0x7F | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def variable_cells(cells: list[Cell]) -> bytes:
+    """Encode cells as the compact cell stream of a tree with variable-length keys.
+
+    Each cell is led by its leb128 key and value lengths, a tombstone's with a value length
+    of 0 and no value.
+    """
+    out = bytearray()
+    for group_start in range(0, len(cells), LSM_CELL_GROUP_MAX):
+        group = cells[group_start : group_start + LSM_CELL_GROUP_MAX]
+        alive = sum(1 << index for index, cell in enumerate(group) if cell.alive)
+        out += c_tibx.lsm_cell_group_header(count=len(group), alive=alive).dumps()
+        for cell in group:
+            value = cell.value if cell.alive else b""
+            out += leb128(len(cell.key)) + leb128(len(value)) + cell.key + value
+    return bytes(out)
+
+
+class ImapItem(NamedTuple):
+    """One version of an item for :func:`imap`: as of backup ``slice_id``, its content is stream ``stream_id``."""
+
+    slice_id: int
+    name: bytes
+    stream_id: int
+    size: int
+    flags: int = c_tibx.ItemFlags.COMPLETE | c_tibx.ItemFlags.LINKED
+
+
+def imap(items: list[ImapItem]) -> bytes:
+    """The TLV[0] imap of ``items``, in its mem-tree."""
+    cells = [
+        Cell(
+            c_tibx.imap_key(slice_id=item.slice_id, flags=item.flags, type=0).dumps() + item.name,
+            c_tibx.imap_value(extra_streams=0).dumps()
+            + c_tibx.imap_stream(index=0, flags=c_tibx.StreamFlags.WRITTEN, id=item.stream_id, size=item.size).dumps(),
+        )
+        for item in items
+    ]
+    return lsb(0, 0, memtree_cells=cells, memtree_blob=variable_cells(cells))
+
+
 def build_lsm_archive(
     extents: list[ExtentSpec],
     *,

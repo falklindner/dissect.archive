@@ -23,6 +23,7 @@ from tests._tools.tibx._synth import (
     Cell,
     CountingIO,
     ExtentSpec,
+    ImapItem,
     arch_header_page,
     build_exfat_image,
     build_fat32_image,
@@ -30,6 +31,7 @@ from tests._tools.tibx._synth import (
     build_version_set,
     data_map_key,
     data_map_value,
+    imap,
     lsb,
     lsm_page,
     segment_map_key,
@@ -624,6 +626,62 @@ def test_metadata_streams_are_not_volumes() -> None:
 
     assert [v.volume_id for v in tibx.volumes()] == [4]
     assert len(tibx.streams()) == 4  # nothing is lost, just classified
+
+
+def _two_generations(*items: ImapItem) -> TIBX:
+    # A full backup (slice 2) and a second one (slice 3) that writes the partition to a new
+    # stream, 8, which shares the first one's unchanged boot sector. The first full's
+    # stream, 4, stays in the archive
+    boot = _ntfs_boot(0x18000)
+    archive = build_lsm_archive(
+        [
+            ExtentSpec(4, 0, boot, slice_id=2),
+            ExtentSpec(4, 0x10000, b"first".ljust(512, b"\x00"), slice_id=2),
+            ExtentSpec(8, 0, boot, slice_id=2),
+            ExtentSpec(8, 0x10000, b"second".ljust(512, b"\x00"), slice_id=3),
+            ExtentSpec(9, 0, b'\xef\xbb\xbf<?xml version="1.0"?><metainfo/>', slice_id=3),
+        ],
+        slices=[2, 3],
+        extra_slots={0: imap(list(items))},
+    )
+    return TIBX(io.BytesIO(archive))
+
+
+def test_volumes_are_the_partitions_the_imap_names() -> None:
+    tibx = _two_generations(
+        ImapItem(2, b"disk1/part1", 4, 0x3000000),
+        ImapItem(2, b"part/77494f13728b0e116d08d747fe6df179", 4, 0x3000000),
+        ImapItem(3, b"disk1/part1", 8, 0x3000000),
+        ImapItem(3, b"part/77494f13728b0e116d08d747fe6df179", 8, 0x3000000),
+        ImapItem(3, b"meta", 9, 49),
+    )
+    # Both generations of the partition look like one
+    assert {stream.volume_id for stream in tibx.streams()} == {4, 8, 9}
+
+    assert [volume.volume_id for volume in tibx.volumes()] == [8]
+    assert tibx.volumes()[0].read(0x10000, 6) == b"second"
+    # At the first backup, the second stream holds the boot sector it shares: not a volume
+    tibx.use_recovery_point(0)
+    assert [volume.volume_id for volume in tibx.volumes()] == [4]
+    assert tibx.volumes()[0].read(0x10000, 5) == b"first"
+
+
+def test_volumes_without_the_deleted_partitions() -> None:
+    # The second backup no longer has the partition
+    tibx = _two_generations(
+        ImapItem(2, b"disk1/part1", 4, 0x3000000),
+        ImapItem(3, b"disk1/part1", 0, 0, flags=c_tibx.ItemFlags.COMPLETE | c_tibx.ItemFlags.DELETED),
+        ImapItem(3, b"disk1/part2", 8, 0x3000000),
+    )
+    assert [volume.volume_id for volume in tibx.volumes()] == [8]
+    tibx.use_recovery_point(0)
+    assert [volume.volume_id for volume in tibx.volumes()] == [4]
+
+
+def test_volumes_without_partitions_in_the_imap() -> None:
+    # No partition in the imap, as in a file-level backup: the streams are judged by their content
+    tibx = _two_generations(ImapItem(3, b"meta", 9, 49))
+    assert [volume.volume_id for volume in tibx.volumes()] == [8, 4]
 
 
 def test_unformatted_partition_is_still_a_volume() -> None:

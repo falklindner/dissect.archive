@@ -449,38 +449,65 @@ class TIBX:
         if self._streams is None:
             extents = self.extents
             streams = [TibxVolume(self, vid, extents, start, stop) for vid, start, stop in extents.volume_ranges()]
-            streams.sort(key=lambda stream: (stream._newest_slice, stream.span), reverse=True)
+            streams.sort(key=_stream_order, reverse=True)
             self._streams = streams
         return self._streams
 
     def volumes(self) -> list[TibxVolume]:
-        """The backed-up volumes, newest backup generation first, then largest first.
+        """The backed-up volumes of the selected recovery point, newest backup generation first, then largest first.
 
-        An archive's data_map holds more streams than it holds volumes: alongside each
+        An archive's data_map holds more streams than it holds volumes. Alongside each
         partition, Acronis stores its own metadata -- the ``metainfo`` XML, allocation
         bitmaps, small index tables -- and the disk's MBR/GPT bootstrap region, all keyed
-        by volume id exactly like a partition. Returning those as volumes made a
-        single-partition backup look like eight, and a file-level backup like forty-five.
+        by volume id exactly like a partition. And every full or differential backup writes
+        its partitions to new streams, while those of the backups before it stay: a chain of
+        ten full backups of three partitions holds thirty streams that look like partitions.
 
-        A stream counts as a volume if its content starts with a filesystem this parser
-        recognises, or if it is at least :data:`MIN_VOLUME_SIZE`, a whole number of sectors
-        and does not start with a partition table -- which keeps an unformatted or
-        unrecognised partition, something ``acrocmd list content`` reports as a partition
-        of type ``None``. Use :meth:`streams` for the unfiltered list.
+        So the volumes are the streams the imap names for the partitions of the selected
+        backup, ``disk%u/part%u``. A partition that stores no data at all, such as one never
+        formatted, has no data_map stream. It is listed last and reads as zeros, as
+        Acronis's ``tibxread`` reads it.
 
-        A partition that stores no data at all, such as one never formatted, has no data_map
-        stream. It is listed last, from the imap, and reads as zeros, as Acronis's
-        ``tibxread`` reads it. If the imap is encrypted, a locked archive does not list it.
+        Without partitions in the imap -- it is encrypted and the archive locked, or the
+        backup is a file-level one -- a stream counts as a volume if its content starts with
+        a filesystem this parser recognises, or if it is at least :data:`MIN_VOLUME_SIZE`, a
+        whole number of sectors and does not start with a partition table -- which keeps an
+        unformatted or unrecognised partition, something ``acrocmd list content`` reports as
+        a partition of type ``None``. Use :meth:`streams` for the unfiltered list.
         """
         if self._volumes is None:
-            streams = self.streams()
-            bitmap_spans = _bitmap_spans(streams)
-            self._volumes = [stream for stream in streams if self._is_volume(stream, bitmap_spans)]
-            self._volumes.extend(self._empty_partitions())
+            if partitions := self._partitions():
+                named = {partition.id for partition in partitions}
+                if self._streams is not None:
+                    volumes = [stream for stream in self._streams if stream.volume_id in named]
+                else:
+                    # Only the streams of the partitions: resolving every stream's extents
+                    # costs seconds per backup on a large archive
+                    extents = self.extents
+                    volumes = [
+                        TibxVolume(self, vid, extents, start, stop)
+                        for vid, start, stop in extents.volume_ranges()
+                        if vid in named
+                    ]
+                    volumes.sort(key=_stream_order, reverse=True)
+                stored = {volume.volume_id for volume in volumes}
+                volumes.extend(
+                    TibxVolume(self, partition.id, self.extents, 0, 0)
+                    for partition in partitions
+                    if partition.id not in stored
+                )
+            else:
+                streams = self.streams()
+                bitmap_spans = _bitmap_spans(streams)
+                volumes = [stream for stream in streams if self._is_volume(stream, bitmap_spans)]
+            self._volumes = volumes
         return self._volumes
 
-    def _empty_partitions(self) -> list[TibxVolume]:
-        """The partitions of the selected recovery point whose content has no data_map stream."""
+    def _partitions(self) -> list[ItemStream]:
+        """The partitions of the selected recovery point, as the imap names them, by the record of their data stream.
+
+        Empty if the imap names no partition, or if it is encrypted and the archive locked.
+        """
         try:
             records = self._item_streams()
         except InvalidPasswordError:
@@ -489,18 +516,18 @@ class TIBX:
         # lists items; one that is deleted or incomplete is not there
         versions: dict[bytes, ItemStream] = {}
         for record in records:
-            if record.index == 0 and (self._slice_limit is None or record.slice_id <= self._slice_limit):
+            if (
+                record.index == 0
+                and (self._slice_limit is None or record.slice_id <= self._slice_limit)
+                and PARTITION_NAME_RE.fullmatch(record.name)
+            ):
                 version = versions.get(record.name)
                 if version is None or record.slice_id > version.slice_id:
                     versions[record.name] = record
-        streams = {stream.volume_id for stream in self.streams()}
         return [
-            TibxVolume(self, record.id, self.extents, 0, 0)
-            for name, record in versions.items()
-            if PARTITION_NAME_RE.fullmatch(name)
-            and record.flags & c_tibx.ItemFlags.COMPLETE
-            and not record.flags & c_tibx.ItemFlags.DELETED
-            and record.id not in streams
+            record
+            for record in versions.values()
+            if record.flags & c_tibx.ItemFlags.COMPLETE and not record.flags & c_tibx.ItemFlags.DELETED
         ]
 
     def _item_streams(self) -> list[ItemStream]:
@@ -1001,6 +1028,11 @@ def _stitch(handles: list[BinaryIO], numbers: list[int] | None = None) -> Mappin
         stream.add(offset, size, handle, 0)
         position = offset + size
     return stream
+
+
+def _stream_order(stream: TibxVolume) -> tuple[int, int]:
+    """Sort key of :meth:`TIBX.streams`, which sorts in reverse: the newest backup that wrote to a stream, its span."""
+    return stream._newest_slice, stream.span
 
 
 def _bitmap_spans(streams: list[TibxVolume]) -> set[int]:
