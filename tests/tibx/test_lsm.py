@@ -54,10 +54,13 @@ def test_compact_cells_multiple_groups() -> None:
 
 
 def _variable_cells(cells: list[Cell]) -> bytes:
-    # The cells of a variable-key tree: one group, each cell led by its leb128 lengths
-    out = c_tibx.lsm_cell_group_header(count=len(cells), alive=(1 << len(cells)) - 1).dumps()
+    # The cells of a variable-key tree: one group, each cell led by its leb128 lengths, a
+    # tombstone's with a value length of 0 and no value
+    alive = sum(1 << index for index, cell in enumerate(cells) if cell.alive)
+    out = c_tibx.lsm_cell_group_header(count=len(cells), alive=alive).dumps()
     for cell in cells:
-        out += bytes([len(cell.key), len(cell.value)]) + cell.key + cell.value
+        value = cell.value if cell.alive else b""
+        out += bytes([len(cell.key), len(value)]) + cell.key + value
     return out
 
 
@@ -69,10 +72,38 @@ def test_compact_cells_variable_length() -> None:
     assert [(c.key, c.value) for c in decoded] == [(key, b"abc"), (b"k", b"")]
 
 
+def test_compact_cells_variable_length_tombstones() -> None:
+    # A deleted item of the imap: both lengths, the value's 0, then the key. Read as if it
+    # stored its key length only, the 0 became a key length and the stream fell out of step
+    key = b"K" * 200
+    buf = c_tibx.lsm_cell_group_header(count=4, alive=0b1001).dumps()
+    buf += bytes([2, 3]) + b"ab" + b"xyz"
+    buf += bytes([200 & 0x7F | 0x80, 200 >> 7, 0]) + key
+    buf += bytes([3, 0]) + b"abc"
+    buf += bytes([1, 1]) + b"b" + b"z"
+    decoded = decode_cells_compact(buf, 4, key_length=0, value_length=0)
+    assert [(c.key, c.value, c.alive) for c in decoded] == [
+        (b"ab", b"xyz", True),
+        (key, b"", False),
+        (b"abc", b"", False),
+        (b"b", b"z", True),
+    ]
+
+
 def test_memtree_variable_keys() -> None:
     cells = [Cell(b"ab", b"xyz"), Cell(b"abc", b"")]
     sb = LsmSuperBlock(lsb(0, 0, memtree_cells=cells, memtree_blob=_variable_cells(cells)), tlv_index=0)
     assert [(c.key, c.value) for c in iter_memtree_cells(sb)] == [(b"ab", b"xyz"), (b"abc", b"")]
+
+
+def test_memtree_variable_keys_with_tombstones() -> None:
+    cells = [Cell(b"ab", b"xyz"), Cell(b"abc", b"old", alive=False), Cell(b"abd", b"w")]
+    sb = LsmSuperBlock(lsb(0, 0, memtree_cells=cells, memtree_blob=_variable_cells(cells)), tlv_index=0)
+    assert [(c.key, c.value, c.alive) for c in iter_memtree_cells(sb)] == [
+        (b"ab", b"xyz", True),
+        (b"abc", b"", False),
+        (b"abd", b"w", True),
+    ]
 
 
 def test_memtree_encrypted() -> None:

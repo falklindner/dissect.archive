@@ -268,9 +268,9 @@ def decode_cells_compact(buf: bytes, count: int, key_length: int, value_length: 
 
     Cells come in groups of up to 24, each preceded by a :class:`c_tibx.lsm_cell_group_header`
     whose ``alive`` bitmap has bit ``i`` set when cell ``i`` carries a value; tombstones store
-    only the key. ``key_length == 0`` selects variable-length cells, each led by
-    ``leb128 key_len | leb128 val_len``; a variable-length tombstone is taken to store only
-    ``key_len``, as none has been seen.
+    no value. ``key_length == 0`` selects variable-length cells, each led by
+    ``leb128 key_len | leb128 val_len``, a tombstone's too: its value length is 0. Real
+    archives have such tombstones in the imap and the nlink_map once items were deleted.
     """
     cells = []
     pos = 0
@@ -289,9 +289,7 @@ def decode_cells_compact(buf: bytes, count: int, key_length: int, value_length: 
             key_len, val_len = key_length, value_length
             if key_length == 0:
                 key_len, pos = _read_leb128(buf, pos)
-                val_len = 0
-                if alive:
-                    val_len, pos = _read_leb128(buf, pos)
+                val_len, pos = _read_leb128(buf, pos)
             key = bytes(buf[pos : pos + key_len])
             pos += key_len
             value = b""

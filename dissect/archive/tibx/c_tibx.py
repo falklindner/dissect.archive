@@ -314,7 +314,7 @@ struct lsm_page_header {
 /* Precedes each group of cells in a compact cell stream */
 struct lsm_cell_group_header {
     uint8       count;                  /* cells in this group, 1-24 */
-    uint24      alive;                  /* bit i set: cell i carries a value; a tombstone only its key */
+    uint24      alive;                  /* bit i set: cell i carries a value; a tombstone none */
 };
 
 /* LDIR record value: where the child page is */
