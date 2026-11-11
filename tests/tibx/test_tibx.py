@@ -15,9 +15,15 @@ from typing import TYPE_CHECKING
 import pytest
 
 from dissect.archive.tibx.c_tibx import c_tibx
-from dissect.archive.tibx.exception import MissingFilesError
+from dissect.archive.tibx.exception import MissingVolumeError
 from dissect.archive.tibx.map import Extent, ExtentTable, load_extents, load_segment_index
-from dissect.archive.tibx.tibx import MIN_VOLUME_SIZE, TIBX, find_split_parts, resolve_extents
+from dissect.archive.tibx.tibx import (
+    MIN_VOLUME_SIZE,
+    TIBX,
+    _missing_volumes_error_string,
+    find_split_parts,
+    resolve_extents,
+)
 from tests._tools.tibx._synth import (
     PAGE,
     Cell,
@@ -547,16 +553,27 @@ def test_version_set_after_cleanup(tmp_path: Path, indexes: list[int], name: str
         assert tibx.streams()[0].read(0, len(data)) == data
 
 
-def test_version_set_missing_files(tmp_path: Path) -> None:
+def test_version_set_missing_volumes(tmp_path: Path) -> None:
     stub, version = build_version_set([ExtentSpec(10, 0, b"x" * 100)], indexes=[0, 9], missing=[1, 2, 3, 5])
     (tmp_path / "Ver.tibx").write_bytes(stub)
     (tmp_path / "Ver-0009.tibx").write_bytes(version)
 
-    with pytest.raises(MissingFilesError, match=r"missing 4 of the 6 files of this archive: -0001 to -0003, -0005$"):
+    with pytest.raises(MissingVolumeError, match=r"missing 4 of the 6 files of this archive: -0001 to -0003, -0005$"):
         TIBX.open(tmp_path / "Ver.tibx")
     # From file-like objects, which are numbered 0, 1, ...: which files are missing is unknown
-    with pytest.raises(MissingFilesError, match=r"missing 4 of the 6 files of this archive$"):
+    with pytest.raises(MissingVolumeError, match=r"missing 4 of the 6 files of this archive$"):
         TIBX([io.BytesIO(stub), io.BytesIO(version)])
+
+
+def test_missing_volumes_named_at_most() -> None:
+    # Every other file of 20 missing: ten runs of one, of which the message names the first three
+    table = {number: number * PAGE for number in range(20)}
+    found = list(range(0, 20, 2))
+
+    message = _missing_volumes_error_string(table, len(found), found, max_missing_filenames=3)
+    assert message == "missing 10 of the 20 files of this archive: -0001, -0003, -0005, ..."
+    assert _missing_volumes_error_string(table, len(found), found).endswith("-0019")
+    assert _missing_volumes_error_string(table, 20, list(range(20))) is None
 
 
 def test_version_file_on_its_own(tmp_path: Path) -> None:
@@ -564,7 +581,7 @@ def test_version_file_on_its_own(tmp_path: Path) -> None:
     _, version = build_version_set([ExtentSpec(10, 0, b"x" * 100)])
     (tmp_path / "Ver-0001.tibx").write_bytes(version)
 
-    with pytest.raises(MissingFilesError, match=r"missing 1 of the 2 files of this archive: the first file$"):
+    with pytest.raises(MissingVolumeError, match=r"missing 1 of the 2 files of this archive: the first file$"):
         TIBX.open(tmp_path / "Ver-0001.tibx")
 
 
@@ -578,7 +595,7 @@ def test_split_archive_missing_part(tmp_path: Path) -> None:
         assert tibx.streams()[0].read(0, 21) == b"split archive content"
 
     parts[1].unlink()
-    with pytest.raises(MissingFilesError, match=r"missing 1 of the 3 files of this archive: -0001$"):
+    with pytest.raises(MissingVolumeError, match=r"missing 1 of the 3 files of this archive: -0001$"):
         TIBX.open(parts[0])
 
 
@@ -588,7 +605,7 @@ def test_split_part_on_its_own(tmp_path: Path) -> None:
     parts = write_split_parts(archive, tmp_path, "Split", (4 * PAGE,))
     parts[0].unlink()
 
-    with pytest.raises(MissingFilesError, match=r"missing the first file of this archive, Split\.tibx$"):
+    with pytest.raises(MissingVolumeError, match=r"missing the first file of this archive, Split\.tibx$"):
         TIBX.open(parts[1])
 
 

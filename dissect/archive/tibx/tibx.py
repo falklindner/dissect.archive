@@ -18,6 +18,7 @@ import uuid
 from array import array
 from bisect import bisect_right
 from collections import OrderedDict, defaultdict
+from io import BytesIO
 from itertools import compress, groupby, islice, repeat
 from operator import add, itemgetter, le, ne
 from pathlib import Path
@@ -49,7 +50,7 @@ from dissect.archive.tibx.exception import (
     Error,
     InvalidArchiveError,
     InvalidPasswordError,
-    MissingFilesError,
+    MissingVolumeError,
     UnsupportedFormatError,
 )
 from dissect.archive.tibx.lsm import iter_tree_cells, read_archive_header
@@ -75,9 +76,6 @@ SEGMENT_CACHE_BUDGET = 256 * 1024 * 1024
 PARTITION_NAME_RE = re.compile(rb"disk\d+/part\d+")
 
 SPLIT_PART_RE = re.compile(r"^(?P<stem>.+?)-(?P<num>\d{4})\.tibx$", re.IGNORECASE)
-
-# Ranges of missing files an error names before it leaves the rest out
-MISSING_FILES_NAMED = 10
 
 # Smallest stream taken to be a partition rather than Acronis metadata, for a stream whose
 # filesystem this parser does not recognise. The two populations are far apart in practice:
@@ -162,8 +160,8 @@ class TIBX:
             split archive's parts (a raw byte-split of one logical page store).
 
     Raises:
-        ~dissect.archive.tibx.exception.MissingFilesError: If the archive names more files
-            than ``fh`` gives.
+        ~dissect.archive.tibx.exception.MissingVolumeError: If the archive names more volumes
+            (files) than ``fh`` gives.
     """
 
     def __init__(self, fh: BinaryIO | list[BinaryIO]):
@@ -218,7 +216,8 @@ class TIBX:
         context manager) to release them.
 
         Raises:
-            ~dissect.archive.tibx.exception.MissingFilesError: If files of the archive are missing.
+            ~dissect.archive.tibx.exception.MissingVolumeError: If volumes (files) of the archive are
+                missing.
         """
         parts = find_split_parts(Path(path))
         numbers = _part_numbers(parts)
@@ -237,7 +236,7 @@ class TIBX:
                 if numbers[0]:
                     # A later file on its own, which need not even start with a header
                     first = SPLIT_PART_RE.match(parts[0].name).group("stem") + parts[0].suffix
-                    raise MissingFilesError(f"missing the first file of this archive, {first}") from e
+                    raise MissingVolumeError(f"missing the first file of this archive, {first}") from e
                 raise
             tibx._check_files(len(handles), numbers)
         except Exception:
@@ -254,10 +253,10 @@ class TIBX:
         the table in the last one, if it had one: a raw byte-split part has none.
 
         Raises:
-            ~dissect.archive.tibx.exception.MissingFilesError: If they are not.
+            ~dissect.archive.tibx.exception.MissingVolumeError: If they are not.
         """
-        if (missing := _missing_files(_file_table(self.header), found, numbers)) is not None:
-            raise MissingFilesError(missing)
+        if (missing := _missing_volumes_error_string(_volume_table(self.header), found, numbers)) is not None:
+            raise MissingVolumeError(missing)
 
     def close(self) -> None:
         """Close the file handles owned by this instance (opened via :meth:`open`).
@@ -894,23 +893,21 @@ def _part_numbers(parts: list[Path]) -> list[int]:
     return [0, *(int(SPLIT_PART_RE.match(part.name).group("num")) for part in parts[1:])]
 
 
-def _file_table(header: ArchiveHeader) -> dict[int, int]:
-    """The files of the archive that ``header``'s TLV[18] names: where each starts in the archive, by index.
+def _volume_table(header: ArchiveHeader) -> dict[int, int]:
+    """The volumes of the archive that ``header``'s TLV[18] names: where each starts in the archive, by index.
 
     Acronis calls the files of an archive its volumes; they have nothing to do with the
-    backed-up volumes of :meth:`TIBX.volumes`.
+    backed-up volumes of :meth:`TIBX.volumes`. TLV[18] is a run of ``ar_volume`` entries,
+    and empty if the header has none.
     """
-    entry_size = len(c_tibx.ar_volume)
-    payload = header.tlv[TLV_VOLUMES].payload if len(header.tlv) > TLV_VOLUMES else b""
-    table = {}
-    for offset in range(0, len(payload) - entry_size + 1, entry_size):
-        entry = c_tibx.ar_volume(payload[offset : offset + entry_size])
-        table[entry.index] = entry.start_offs
-    return table
+    payload = header.tlv[TLV_VOLUMES].payload
+    fh = BytesIO(payload)
+    entries = (c_tibx.ar_volume(fh) for _ in range(len(payload) // len(c_tibx.ar_volume)))
+    return {entry.index: entry.start_offs for entry in entries}
 
 
-def _own_file_table(handle: BinaryIO) -> dict[int, int] | None:
-    """The file table of the newest commit in the file ``handle`` itself.
+def _own_volume_table(handle: BinaryIO) -> dict[int, int] | None:
+    """The volume table of the newest commit in the file ``handle`` itself.
 
     Version files carry the archive's newest commit roots, so the *last* file's live root
     has the authoritative table. None if the file has no commit root of its own, as a raw
@@ -918,21 +915,27 @@ def _own_file_table(handle: BinaryIO) -> dict[int, int] | None:
     """
     try:
         store = PageStore(handle)
-        return _file_table(read_archive_header(store, store.live_root()))
+        return _volume_table(read_archive_header(store, store.live_root()))
     except Error:
         return None
 
 
-def _missing_files(table: dict[int, int], found: int, numbers: list[int] | None = None) -> str | None:
-    """Which of the files ``table`` names are missing, in words; None if none are.
+def _missing_volumes_error_string(
+    table: dict[int, int], found: int, numbers: list[int] | None = None, max_missing_filenames: int = 10
+) -> str | None:
+    """The error message naming which of the volumes ``table`` names are missing; None if none are.
+
+    The message speaks of files, as Acronis's own does: those are what a user looks for.
 
     Args:
-        table: The archive's file table, from :func:`_file_table`.
+        table: The archive's volume table, from :func:`_volume_table`.
         found: How many files of the archive there are.
         numbers: Their numbers, if known: 0 for the first file, NNNN for the one named -NNNN.
+        max_missing_filenames: How many missing files, or runs of them, the message names
+            before it leaves the rest out.
 
-    A table of no more files than were found names no missing file: any file it does not
-    name is left over.
+    A table of no more volumes than files were found names no missing file: any volume it
+    does not name is left over.
     """
     if len(table) <= found:
         return None
@@ -948,16 +951,16 @@ def _missing_files(table: dict[int, int], found: int, numbers: list[int] | None 
         run_numbers = [number for _, number in run]
         first, last = run_numbers[0], run_numbers[-1]
         names.append(f"-{first:04d}" if first == last else f"-{first:04d} to -{last:04d}")
-    if len(names) > MISSING_FILES_NAMED:
-        names[MISSING_FILES_NAMED:] = ["..."]
+    if len(names) > max_missing_filenames:
+        names[max_missing_filenames:] = ["..."]
     return f"missing {len(missing)} of the {len(table)} files of this archive: {', '.join(names)}"
 
 
-def _file_offsets(table: dict[int, int], sizes: list[int], numbers: list[int] | None = None) -> list[int] | None:
+def _volume_offsets(table: dict[int, int], sizes: list[int], numbers: list[int] | None = None) -> list[int] | None:
     """Where each file of an archive starts in it, by ``table``; None if the table cannot say.
 
     Args:
-        table: The archive's file table, from :func:`_file_table`.
+        table: The archive's volume table, from :func:`_volume_table`.
         sizes: The size of each file, the first file first.
         numbers: The number of each file, if known: 0 for the first, NNNN for the one named -NNNN.
 
@@ -1000,8 +1003,8 @@ def _stitch(handles: list[BinaryIO], numbers: list[int] | None = None) -> Mappin
             named -NNNN.
 
     Raises:
-        ~dissect.archive.tibx.exception.MissingFilesError: If the last file's table names
-            files that are not among ``handles``.
+        ~dissect.archive.tibx.exception.MissingVolumeError: If the last file's table names
+            volumes that are not among ``handles``.
     """
     sizes = []
     for handle in handles:
@@ -1009,10 +1012,10 @@ def _stitch(handles: list[BinaryIO], numbers: list[int] | None = None) -> Mappin
         sizes.append(handle.tell())
 
     offsets = None
-    if len(handles) > 1 and (table := _own_file_table(handles[-1])) is not None:
-        if (missing := _missing_files(table, len(handles), numbers)) is not None:
-            raise MissingFilesError(missing)
-        offsets = _file_offsets(table, sizes, numbers)
+    if len(handles) > 1 and (table := _own_volume_table(handles[-1])) is not None:
+        if (missing := _missing_volumes_error_string(table, len(handles), numbers)) is not None:
+            raise MissingVolumeError(missing)
+        offsets = _volume_offsets(table, sizes, numbers)
     if offsets is None:
         offsets = []
         position = 0

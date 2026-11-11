@@ -163,7 +163,9 @@ class ArchiveHeader:
 def parse_tlv_directory(body: bytes) -> list[TlvSlot]:
     """Walk the 19-entry TLV directory at ``body[0x400:header_size]``.
 
-    Header versions below 8 zero-skip some slots; version 8+ parses all 19.
+    Header versions below 8 zero-skip some slots; version 8+ parses all 19. Always returns
+    all 19 slots, indexable by slot number: a slot that is skipped or lies past the end of
+    the directory has an empty payload.
     """
     if len(body) < TLV_DIRECTORY_OFFSET + 8:
         raise CorruptArchiveError(f"ARCH body too short for TLV directory: {len(body)} bytes")

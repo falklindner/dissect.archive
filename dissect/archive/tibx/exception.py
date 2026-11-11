@@ -17,8 +17,12 @@ class CorruptArchiveError(TibxError):
     """The archive is a TIBX archive but its structure is damaged."""
 
 
-class MissingFilesError(CorruptArchiveError):
-    """Files of an archive that consists of several are missing."""
+class MissingVolumeError(CorruptArchiveError):
+    """One or more volumes of an archive that consists of several are missing.
+
+    Acronis calls the files of an archive its volumes; they have nothing to do with the
+    backed-up volumes of :meth:`~dissect.archive.tibx.tibx.TIBX.volumes`.
+    """
 
 
 class UnsupportedFormatError(TibxError):
