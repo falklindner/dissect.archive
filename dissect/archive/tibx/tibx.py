@@ -74,6 +74,10 @@ SEGMENT_CACHE_BUDGET = 256 * 1024 * 1024
 # A partition's item name: Acronis looks partitions up as disk%u/part%u. The same
 # partition is also linked as part/<hash>.
 PARTITION_NAME_RE = re.compile(rb"disk\d+/part\d+")
+# The items only a disk backup names: its disks, its partitions, and their links by hash
+DISK_ITEM_RE = re.compile(rb"disk\d+(?:/part\d+)?|part/[0-9a-fA-F]+")
+# Acronis's own items, which a disk backup names besides
+ACRONIS_ITEM_RE = re.compile(rb"meta.*|file/vss_.*", re.DOTALL)
 
 SPLIT_PART_RE = re.compile(r"^(?P<stem>.+?)-(?P<num>\d{4})\.tibx$", re.IGNORECASE)
 
@@ -467,12 +471,16 @@ class TIBX:
         formatted, has no data_map stream. It is listed last and reads as zeros, as
         Acronis's ``tibxread`` reads it.
 
-        Without partitions in the imap -- it is encrypted and the archive locked, or the
-        backup is a file-level one -- a stream counts as a volume if its content starts with
-        a filesystem this parser recognises, or if it is at least :data:`MIN_VOLUME_SIZE`, a
-        whole number of sectors and does not start with a partition table -- which keeps an
-        unformatted or unrecognised partition, something ``acrocmd list content`` reports as
-        a partition of type ``None``. Use :meth:`streams` for the unfiltered list.
+        A file-level backup, whose imap names files and folders but no disk or partition,
+        has no volumes: its files are streams too, and large ones look like partitions.
+
+        Without partitions in the imap otherwise -- it is encrypted and the archive locked,
+        or the backup never finished, so that none of its partitions was completed -- a
+        stream counts as a volume if its content starts with a filesystem this parser
+        recognises, or if it is at least :data:`MIN_VOLUME_SIZE`, a whole number of sectors
+        and does not start with a partition table -- which keeps an unformatted or
+        unrecognised partition, something ``acrocmd list content`` reports as a partition of
+        type ``None``. Use :meth:`streams` for the unfiltered list.
         """
         if self._volumes is None:
             if partitions := self._partitions():
@@ -495,12 +503,27 @@ class TIBX:
                     for partition in partitions
                     if partition.id not in stored
                 )
+            elif self._file_level():
+                volumes = []
             else:
                 streams = self.streams()
                 bitmap_spans = _bitmap_spans(streams)
                 volumes = [stream for stream in streams if self._is_volume(stream, bitmap_spans)]
             self._volumes = volumes
         return self._volumes
+
+    def _file_level(self) -> bool:
+        """Whether the archive holds a file-level backup: its imap names files and folders, and no disk or partition.
+
+        False if the imap is encrypted and the archive locked: then it cannot be told.
+        """
+        try:
+            names = {record.name for record in self._item_streams()}
+        except InvalidPasswordError:
+            return False
+        if any(DISK_ITEM_RE.fullmatch(name) for name in names):
+            return False
+        return any(not ACRONIS_ITEM_RE.fullmatch(name) for name in names)
 
     def _partitions(self) -> list[ItemStream]:
         """The partitions of the selected recovery point, as the imap names them, by the record of their data stream.

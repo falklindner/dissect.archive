@@ -695,10 +695,38 @@ def test_volumes_without_the_deleted_partitions() -> None:
     assert [volume.volume_id for volume in tibx.volumes()] == [4]
 
 
-def test_volumes_without_partitions_in_the_imap() -> None:
-    # No partition in the imap, as in a file-level backup: the streams are judged by their content
-    tibx = _two_generations(ImapItem(3, b"meta", 9, 49))
+@pytest.mark.parametrize(
+    "items",
+    [
+        pytest.param([ImapItem(3, b"meta", 9, 49)], id="acronis-items-only"),
+        # A backup that never finished: its disk is complete, its partition's link is not
+        pytest.param(
+            [
+                ImapItem(3, b"disk1", 9, 49, flags=c_tibx.ItemFlags.COMPLETE),
+                ImapItem(3, b"part/77494f13728b0e116d08d747fe6df179", 8, 0x3000000, flags=c_tibx.ItemFlags(0)),
+            ],
+            id="not-finished",
+        ),
+    ],
+)
+def test_volumes_without_partitions_in_the_imap(items: list[ImapItem]) -> None:
+    # No partition in the imap: the streams are judged by their content
+    tibx = _two_generations(*items)
     assert [volume.volume_id for volume in tibx.volumes()] == [8, 4]
+
+
+def test_file_level_backup_has_no_volumes() -> None:
+    # Its imap names files, no disk or partition. A large file looks like a partition by its
+    # content, as two real file-level backups listing 240 and 107 volumes showed
+    tibx = _two_generations(
+        ImapItem(2, b"C:/Users/user/disk.vhd", 4, 0x3000000),
+        ImapItem(3, b"C:/Users/user/disk.vhd", 8, 0x3000000),
+        ImapItem(3, b"C:/Users/user/notes.xml", 9, 49),
+    )
+    assert tibx.volumes() == []
+    assert len(tibx.streams()) == 3  # nothing is lost
+    tibx.use_recovery_point(0)
+    assert tibx.volumes() == []
 
 
 def test_unformatted_partition_is_still_a_volume() -> None:
