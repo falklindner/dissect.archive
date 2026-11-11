@@ -32,7 +32,7 @@ from dissect.archive.tibx.page import (
 from dissect.archive.tibx.segment import Segment
 from dissect.archive.tibx.tibx import TIBX
 from tests._tools.tibx._synth import CountingIO
-from tests.conftest import absolute_path
+from tests._util import absolute_path
 
 PASSWORD = "dissect"
 
@@ -57,14 +57,14 @@ ARCHIVES = [
 
 
 def _open(name: str) -> TIBX:
-    return TIBX.open(absolute_path(f"_data/acronis/tibx/{name}.tibx"))
+    return TIBX.open(absolute_path(f"_data/tibx/{name}.tibx"))
 
 
 def _sample(name: str, corrupt: tuple[int, ...] = (), trailing: int = 0) -> bytes:
     """A single-file sample with a byte flipped in the page at each ``corrupt`` offset, and
     ``trailing`` zero pages appended, as a backup that failed after the last commit leaves.
     """
-    data = bytearray(absolute_path(f"_data/acronis/tibx/{name}.tibx").read_bytes())
+    data = bytearray(absolute_path(f"_data/tibx/{name}.tibx").read_bytes())
     for offset in corrupt:
         data[offset + 0x100] ^= 0xFF
     return bytes(data) + b"\x00" * PAGE_SIZE * trailing

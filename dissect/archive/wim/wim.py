@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, BinaryIO
 from dissect.util.stream import AlignedStream, BufferedStream, RelativeStream
 from dissect.util.ts import wintimestamp
 
-from dissect.archive.c_wim import (
+from dissect.archive.exception import (
+    FileNotFoundError,
+    InvalidHeaderError,
+    NotADirectoryError,
+    NotAReparsePointError,
+)
+from dissect.archive.wim.c_wim import (
     DECOMPRESSOR_MAP,
     FILE_ATTRIBUTE,
     HEADER_FLAG,
@@ -17,12 +23,6 @@ from dissect.archive.c_wim import (
     SYMLINK_FLAG,
     WIM_IMAGE_TAG,
     c_wim,
-)
-from dissect.archive.exceptions import (
-    FileNotFoundError,
-    InvalidHeaderError,
-    NotADirectoryError,
-    NotAReparsePointError,
 )
 
 if TYPE_CHECKING:

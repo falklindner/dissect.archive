@@ -5,6 +5,7 @@ from dissect.archive.tibx.exception import (
     Error,
     InvalidArchiveError,
     InvalidPasswordError,
+    TibxError,
     UnsupportedFormatError,
 )
 from dissect.archive.tibx.stream import TibxVolumeStream
@@ -17,6 +18,7 @@ __all__ = [
     "InvalidArchiveError",
     "InvalidPasswordError",
     "RecoveryPoint",
+    "TibxError",
     "TibxVolume",
     "TibxVolumeStream",
     "UnsupportedFormatError",

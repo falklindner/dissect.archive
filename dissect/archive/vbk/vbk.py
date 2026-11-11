@@ -13,8 +13,8 @@ from dissect.util.hash.crc32c import crc32c
 from dissect.util.stream import AlignedStream
 from dissect.util.xmemoryview import xmemoryview
 
-from dissect.archive.c_vbk import PAGE_SIZE, c_vbk
-from dissect.archive.exceptions import Error, FileNotFoundError, IsADirectoryError, NotADirectoryError
+from dissect.archive.exception import Error, FileNotFoundError, IsADirectoryError, NotADirectoryError
+from dissect.archive.vbk.c_vbk import PAGE_SIZE, c_vbk
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

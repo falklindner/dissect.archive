@@ -13,8 +13,8 @@ from uuid import UUID
 from dissect.util import ts
 from dissect.util.stream import AlignedStream
 
-from dissect.archive.c_vma import VMA_EXTENT_MAGIC, VMA_MAGIC, c_vma
-from dissect.archive.exceptions import InvalidHeaderError
+from dissect.archive.exception import InvalidHeaderError
+from dissect.archive.vma.c_vma import VMA_EXTENT_MAGIC, VMA_MAGIC, c_vma
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
