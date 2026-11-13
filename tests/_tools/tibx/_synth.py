@@ -226,15 +226,18 @@ def build_archive(uuid: bytes = b"\xab" * 16) -> bytes:
 
 
 class CountingIO(io.BytesIO):
-    """An in-memory archive that counts the reads made on it."""
+    """An in-memory archive that counts the reads made on it, and the bytes they read."""
 
     def __init__(self, data: bytes):
         super().__init__(data)
         self.reads = 0
+        self.bytes = 0
 
     def read(self, size: int | None = -1) -> bytes:
         self.reads += 1
-        return super().read(size)
+        data = super().read(size)
+        self.bytes += len(data)
+        return data
 
 
 def build_fat12_image(content: bytes, filename: bytes = b"HELLO   TXT") -> bytes:
