@@ -258,7 +258,7 @@ class TIBX:
         Raises:
             ~dissect.archive.tibx.exception.MissingVolumeError: If they are not.
         """
-        if (missing := _missing_volumes_error_string(_volume_table(self.header), found, numbers)) is not None:
+        if (missing := _missing_volumes_message(_volume_table(self.header), found, numbers)) is not None:
             raise MissingVolumeError(missing)
 
     def close(self) -> None:
@@ -942,7 +942,7 @@ def _own_volume_table(handle: BinaryIO) -> dict[int, int] | None:
         return None
 
 
-def _missing_volumes_error_string(
+def _missing_volumes_message(
     table: dict[int, int], found: int, numbers: list[int] | None = None, max_missing_filenames: int = 10
 ) -> str | None:
     """The error message naming which of the volumes ``table`` names are missing; None if none are.
@@ -1035,7 +1035,7 @@ def _stitch(handles: list[BinaryIO], numbers: list[int] | None = None) -> Mappin
 
     offsets = None
     if len(handles) > 1 and (table := _own_volume_table(handles[-1])) is not None:
-        if (missing := _missing_volumes_error_string(table, len(handles), numbers)) is not None:
+        if (missing := _missing_volumes_message(table, len(handles), numbers)) is not None:
             raise MissingVolumeError(missing)
         offsets = _volume_offsets(table, sizes, numbers)
     if offsets is None:

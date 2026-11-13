@@ -20,7 +20,7 @@ from dissect.archive.tibx.map import Extent, ExtentTable, load_extents, load_seg
 from dissect.archive.tibx.tibx import (
     MIN_VOLUME_SIZE,
     TIBX,
-    _missing_volumes_error_string,
+    _missing_volumes_message,
     find_split_parts,
     resolve_extents,
 )
@@ -570,10 +570,10 @@ def test_missing_volumes_named_at_most() -> None:
     table = {number: number * PAGE for number in range(20)}
     found = list(range(0, 20, 2))
 
-    message = _missing_volumes_error_string(table, len(found), found, max_missing_filenames=3)
+    message = _missing_volumes_message(table, len(found), found, max_missing_filenames=3)
     assert message == "missing 10 of the 20 files of this archive: -0001, -0003, -0005, ..."
-    assert _missing_volumes_error_string(table, len(found), found).endswith("-0019")
-    assert _missing_volumes_error_string(table, 20, list(range(20))) is None
+    assert _missing_volumes_message(table, len(found), found).endswith("-0019")
+    assert _missing_volumes_message(table, 20, list(range(20))) is None
 
 
 def test_version_file_on_its_own(tmp_path: Path) -> None:
