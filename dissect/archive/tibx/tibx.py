@@ -18,7 +18,6 @@ import uuid
 from array import array
 from bisect import bisect_right
 from collections import OrderedDict, defaultdict
-from io import BytesIO
 from itertools import compress, groupby, islice, repeat
 from operator import add, itemgetter, le, ne
 from pathlib import Path
@@ -924,8 +923,8 @@ def _volume_table(header: ArchiveHeader) -> dict[int, int]:
     and empty if the header has none.
     """
     payload = header.tlv[TLV_VOLUMES].payload
-    fh = BytesIO(payload)
-    entries = (c_tibx.ar_volume(fh) for _ in range(len(payload) // len(c_tibx.ar_volume)))
+    count = len(payload) // len(c_tibx.ar_volume)
+    entries = c_tibx.ar_volume[count](payload)
     return {entry.index: entry.start_offs for entry in entries}
 
 
