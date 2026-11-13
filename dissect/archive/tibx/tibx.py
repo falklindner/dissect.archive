@@ -39,6 +39,7 @@ from dissect.archive.tibx.c_tibx import (
     SLICE_TYPE_MASK,
     TLV_IMAP,
     TLV_KEYMAP,
+    TLV_META,
     TLV_SLICES,
     TLV_VOLUMES,
     c_boot,
@@ -73,10 +74,6 @@ SEGMENT_CACHE_BUDGET = 256 * 1024 * 1024
 # A partition's item name: Acronis looks partitions up as disk%u/part%u. The same
 # partition is also linked as part/<hash>.
 PARTITION_NAME_RE = re.compile(rb"disk\d+/part\d+")
-# The items only a disk backup names: its disks, its partitions, and their links by hash
-DISK_ITEM_RE = re.compile(rb"disk\d+(?:/part\d+)?|part/[0-9a-fA-F]+")
-# Acronis's own items, which a disk backup names besides
-ACRONIS_ITEM_RE = re.compile(rb"meta.*|file/vss_.*", re.DOTALL)
 
 SPLIT_PART_RE = re.compile(r"^(?P<stem>.+?)-(?P<num>\d{4})\.tibx$", re.IGNORECASE)
 
@@ -323,6 +320,32 @@ class TIBX:
 
         return has_certificate_wrapped_key(self.header)
 
+    @property
+    def meta(self) -> dict[c_tibx.MetaKey, str]:
+        """The archive's meta (TLV[9]): the archive type, the product that wrote it, its machine, owner and plan.
+
+        TLV[9] holds a NUL-terminated string per slot, in the order of :class:`MetaKey`,
+        as libarchive3's ``ar_meta_keys`` names them. An older product writes fewer slots,
+        which are left out: Cyber Protect 15 writes no ``PASSWORD_HINT``, True Image 2020
+        no ``CENTRALIZED_PLAN_ID`` either. Bytes after the last NUL are ignored, as Acronis
+        ignores them. The meta is stored unencrypted, so it can be read without a password,
+        even from an encrypted archive.
+        """
+        # The last piece is what follows the last NUL. Fewer values than keys is an older
+        # writer, more ones are no slot libarchive3 knows
+        *values, _ = self.header.tlv[TLV_META].payload.split(b"\x00")
+        return {key: value.decode("utf-8", "replace") for key, value in zip(c_tibx.MetaKey, values, strict=False)}
+
+    @property
+    def archive_type(self) -> str:
+        """What the archive holds: ``"disk"`` for a disk-level backup, ``"file"`` for a file-level one.
+
+        The ``TYPE`` of the :attr:`meta`, which Acronis reads as the archive type:
+        libarchive3 creates no backup in an archive without one, and ``tibxread`` opens only
+        a ``"disk"`` archive. An empty string if the archive has no type.
+        """
+        return self.meta.get(c_tibx.MetaKey.TYPE, "")
+
     def unlock(self, password: str | bytes) -> None:
         """Derive the data key from ``password`` to read encrypted segments.
 
@@ -470,8 +493,8 @@ class TIBX:
         formatted, has no data_map stream. It is listed last and reads as zeros, as
         Acronis's ``tibxread`` reads it.
 
-        A file-level backup, whose imap names files and folders but no disk or partition,
-        has no volumes: its files are streams too, and large ones look like partitions.
+        A file-level backup, of :attr:`archive_type` ``"file"``, has no volumes: its files
+        are streams too, and large ones look like partitions.
 
         Without partitions in the imap otherwise -- it is encrypted and the archive locked,
         or the backup never finished, so that none of its partitions was completed -- a
@@ -482,7 +505,9 @@ class TIBX:
         type ``None``. Use :meth:`streams` for the unfiltered list.
         """
         if self._volumes is None:
-            if partitions := self._partitions():
+            if self.archive_type == "file":
+                volumes = []
+            elif partitions := self._partitions():
                 named = {partition.id for partition in partitions}
                 if self._streams is not None:
                     volumes = [stream for stream in self._streams if stream.volume_id in named]
@@ -502,27 +527,12 @@ class TIBX:
                     for partition in partitions
                     if partition.id not in stored
                 )
-            elif self._file_level():
-                volumes = []
             else:
                 streams = self.streams()
                 bitmap_spans = _bitmap_spans(streams)
                 volumes = [stream for stream in streams if self._is_volume(stream, bitmap_spans)]
             self._volumes = volumes
         return self._volumes
-
-    def _file_level(self) -> bool:
-        """Whether the archive holds a file-level backup: its imap names files and folders, and no disk or partition.
-
-        False if the imap is encrypted and the archive locked: then it cannot be told.
-        """
-        try:
-            names = {record.name for record in self._item_streams()}
-        except InvalidPasswordError:
-            return False
-        if any(DISK_ITEM_RE.fullmatch(name) for name in names):
-            return False
-        return any(not ACRONIS_ITEM_RE.fullmatch(name) for name in names)
 
     def _partitions(self) -> list[ItemStream]:
         """The partitions of the selected recovery point, as the imap names them, by the record of their data stream.

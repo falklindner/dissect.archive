@@ -219,6 +219,31 @@ struct tlv_header {
     uint32      length;
 };
 
+/* Slot of the meta (TLV[9]): its NUL-terminated strings, one per slot in this order, as
+ * libarchive3's ar_meta_keys names them. An older writer writes fewer slots */
+enum MetaKey : uint8 {
+    TYPE                = 0,            /* type: "disk" or "file" */
+    DISPLAY_NAME        = 1,            /* display_name */
+    DESCRIPTION         = 2,            /* description */
+    AGENT_MACHINE_ID    = 3,            /* agent_machine_id */
+    AGENT_MACHINE_NAME  = 4,            /* agent_machine_name */
+    AGENT_VERSION       = 5,            /* agent_version */
+    CLUSTER_ID          = 6,            /* cluster_id */
+    CLUSTER_NAME        = 7,            /* cluster_name */
+    OWNER_ID            = 8,            /* owner_id */
+    OWNER_NAME          = 9,            /* owner_name */
+    RESOURCE_ID         = 10,           /* resource_id */
+    RESOURCE_TYPE       = 11,           /* resource_type */
+    ARCHIVER_VERSION    = 12,           /* archiver_version */
+    RESOURCE_NAME       = 13,           /* resource_name */
+    TENANT_ID           = 14,           /* tenant_id */
+    TENANT_NAME         = 15,           /* tenant_name */
+    BACKUP_PLAN         = 16,           /* backup_plan */
+    BACKUP_PLAN_ID      = 17,           /* backup_plan_id */
+    CENTRALIZED_PLAN_ID = 18,           /* centralized_plan_id */
+    PASSWORD_HINT       = 19            /* password_hint */
+};
+
 /* Data segment header, at page offset +0x08 of a DATA page */
 struct segment_header {
     char        magic[2];               /* "SG" plaintext / "SE" encrypted */

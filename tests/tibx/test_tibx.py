@@ -645,11 +645,14 @@ def test_metadata_streams_are_not_volumes() -> None:
     assert len(tibx.streams()) == 4  # nothing is lost, just classified
 
 
-def _two_generations(*items: ImapItem) -> TIBX:
+def _two_generations(*items: ImapItem, meta: bytes | None = None) -> TIBX:
     # A full backup (slice 2) and a second one (slice 3) that writes the partition to a new
     # stream, 8, which shares the first one's unchanged boot sector. The first full's
     # stream, 4, stays in the archive
     boot = _ntfs_boot(0x18000)
+    extra_slots = {0: imap(list(items))}
+    if meta is not None:
+        extra_slots[9] = meta
     archive = build_lsm_archive(
         [
             ExtentSpec(4, 0, boot, slice_id=2),
@@ -659,7 +662,7 @@ def _two_generations(*items: ImapItem) -> TIBX:
             ExtentSpec(9, 0, b'\xef\xbb\xbf<?xml version="1.0"?><metainfo/>', slice_id=3),
         ],
         slices=[2, 3],
-        extra_slots={0: imap(list(items))},
+        extra_slots=extra_slots,
     )
     return TIBX(io.BytesIO(archive))
 
@@ -715,14 +718,44 @@ def test_volumes_without_partitions_in_the_imap(items: list[ImapItem]) -> None:
     assert [volume.volume_id for volume in tibx.volumes()] == [8, 4]
 
 
+@pytest.mark.parametrize(
+    ("meta", "archive_type"),
+    [
+        (b"disk\x00{guid}\x0026.10.1.43456\x00", "disk"),
+        (b"file\x00{guid}\x0026.10.1.43456\x00", "file"),
+        (b"", ""),
+    ],
+)
+def test_archive_type(meta: bytes, archive_type: str) -> None:
+    assert _two_generations(meta=meta).archive_type == archive_type
+
+
+@pytest.mark.parametrize(
+    ("payload", "meta"),
+    [
+        (b"", {}),
+        # Bytes after the last NUL are no slot, as Acronis reads them
+        (b"disk", {}),
+        (b"disk\x00\x00x", {c_tibx.MetaKey.TYPE: "disk", c_tibx.MetaKey.DISPLAY_NAME: ""}),
+        (b"file\x00Pl\xc3\xa4n\x00", {c_tibx.MetaKey.TYPE: "file", c_tibx.MetaKey.DISPLAY_NAME: "Pl\u00e4n"}),
+        # No slot past the last key
+        (b"\x00" * 25, dict.fromkeys(c_tibx.MetaKey, "")),
+    ],
+)
+def test_meta(payload: bytes, meta: dict[c_tibx.MetaKey, str]) -> None:
+    assert _two_generations(meta=payload).meta == meta
+
+
 def test_file_level_backup_has_no_volumes() -> None:
-    # Its imap names files, no disk or partition. A large file looks like a partition by its
-    # content, as two real file-level backups listing 240 and 107 volumes showed
+    # A large file looks like a partition by its content, as two real file-level backups
+    # listing 240 and 107 volumes showed
     tibx = _two_generations(
         ImapItem(2, b"C:/Users/user/disk.vhd", 4, 0x3000000),
         ImapItem(3, b"C:/Users/user/disk.vhd", 8, 0x3000000),
         ImapItem(3, b"C:/Users/user/notes.xml", 9, 49),
+        meta=b"file\x00",
     )
+    assert tibx.archive_type == "file"
     assert tibx.volumes() == []
     assert len(tibx.streams()) == 3  # nothing is lost
     tibx.use_recovery_point(0)

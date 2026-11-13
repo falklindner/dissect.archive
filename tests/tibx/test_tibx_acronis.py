@@ -17,7 +17,7 @@ import io
 
 import pytest
 
-from dissect.archive.tibx.c_tibx import PAGE_SIZE, TLV_SEGMENT_MAP, c_tibx
+from dissect.archive.tibx.c_tibx import PAGE_SIZE, TLV_META, TLV_SEGMENT_MAP, c_tibx
 from dissect.archive.tibx.exception import CorruptArchiveError, InvalidPasswordError
 from dissect.archive.tibx.lsm import iter_tree_cells
 from dissect.archive.tibx.map import load_segment_index
@@ -118,7 +118,56 @@ def test_acronis_archive(name: str, backups: list[str], volumes: int) -> None:
         assert tibx.store.verify()["bad"] == 0
         assert [str(point.guid)[:8] for point in tibx.recovery_points()] == backups
         # Listing must not need the password, only reading does
+        assert tibx.archive_type == ("file" if name == "t1_legacy_tib" else "disk")
         assert len(tibx.volumes()) == volumes
+
+
+@pytest.mark.parametrize(
+    ("name", "slots", "expected"),
+    [
+        # Cyber Protect 15 writes no password_hint
+        (
+            "t1_simple_ntfs",
+            c_tibx.MetaKey.PASSWORD_HINT,
+            {
+                c_tibx.MetaKey.TYPE: "disk",
+                c_tibx.MetaKey.DISPLAY_NAME: "t1_simple_ntfs",
+                c_tibx.MetaKey.AGENT_VERSION: "Acronis Cyber Protect 15.0.1.37414 Win64",
+                c_tibx.MetaKey.RESOURCE_TYPE: "disk",
+                c_tibx.MetaKey.BACKUP_PLAN_ID: "F91E3042-ADD0-4730-8A63-466766594D7C",
+                c_tibx.MetaKey.CENTRALIZED_PLAN_ID: "00000000-0000-0000-0000-000000000000",
+            },
+        ),
+        (
+            "t1_legacy_tib",
+            c_tibx.MetaKey.PASSWORD_HINT,
+            {
+                c_tibx.MetaKey.TYPE: "file",
+                c_tibx.MetaKey.DISPLAY_NAME: "t1_legacy_tib",
+                c_tibx.MetaKey.RESOURCE_TYPE: "file",
+            },
+        ),
+        # True Image 2020 writes no centralized_plan_id and password_hint either
+        (
+            "ati_2020_disk_lz4_compr",
+            c_tibx.MetaKey.CENTRALIZED_PLAN_ID,
+            {
+                c_tibx.MetaKey.TYPE: "disk",
+                c_tibx.MetaKey.AGENT_MACHINE_ID: "C5BFB73E-8277-4C0A-9412-2EAF14C6C6B1",
+                c_tibx.MetaKey.AGENT_VERSION: "Acronis True Image 2020 24.8.1.38600 Win",
+                c_tibx.MetaKey.RESOURCE_ID: "51836604-7FFF-462C-9906-531229D52E73",
+            },
+        ),
+    ],
+)
+def test_meta(name: str, slots: int, expected: dict[c_tibx.MetaKey, str]) -> None:
+    # The meta's strings are in the order of libarchive3's ar_meta_keys; an older writer
+    # writes fewer slots
+    with _open(name) as tibx:
+        assert tibx.header.tlv[TLV_META].payload.endswith(b"\x00")
+        assert list(tibx.meta) == list(c_tibx.MetaKey)[:slots]
+        for key, value in expected.items():
+            assert tibx.meta[key] == value
 
 
 @pytest.mark.parametrize(
