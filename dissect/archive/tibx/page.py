@@ -60,8 +60,8 @@ SCAN_CHUNK_MIN_PAGES = 16
 SCAN_CHUNK_MAX_PAGES = 1024
 
 # ENVELOPE PARSING -- page envelopes go through :class:`c_tibx.page_header` everywhere
-# except the page sweeps -- :func:`_is_valid_page`, :meth:`PageStore._last_ci` and
-# :meth:`PageStore._last_arch` -- which index the envelope bytes directly.
+# except the page sweeps -- :func:`_is_valid_page` and :meth:`PageStore._last_root` --
+# which index the envelope bytes directly.
 #
 # cstruct costs ~3.6 us per envelope against ~0.33 us for the indexing, but that ratio is
 # not the one that matters; measured end to end on a 949 MiB archive (242,977 pages):
@@ -71,7 +71,7 @@ SCAN_CHUNK_MAX_PAGES = 1024
 # and on an archive whose live root is 84k pages before EOF, as in one real archive (most
 # have it within the last 3 pages, where the choice is unmeasurable):
 #
-#   _last_arch()           2.8x   -- 291 ms vs 801 ms
+#   _last_root()           2.8x   -- 291 ms vs 801 ms
 #
 # So only the sweeps -- whose per-page work is otherwise just a marker comparison -- index
 # directly, and the offsets are mirrored in those places. Random access never touches this
@@ -334,37 +334,20 @@ class PageStore:
         ci = self._commit_info_at(FIRST_CI_OFFSET)
         return ci if ci is not None and ci.flags & c_tibx.ArciFlags.CI0 else None
 
-    def _last_ci(self) -> CommitInfo | None:
-        """The last commit info page written, by scanning backward from EOF.
-
-        That is the highest-offset one, which is the newest only in "append" mode. In
-        "rewrite" mode CI0 names the newest, and this comes in only when CI0 is damaged:
-        should the archive have reused space, an older commit may then be taken for the
-        newest.
-        """
-        for index, page in self._pages_backward():
-            # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
-            if page[1] == _ARCI_TYPE and (ci := _commit_info(page, index * PAGE_SIZE)):
-                return ci
-        return None
-
-    def _last_arch(self) -> SuperBlock | None:
-        """The last CRC-valid ARCH header, by scanning backward from EOF.
-
-        Whether its commit was completed or not: this does not look at commit info at all.
-        """
-        for index, page in self._pages_backward():
-            # Envelope indexed directly -- see the ENVELOPE PARSING note at the top
-            if page[1] == _ARCH_TYPE and _is_valid_page(page, _ARCH_TYPE, ARCH_MAGIC):
-                return SuperBlock(page, index * PAGE_SIZE)
-        return None
-
     def _last_root(self) -> SuperBlock | None:
-        """The root of the commit of :meth:`_last_ci`, if it has a valid one, else :meth:`_last_arch`.
+        """The root of the last commit info page written, if it has a valid one, else the last CRC-valid ARCH header.
 
-        In one scan backward from EOF rather than one for each: an archive without usable
-        commit info is read to its start, and a 25 GB file cut off in the middle of a backup
-        took 49.5 GB of reads, 455 s over SMB.
+        Both are found by scanning backward from EOF, in one scan rather than one for each:
+        an archive without usable commit info is read to its start, and a 25 GB file cut off
+        in the middle of a backup took 49.5 GB of reads, 455 s over SMB.
+
+        The last commit info page written is the highest-offset one, which is the newest only
+        in "append" mode. In "rewrite" mode CI0 names the newest, and this comes in only when
+        CI0 is damaged: should the archive have reused space, an older commit may then be
+        taken for the newest.
+
+        The last ARCH header is taken whether its commit was completed or not: it may be of a
+        commit that was cut off before its commit info was written.
         """
         last_arch = None
         want_ci = True

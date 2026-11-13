@@ -320,10 +320,10 @@ def test_acronis_segment_hash(name: str) -> None:
 
 @pytest.mark.parametrize("name", ARCHIVES)
 def test_acronis_commit_info(name: str) -> None:
-    # In an intact archive CI0, the last commit info and the last header all name the same root
+    # In an intact archive CI0 and the backward scan name the same root
     with _open(name) as tibx:
         store = tibx.store
-        assert store.live_root().offset == store._last_ci().arch_offset == store._last_arch().offset
+        assert store.live_root().offset == store._last_root().offset
 
 
 def test_acronis_commit_info_rewritten_ci0() -> None:
@@ -362,7 +362,7 @@ def test_acronis_live_root_three_reads(name: str) -> None:
     fh.reads = 0
     root = store.live_root()
     assert fh.reads == 3
-    assert root.offset == store._last_ci().arch_offset
+    assert root.offset == store._last_root().offset
 
 
 def test_acronis_live_root_trusts_ci0() -> None:
@@ -373,7 +373,7 @@ def test_acronis_live_root_trusts_ci0() -> None:
     _rewrite_commit_info(data, FIRST_CI_OFFSET, arch_offset=0xB6000, commit_seq=4, ci_seq=8, prev_ci_offset=0xB8000)
 
     store = PageStore(io.BytesIO(bytes(data)))
-    assert store._last_ci().arch_offset == 0xF3000
+    assert store._last_root().offset == 0xF3000
     assert store.live_root().offset == 0xB6000
 
 
@@ -412,7 +412,6 @@ def test_acronis_live_root_without_commit_info() -> None:
     )
     store = PageStore(io.BytesIO(_sample("t1_chain_inc", corrupt=offsets)))
     assert store._ci0() is None
-    assert store._last_ci() is None
     assert store.live_root().offset == 0xF3000
 
 
